@@ -1,0 +1,5 @@
+{
+  "name": "PolyBTC AI Trader",
+  "description": "AI-powered scanner for Polymarket BTC 5-minute price prediction markets.",
+  "requestFramePermissions": []
+}
