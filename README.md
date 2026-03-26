@@ -56,6 +56,16 @@ POLYMARKET_SIGNATURE_TYPE=1
 POLYMARKET_FUNDER_ADDRESS=...
 POLYGON_RPC_URLS=https://1rpc.io/matic,https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org
 GEMINI_API_KEY=...
+MONGODB_URI=...
+MONGODB_DB_NAME=polybtc
+MONGODB_CACHE_COLLECTION=market_cache
+MONGODB_PRICE_SNAPSHOTS_COLLECTION=btc_price_snapshots
+MONGODB_CHART_COLLECTION=chart
+MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
+BTC_BACKGROUND_SYNC_MS=20000
+POSITION_AUTOMATION_SYNC_MS=15000
+BTC_PRICE_SNAPSHOT_TTL_SECONDS=1209600
+BTC_CANDLE_TTL_SECONDS=2592000
 ```
 
 Di bawah ini penjelasan satu-satu.
@@ -174,6 +184,50 @@ Kalau kosong:
 - app tetap bisa buka dashboard
 - tapi analisa AI tidak akan jalan
 
+### 9. `MONGODB_URI`
+### 10. `MONGODB_DB_NAME`
+
+Ini optional, tapi sangat disarankan.
+
+Fungsinya:
+- nyimpen latest BTC price
+- nyimpen short candle history BTC
+- jadi cache internal kalau provider public seperti Binance / CoinGecko lagi error atau rate limit
+
+Contoh:
+
+```env
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/cryptoNews
+MONGODB_DB_NAME=polybtc
+MONGODB_CACHE_COLLECTION=market_cache
+MONGODB_PRICE_SNAPSHOTS_COLLECTION=btc_price_snapshots
+MONGODB_CHART_COLLECTION=chart
+BTC_BACKGROUND_SYNC_MS=20000
+MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
+POSITION_AUTOMATION_SYNC_MS=15000
+BTC_PRICE_SNAPSHOT_TTL_SECONDS=1209600
+BTC_CANDLE_TTL_SECONDS=2592000
+```
+
+Kalau tidak diisi:
+- app tetap jalan
+- tapi BTC endpoint akan lebih bergantung ke provider public langsung
+
+Arti nilai tambahannya:
+- `MONGODB_DB_NAME`: nama database Mongo yang dipakai app
+- `MONGODB_CACHE_COLLECTION`: collection cache latest
+- `MONGODB_PRICE_SNAPSHOTS_COLLECTION`: collection histori snapshot harga
+- `MONGODB_CHART_COLLECTION`: collection candle chart BTC 1m
+- `MONGODB_POSITION_AUTOMATION_COLLECTION`: collection backend TP/SL and trailing stop
+- `BTC_BACKGROUND_SYNC_MS`: interval backend refresh data BTC ke Mongo
+- `POSITION_AUTOMATION_SYNC_MS`: interval backend monitor TP/SL positions
+- `BTC_PRICE_SNAPSHOT_TTL_SECONDS`: berapa lama price snapshot disimpan
+- `BTC_CANDLE_TTL_SECONDS`: berapa lama candle 1m disimpan
+
+Penting:
+- jangan pakai URI MongoDB asli di file yang di-commit
+- kalau URI ini pernah kebocoran ke chat / screenshot / GitHub, rotate password database
+
 ## Contoh `.env`
 
 Ini contoh bentuk file yang benar:
@@ -190,6 +244,10 @@ POLYGON_RPC_URLS=https://1rpc.io/matic,https://polygon-bor-rpc.publicnode.com,ht
 
 # Gemini API Key
 GEMINI_API_KEY=your_gemini_api_key
+
+# Optional MongoDB cache
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/cryptoNews
+MONGODB_DB_NAME=cryptoNews
 ```
 
 ## Cara Cek `.env` Sudah Benar
@@ -216,6 +274,24 @@ Kalau trade gagal auth:
 
 Kalau analisa AI gagal:
 - cek `GEMINI_API_KEY`
+
+Kalau data BTC sering 500:
+- isi `MONGODB_URI`
+- restart server
+- biarkan backend pakai cache internal MongoDB
+
+Kalau mau cek cache Mongo jalan atau tidak:
+
+```text
+GET /api/debug/btc-cache
+```
+
+Endpoint ini akan kasih tahu:
+- cache latest ada atau tidak
+- jumlah snapshot harga
+- jumlah candle 1m
+- source data terakhir
+- setting TTL dan background sync
 
 ## Fitur Yang Sudah Ada
 

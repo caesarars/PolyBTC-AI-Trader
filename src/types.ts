@@ -75,4 +75,10 @@ export interface AIRecommendation {
   reasoning: string;
   riskLevel: "LOW" | "MEDIUM" | "HIGH";
   dataMode?: "FULL_DATA" | "POLYMARKET_ONLY";
+  astrologyBias?: "BULLISH" | "BEARISH" | "NEUTRAL";
+  astrologyConfidence?: number;
+  astrologyReasoning?: string;
+  reversalProbability?: number;
+  oppositePressureProbability?: number;
+  reversalReasoning?: string;
 }

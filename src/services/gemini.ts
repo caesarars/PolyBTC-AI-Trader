@@ -11,6 +11,114 @@ interface Candle {
   volume: number;
 }
 
+function aggregateCandles(history: BTCHistory[], bucketSize: number): Candle[] {
+  if (!history.length || bucketSize <= 1) return history;
+
+  const aggregated: Candle[] = [];
+  for (let i = 0; i < history.length; i += bucketSize) {
+    const bucket = history.slice(i, i + bucketSize);
+    if (!bucket.length) continue;
+    aggregated.push({
+      open: bucket[0].open,
+      high: Math.max(...bucket.map((c) => c.high)),
+      low: Math.min(...bucket.map((c) => c.low)),
+      close: bucket[bucket.length - 1].close,
+      volume: bucket.reduce((sum, c) => sum + c.volume, 0),
+    });
+  }
+
+  return aggregated;
+}
+
+function computeDirectionalBias(candles: Candle[]): "UP" | "DOWN" | "MIXED" {
+  if (candles.length < 3) return "MIXED";
+  const first = candles[0].close;
+  const last = candles[candles.length - 1].close;
+  const risingCloses = candles.slice(-3).every((c, i, arr) => i === 0 || c.close >= arr[i - 1].close);
+  const fallingCloses = candles.slice(-3).every((c, i, arr) => i === 0 || c.close <= arr[i - 1].close);
+
+  if (last > first && risingCloses) return "UP";
+  if (last < first && fallingCloses) return "DOWN";
+  return "MIXED";
+}
+
+function describeSixtyMinuteBias(history: BTCHistory[], indicators: BTCIndicators | null) {
+  if (history.length < 20) {
+    return {
+      bias: "MIXED" as const,
+      summary: "60m bias unavailable.",
+    };
+  }
+
+  const first = history[0].close;
+  const last = history[history.length - 1].close;
+  const movePct = first > 0 ? ((last - first) / first) * 100 : 0;
+  const rangeHigh = Math.max(...history.map((c) => c.high));
+  const rangeLow = Math.min(...history.map((c) => c.low));
+  const bias =
+    indicators?.emaCross === "BULLISH" && movePct > 0.15
+      ? "UP"
+      : indicators?.emaCross === "BEARISH" && movePct < -0.15
+        ? "DOWN"
+        : Math.abs(movePct) < 0.1
+          ? "MIXED"
+          : movePct > 0
+            ? "UP"
+            : "DOWN";
+
+  return {
+    bias,
+    summary: `60m bias: ${bias}. Move ${movePct.toFixed(2)}%. Range ${rangeLow.toFixed(1)} -> ${rangeHigh.toFixed(1)}. EMA cross ${indicators?.emaCross ?? "UNKNOWN"}. RSI ${indicators?.rsi ?? "?"}.`,
+  };
+}
+
+function describeFiveMinuteConfirmation(history: BTCHistory[]) {
+  const candles5m = aggregateCandles(history.slice(-30), 5);
+  if (candles5m.length < 3) {
+    return {
+      confirmation: "MIXED" as const,
+      summary: "5m confirmation unavailable.",
+    };
+  }
+
+  const recent = candles5m.slice(-4);
+  const direction = computeDirectionalBias(recent);
+  const last = recent[recent.length - 1];
+  const previous = recent[recent.length - 2];
+  const breakout = last.close > previous.high ? "bullish breakout" : last.close < previous.low ? "bearish breakdown" : "inside range";
+
+  return {
+    confirmation: direction,
+    summary: `5m confirmation: ${direction}. Last 5m candle O:${last.open.toFixed(1)} H:${last.high.toFixed(1)} L:${last.low.toFixed(1)} C:${last.close.toFixed(1)} with ${breakout}.`,
+  };
+}
+
+function describeOneMinuteTrigger(history: BTCHistory[]) {
+  const last5 = history.slice(-5);
+  if (last5.length < 3) {
+    return {
+      trigger: "MIXED" as const,
+      summary: "1m trigger unavailable.",
+    };
+  }
+
+  const patterns = detectPatterns(last5);
+  const direction = computeDirectionalBias(last5);
+  const last = last5[last5.length - 1];
+  const trigger =
+    patterns.some((p) => /Bullish|Hammer|Pin Bar|White Soldiers/i.test(p)) && last.close >= last.open
+      ? "UP"
+      : patterns.some((p) => /Bearish|Shooting Star|Black Crows/i.test(p)) && last.close <= last.open
+        ? "DOWN"
+        : direction;
+
+  return {
+    trigger,
+    patterns,
+    summary: `1m trigger: ${trigger}. Last candle O:${last.open.toFixed(1)} H:${last.high.toFixed(1)} L:${last.low.toFixed(1)} C:${last.close.toFixed(1)}. Patterns: ${patterns.join(", ")}.`,
+  };
+}
+
 function detectPatterns(candles: Candle[]): string[] {
   if (candles.length < 2) return [];
 
@@ -84,7 +192,16 @@ export async function analyzeMarket(
     hasBtcPrice && hasBtcHistory ? "FULL_DATA" : "POLYMARKET_ONLY";
 
   const last15 = history.slice(-15);
-  const patterns = hasBtcHistory ? detectPatterns(last15) : ["BTC candlestick feed unavailable"];
+  const triggerAnalysis = hasBtcHistory
+    ? describeOneMinuteTrigger(history)
+    : { trigger: "MIXED" as const, patterns: ["BTC candlestick feed unavailable"], summary: "1m trigger unavailable." };
+  const confirmationAnalysis = hasBtcHistory
+    ? describeFiveMinuteConfirmation(history)
+    : { confirmation: "MIXED" as const, summary: "5m confirmation unavailable." };
+  const biasAnalysis = hasBtcHistory
+    ? describeSixtyMinuteBias(history, indicators)
+    : { bias: "MIXED" as const, summary: "60m bias unavailable." };
+  const patterns = triggerAnalysis.patterns;
 
   const ohlcvTable =
     last15
@@ -139,6 +256,11 @@ Window: ${market.startDate} -> ${market.endDate}
 == BTC PRICE ==
 Current: ${hasBtcPrice ? `$${btcPrice}` : "Unavailable"}
 
+== MULTI-TIMEFRAME DECISION STACK ==
+${biasAnalysis.summary}
+${confirmationAnalysis.summary}
+${triggerAnalysis.summary}
+
 == BTC CANDLESTICK DATA (last 15x 1m candles, oldest to newest) ==
 ${ohlcvTable}
 
@@ -157,10 +279,25 @@ ${marketHistoryBlock}
 
 == EDGE ANALYSIS RULES ==
 1. Edge exists only when your probability estimate differs from implied price by more than 5 cents.
-2. Candle patterns, RSI extremes, EMA cross, and order book imbalance aligned means higher confidence.
-3. Conflicting signals or fairly priced market means NO_TRADE.
-4. Strong Polymarket momentum plus order book imbalance can still justify a trade even if BTC feed is unavailable.
-5. If BTC price/candles are unavailable, still analyze using Polymarket probabilities, history, liquidity, and order book only, but reduce confidence.
+2. Use a strict hierarchy:
+   - 60m bias decides directional preference
+   - 5m confirmation validates short-term alignment
+   - 1m trigger decides exact entry timing
+3. Highest confidence only when 60m bias, 5m confirmation, 1m trigger, and order book all align.
+4. If 60m bias conflicts with 5m and 1m trigger, prefer NO_TRADE or reduce confidence sharply.
+5. If only 1m trigger exists without 5m/60m support, confidence must stay low.
+6. Strong Polymarket momentum plus order book imbalance can still justify a trade even if BTC feed is unavailable, but reduce confidence.
+7. If BTC price/candles are unavailable, still analyze using Polymarket probabilities, history, liquidity, and order book only, but reduce confidence.
+8. Add an Astrology Trading Assist layer as general context only:
+   - infer a broad market mood as BULLISH, BEARISH, or NEUTRAL
+   - use symbolic timing language only as an auxiliary sentiment overlay
+   - this astrology layer must never override strong contrary market structure
+   - if astrology conflicts with actual price action, mention the conflict clearly
+9. Keep astrology separate from the main trading decision. Decision/confidence must still be grounded primarily in market data.
+10. Estimate reversal risk:
+   - reversalProbability: probability that price suddenly reverses against the suggested direction in the next short window
+   - oppositePressureProbability: probability that the opposite side aggressively takes control (example: if direction is DOWN, chance of sudden BUY squeeze)
+   - these should be based on spread, imbalance, recent candles, and conflict between 60m/5m/1m layers
 
 Respond with JSON only:
 {
@@ -171,7 +308,13 @@ Respond with JSON only:
   "candlePatterns": ["pattern1", "pattern2"],
   "reasoning": "string",
   "riskLevel": "LOW" | "MEDIUM" | "HIGH",
-  "dataMode": "FULL_DATA" | "POLYMARKET_ONLY"
+  "dataMode": "FULL_DATA" | "POLYMARKET_ONLY",
+  "astrologyBias": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "astrologyConfidence": number,
+  "astrologyReasoning": "string",
+  "reversalProbability": number,
+  "oppositePressureProbability": number,
+  "reversalReasoning": "string"
 }`;
 
   try {
@@ -191,6 +334,12 @@ Respond with JSON only:
       reasoning: result.reasoning || "Failed to generate analysis.",
       riskLevel: result.riskLevel || "MEDIUM",
       dataMode: result.dataMode || dataMode,
+      astrologyBias: result.astrologyBias || "NEUTRAL",
+      astrologyConfidence: result.astrologyConfidence || 0,
+      astrologyReasoning: result.astrologyReasoning || "Astrology layer unavailable.",
+      reversalProbability: result.reversalProbability || 0,
+      oppositePressureProbability: result.oppositePressureProbability || 0,
+      reversalReasoning: result.reversalReasoning || "Reversal layer unavailable.",
     };
   } catch (error) {
     console.error("AI Analysis Error:", error);
@@ -203,6 +352,12 @@ Respond with JSON only:
       reasoning: "Error occurred during AI analysis.",
       riskLevel: "HIGH",
       dataMode,
+      astrologyBias: "NEUTRAL",
+      astrologyConfidence: 0,
+      astrologyReasoning: "Astrology layer unavailable.",
+      reversalProbability: 0,
+      oppositePressureProbability: 0,
+      reversalReasoning: "Reversal layer unavailable.",
     };
   }
 }

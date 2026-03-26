@@ -119,9 +119,13 @@ export default function App() {
   type PositionAutomation = {
     takeProfit: string;
     stopLoss: string;
+    trailingStop: string;
     armed: boolean;
     status?: string;
     lastPrice?: string;
+    highestPrice?: string;
+    trailingStopPrice?: string;
+    lastExitOrderId?: string | null;
   };
 
   const [markets, setMarkets] = useState<Market[]>([]);
@@ -139,9 +143,10 @@ export default function App() {
   const [balance, setBalance] = useState<BalanceState | null>(null);
   const [tradeAmount, setTradeAmount] = useState<string>("10");
   const [confirmTradeAmount, setConfirmTradeAmount] = useState<string>("");
-  const [limitPrices, setLimitPrices] = useState<Record<string, string>>({});
   const [confirmTradeData, setConfirmTradeData] = useState<{ market: Market; outcomeIndex: number } | null>(null);
-  const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const [executionMode, setExecutionMode] = useState<"PASSIVE" | "AGGRESSIVE">("AGGRESSIVE");
+  const [autoRepriceEnabled, setAutoRepriceEnabled] = useState(false);
+  const [autoAnalyze, setAutoAnalyze] = useState(false);
   const [orderLookupId, setOrderLookupId] = useState<string>("");
   const [orderLookupLoading, setOrderLookupLoading] = useState(false);
   const [trackedOrder, setTrackedOrder] = useState<OrderTrackerState | null>(null);
@@ -149,15 +154,16 @@ export default function App() {
   const [positionAutomation, setPositionAutomation] = useState<Record<string, PositionAutomation>>({});
   const [automationBusy, setAutomationBusy] = useState<Record<string, boolean>>({});
   const [openPositionFilter, setOpenPositionFilter] = useState<"active" | "all">("active");
+  const [openPositionsRefreshing, setOpenPositionsRefreshing] = useState(false);
   const autoAnalyzedRef = useRef<Set<string>>(new Set());
+  const lastWindowRefreshRef = useRef<number | null>(null);
 
   const countdown = useWindowCountdown();
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-
-      const [marketsRes, priceRes, historyRes, indicatorsRes, sentimentRes, balanceRes, performanceRes] = await Promise.all([
+      const [marketsRes, priceRes, historyRes, indicatorsRes, sentimentRes, balanceRes, performanceRes, automationRes] = await Promise.all([
         fetch("/api/polymarket/markets"),
         fetch("/api/btc-price"),
         fetch("/api/btc-history"),
@@ -165,9 +171,10 @@ export default function App() {
         fetch("/api/sentiment"),
         fetch("/api/polymarket/balance"),
         fetch("/api/polymarket/performance"),
+        fetch("/api/polymarket/automation"),
       ]);
 
-      const [marketsData, priceData, historyData, indicatorsData, sentimentData, balanceData, performanceData] = await Promise.all([
+      const [marketsData, priceData, historyData, indicatorsData, sentimentData, balanceData, performanceData, automationData] = await Promise.all([
         marketsRes.json(),
         priceRes.json(),
         historyRes.json(),
@@ -175,6 +182,7 @@ export default function App() {
         sentimentRes.json(),
         balanceRes.json(),
         performanceRes.json(),
+        automationRes.json(),
       ]);
 
       setMarkets(Array.isArray(marketsData) ? marketsData : []);
@@ -184,6 +192,24 @@ export default function App() {
       setSentiment(sentimentData);
       setBalance(balanceData.error ? null : balanceData);
       setPerformance(performanceData.error ? null : performanceData);
+      setPositionAutomation(
+        Object.fromEntries(
+          ((automationData?.automations || []) as any[]).map((item) => [
+            item.assetId,
+            {
+              takeProfit: item.takeProfit || "",
+              stopLoss: item.stopLoss || "",
+              trailingStop: item.trailingStop || "",
+              armed: Boolean(item.armed),
+              status: item.status,
+              lastPrice: item.lastPrice,
+              highestPrice: item.highestPrice,
+              trailingStopPrice: item.trailingStopPrice,
+              lastExitOrderId: item.lastExitOrderId || null,
+            },
+          ])
+        )
+      );
     } catch (error) {
       console.error("Fetch Error:", error);
     } finally {
@@ -210,22 +236,17 @@ export default function App() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 60000);
+    const interval = setInterval(fetchData, 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("polybtc-position-automation");
-      if (saved) setPositionAutomation(JSON.parse(saved));
-    } catch (error) {
-      console.error("Automation restore error:", error);
+    const currentWindow = Math.floor(Date.now() / 1000 / 300);
+    if (countdown >= 299 && lastWindowRefreshRef.current !== currentWindow) {
+      lastWindowRefreshRef.current = currentWindow;
+      fetchData();
     }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem("polybtc-position-automation", JSON.stringify(positionAutomation));
-  }, [positionAutomation]);
+  }, [countdown, fetchData]);
 
   const handleAnalyze = async (market: Market) => {
     setAnalyzingId(market.id);
@@ -288,6 +309,8 @@ export default function App() {
 
   const handleTrade = (market: Market, outcomeIndex: number) => {
     setConfirmTradeAmount(kellyAmount(market, outcomeIndex));
+    setExecutionMode("AGGRESSIVE");
+    setAutoRepriceEnabled(false);
     setConfirmTradeData({ market, outcomeIndex });
   };
 
@@ -297,7 +320,13 @@ export default function App() {
     const tokenId = market.clobTokenIds?.[outcomeIndex];
     if (!tokenId) return;
 
-    const price = limitPrices[`${market.id}-${outcomeIndex}`] || market.outcomePrices[outcomeIndex];
+    const book = orderBooks[tokenId];
+    const bestBid = Number(book?.bids?.[0]?.price || "0");
+    const bestAsk = Number(book?.asks?.[0]?.price || "0");
+    const price =
+      executionMode === "AGGRESSIVE"
+        ? String(bestAsk || market.outcomePrices[outcomeIndex])
+        : String(bestBid || market.outcomePrices[outcomeIndex]);
     const amountToTrade = confirmTradeAmount || kellyAmount(market, outcomeIndex);
     const numericPrice = Number(price);
     const numericAmount = Number(amountToTrade);
@@ -313,15 +342,45 @@ export default function App() {
       const response = await fetch("/api/polymarket/trade", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tokenID: tokenId, amount: amountToTrade, side: "BUY", price }),
+        body: JSON.stringify({
+          tokenID: tokenId,
+          amount: amountToTrade,
+          side: "BUY",
+          executionMode,
+        }),
       });
       const result = await response.json();
       if (response.ok) {
         if (result.orderID) {
           setOrderLookupId(result.orderID);
           lookupOrder(result.orderID);
+          if (autoRepriceEnabled) {
+            setTimeout(async () => {
+              try {
+                const orderRes = await fetch(`/api/polymarket/order/${result.orderID}`);
+                const orderData = await orderRes.json();
+                if (orderRes.ok && orderData.positionState === "OPEN" && Number(orderData.fillPercent) === 0) {
+                  const repriceRes = await fetch("/api/polymarket/order/reprice", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ orderID: result.orderID, executionMode: "AGGRESSIVE" }),
+                  });
+                  const repriceData = await repriceRes.json();
+                  if (repriceRes.ok && repriceData.replacement?.orderID) {
+                    setOrderLookupId(repriceData.replacement.orderID);
+                    lookupOrder(repriceData.replacement.orderID);
+                  }
+                }
+              } catch (error) {
+                console.error("Auto reprice error:", error);
+              }
+            }, 12000);
+          }
         }
-        alert(`Trade submitted. Order ID: ${result.orderID || "Pending"}${result.status ? ` (${result.status})` : ""}`);
+        alert(
+          `Trade submitted. Order ID: ${result.orderID || "Pending"}${result.status ? ` (${result.status})` : ""}` +
+          `${result.marketSnapshot?.bestAsk ? ` | Best ask ${(Number(result.marketSnapshot.bestAsk) * 100).toFixed(1)}c` : ""}`
+        );
       } else {
         alert(`Trade failed: ${result.error || "Unknown error"}`);
       }
@@ -352,11 +411,20 @@ export default function App() {
   };
 
   const getTradePreview = (market: Market, outcomeIndex: number, amount: string) => {
-    const price = Number(limitPrices[`${market.id}-${outcomeIndex}`] || market.outcomePrices[outcomeIndex]);
+    const tokenId = market.clobTokenIds?.[outcomeIndex];
+    const book = tokenId ? orderBooks[tokenId] : null;
+    const bestBid = Number(book?.bids?.[0]?.price || "0");
+    const bestAsk = Number(book?.asks?.[0]?.price || "0");
+    const price =
+      executionMode === "AGGRESSIVE"
+        ? bestAsk || Number(market.outcomePrices[outcomeIndex])
+        : bestBid || Number(market.outcomePrices[outcomeIndex]);
     const spend = Number(amount);
     const minimumUsdc = Number.isFinite(price) && price > 0 ? 5 * price : 0;
     const estimatedShares = Number.isFinite(price) && price > 0 && Number.isFinite(spend) ? spend / price : 0;
-    return { price, spend, minimumUsdc, estimatedShares };
+    const spread = bestBid > 0 && bestAsk > 0 ? bestAsk - bestBid : 0;
+    const distanceToFill = bestAsk > 0 ? bestAsk - price : 0;
+    return { price, spend, minimumUsdc, estimatedShares, bestBid, bestAsk, spread, distanceToFill };
   };
 
   const lookupOrder = useCallback(async (orderID?: string) => {
@@ -387,13 +455,139 @@ export default function App() {
       [assetId]: {
         takeProfit: prev[assetId]?.takeProfit || "",
         stopLoss: prev[assetId]?.stopLoss || "",
+        trailingStop: prev[assetId]?.trailingStop || "",
         armed: prev[assetId]?.armed || false,
         status: prev[assetId]?.status,
         lastPrice: prev[assetId]?.lastPrice,
+        highestPrice: prev[assetId]?.highestPrice,
+        trailingStopPrice: prev[assetId]?.trailingStopPrice,
+        lastExitOrderId: prev[assetId]?.lastExitOrderId,
         ...patch,
       },
     }));
   };
+
+  const saveAutomation = useCallback(async (
+    position: PerformanceState["openPositions"][number],
+    patch?: Partial<PositionAutomation>
+  ) => {
+    setAutomationBusy((prev) => ({ ...prev, [position.assetId]: true }));
+    try {
+      const current = positionAutomation[position.assetId] || {
+        takeProfit: "",
+        stopLoss: "",
+        trailingStop: "",
+        armed: false,
+      };
+      const next = { ...current, ...patch };
+      const response = await fetch("/api/polymarket/automation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: position.assetId,
+          market: position.market,
+          outcome: position.outcome,
+          averagePrice: position.averagePrice,
+          size: position.size,
+          takeProfit: next.takeProfit,
+          stopLoss: next.stopLoss,
+          trailingStop: next.trailingStop,
+          armed: next.armed,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        updateAutomation(position.assetId, { status: result.error || "Failed to save automation" });
+        return;
+      }
+      updateAutomation(position.assetId, {
+        takeProfit: result.automation.takeProfit || "",
+        stopLoss: result.automation.stopLoss || "",
+        trailingStop: result.automation.trailingStop || "",
+        armed: Boolean(result.automation.armed),
+        status: result.automation.status,
+        lastPrice: result.automation.lastPrice,
+        highestPrice: result.automation.highestPrice,
+        trailingStopPrice: result.automation.trailingStopPrice,
+        lastExitOrderId: result.automation.lastExitOrderId || null,
+      });
+    } catch (error) {
+      console.error("Automation save error:", error);
+      updateAutomation(position.assetId, { status: "Failed to save automation" });
+    } finally {
+      setAutomationBusy((prev) => ({ ...prev, [position.assetId]: false }));
+    }
+  }, [positionAutomation]);
+
+  const recommendAutomation = useCallback(async (
+    position: PerformanceState["openPositions"][number]
+  ) => {
+    setAutomationBusy((prev) => ({ ...prev, [position.assetId]: true }));
+    try {
+      const response = await fetch("/api/polymarket/automation/recommend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ averagePrice: position.averagePrice }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        updateAutomation(position.assetId, { status: result.error || "Failed to recommend TP/SL" });
+        return;
+      }
+      updateAutomation(position.assetId, {
+        takeProfit: result.takeProfit,
+        stopLoss: result.stopLoss,
+        trailingStop: result.trailingStop,
+        status: "Recommended levels applied",
+      });
+    } catch (error) {
+      console.error("Automation recommend error:", error);
+      updateAutomation(position.assetId, { status: "Failed to recommend TP/SL" });
+    } finally {
+      setAutomationBusy((prev) => ({ ...prev, [position.assetId]: false }));
+    }
+  }, []);
+
+  const refreshPositionPrice = useCallback(async (
+    position: PerformanceState["openPositions"][number]
+  ) => {
+    try {
+      const res = await fetch(`/api/polymarket/orderbook/${position.assetId}`);
+      const book = await res.json();
+      const bestBid = Number(book?.bids?.[0]?.price || "0");
+      if (bestBid > 0) {
+        updateAutomation(position.assetId, {
+          lastPrice: bestBid.toFixed(4),
+          status: "Live ROI updated",
+        });
+      } else {
+        updateAutomation(position.assetId, {
+          status: "No live bid available",
+        });
+      }
+    } catch (error) {
+      console.error("Open position refresh error:", error);
+      updateAutomation(position.assetId, { status: "Refresh failed" });
+    }
+  }, []);
+
+  const refreshOpenPositionRoi = useCallback(async () => {
+    const assetIds = new Set(markets.flatMap((market) => market.clobTokenIds || []));
+    const positions = (performance?.openPositions || [])
+      .sort((a, b) => Number(b.costBasis) - Number(a.costBasis))
+      .filter((position) =>
+        openPositionFilter === "all" ? true : assetIds.has(position.assetId)
+      );
+
+    if (!positions.length) return;
+
+    setOpenPositionsRefreshing(true);
+    try {
+      await Promise.all(positions.map((position) => refreshPositionPrice(position)));
+    } finally {
+      setOpenPositionsRefreshing(false);
+    }
+  }, [performance, openPositionFilter, markets, refreshPositionPrice]);
 
   const exitPosition = useCallback(async (
     position: PerformanceState["openPositions"][number],
@@ -431,42 +625,6 @@ export default function App() {
   }, [fetchData]);
 
   const countdownColor = countdown <= 30 ? "text-red-400" : countdown <= 60 ? "text-yellow-400" : "text-green-400";
-
-  useEffect(() => {
-    if (!performance?.openPositions?.length) return;
-
-    const armedPositions = performance.openPositions.filter((position) => positionAutomation[position.assetId]?.armed);
-    if (!armedPositions.length) return;
-
-    const interval = setInterval(async () => {
-      for (const position of armedPositions) {
-        const automation = positionAutomation[position.assetId];
-        if (!automation?.armed || automationBusy[position.assetId]) continue;
-
-        try {
-          const res = await fetch(`/api/polymarket/orderbook/${position.assetId}`);
-          const book = await res.json();
-          const bestBid = Number(book?.bids?.[0]?.price || "0");
-          updateAutomation(position.assetId, { lastPrice: bestBid.toFixed(4), status: "Monitoring" });
-
-          const tp = Number(automation.takeProfit);
-          const sl = Number(automation.stopLoss);
-          if (tp > 0 && bestBid >= tp) {
-            await exitPosition(position, "take profit", bestBid.toFixed(4));
-            continue;
-          }
-          if (sl > 0 && bestBid <= sl) {
-            await exitPosition(position, "stop loss", bestBid.toFixed(4));
-          }
-        } catch (error) {
-          console.error("Automation monitor error:", error);
-          updateAutomation(position.assetId, { status: "Monitor error" });
-        }
-      }
-    }, 15000);
-
-    return () => clearInterval(interval);
-  }, [performance, positionAutomation, automationBusy, exitPosition]);
 
   const sortedOpenPositions = performance
     ? [...performance.openPositions].sort((a, b) => Number(b.costBasis) - Number(a.costBasis))
@@ -669,6 +827,37 @@ export default function App() {
                   <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Remaining</div>
                   <div className="text-sm font-bold font-mono">{trackedOrder.remainingSize}</div>
                   <div className="text-[10px] text-zinc-500 mt-1 truncate">{trackedOrder.orderID}</div>
+                  {trackedOrder.positionState === "OPEN" && (
+                    <button
+                      onClick={async () => {
+                        try {
+                          setOrderLookupLoading(true);
+                          const response = await fetch("/api/polymarket/order/reprice", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ orderID: trackedOrder.orderID, executionMode: "AGGRESSIVE" }),
+                          });
+                          const result = await response.json();
+                          if (!response.ok) {
+                            alert(`Reprice failed: ${result.error || "Unknown error"}`);
+                            return;
+                          }
+                          if (result.replacement?.orderID) {
+                            setOrderLookupId(result.replacement.orderID);
+                            await lookupOrder(result.replacement.orderID);
+                          }
+                        } catch (error) {
+                          console.error("Reprice order error:", error);
+                          alert("Failed to reprice order.");
+                        } finally {
+                          setOrderLookupLoading(false);
+                        }
+                      }}
+                      className="mt-3 text-[10px] uppercase font-bold rounded px-2 py-1 border text-amber-300 border-amber-500/30"
+                    >
+                      Reprice To Market
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -728,6 +917,14 @@ export default function App() {
                 <div className="flex items-center justify-between mb-4">
                   <div className="text-sm font-bold">Open Positions</div>
                   <div className="flex items-center gap-2">
+                    <button
+                      onClick={refreshOpenPositionRoi}
+                      disabled={openPositionsRefreshing || filteredOpenPositions.length === 0}
+                      className="text-[10px] uppercase font-bold rounded px-2 py-1 border text-amber-300 border-amber-500/30 disabled:opacity-50 flex items-center gap-1"
+                    >
+                      <RefreshCw className={cn("w-3 h-3", openPositionsRefreshing && "animate-spin")} />
+                      Refresh ROI
+                    </button>
                     <button
                       onClick={() => setOpenPositionFilter("active")}
                       className={cn(
@@ -843,11 +1040,28 @@ export default function App() {
                                   onChange={(e) => updateAutomation(position.assetId, { stopLoss: e.target.value })}
                                   className="w-16 bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-xs font-mono"
                                 />
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0.00"
+                                  max="0.25"
+                                  placeholder="Trail"
+                                  value={positionAutomation[position.assetId]?.trailingStop || ""}
+                                  onChange={(e) => updateAutomation(position.assetId, { trailingStop: e.target.value })}
+                                  className="w-16 bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-xs font-mono"
+                                />
                                 <button
-                                  onClick={() => updateAutomation(position.assetId, {
+                                  onClick={() => recommendAutomation(position)}
+                                  disabled={automationBusy[position.assetId]}
+                                  className="text-[10px] uppercase font-bold rounded px-2 py-1 border text-emerald-300 border-emerald-500/30 disabled:opacity-50"
+                                >
+                                  Auto
+                                </button>
+                                <button
+                                  onClick={() => saveAutomation(position, {
                                     armed: !positionAutomation[position.assetId]?.armed,
-                                    status: !positionAutomation[position.assetId]?.armed ? "Armed" : "Disarmed",
                                   })}
+                                  disabled={automationBusy[position.assetId]}
                                   className={cn(
                                     "text-[10px] uppercase font-bold rounded px-2 py-1 border",
                                     positionAutomation[position.assetId]?.armed
@@ -856,6 +1070,13 @@ export default function App() {
                                   )}
                                 >
                                   {positionAutomation[position.assetId]?.armed ? "Disarm" : "Arm"}
+                                </button>
+                                <button
+                                  onClick={() => refreshPositionPrice(position)}
+                                  disabled={automationBusy[position.assetId]}
+                                  className="text-[10px] uppercase font-bold rounded px-2 py-1 border text-amber-300 border-amber-500/30 disabled:opacity-50"
+                                >
+                                  Refresh
                                 </button>
                                 <button
                                   onClick={() => exitPosition(position, "manual", positionAutomation[position.assetId]?.lastPrice || position.averagePrice)}
@@ -867,6 +1088,8 @@ export default function App() {
                               </div>
                               <div className="text-[10px] text-zinc-500">
                                 Last bid: {positionAutomation[position.assetId]?.lastPrice ? `${(Number(positionAutomation[position.assetId]?.lastPrice) * 100).toFixed(1)}c` : "--"}
+                                {positionAutomation[position.assetId]?.highestPrice ? ` | High: ${(Number(positionAutomation[position.assetId]?.highestPrice) * 100).toFixed(1)}c` : ""}
+                                {positionAutomation[position.assetId]?.trailingStopPrice ? ` | Trail stop: ${(Number(positionAutomation[position.assetId]?.trailingStopPrice) * 100).toFixed(1)}c` : ""}
                                 {positionAutomation[position.assetId]?.status ? ` | ${positionAutomation[position.assetId]?.status}` : ""}
                               </div>
                             </div>
@@ -1024,7 +1247,7 @@ export default function App() {
                                     </div>
                                   )}
 
-                                  {/* Kelly + limit price */}
+                                  {/* Kelly + execution */}
                                   <div className="flex flex-col gap-1.5">
                                     {rec?.decision === "TRADE" && isRecommended && (
                                       <div className="flex items-center justify-between bg-blue-500/10 px-2 py-1 rounded border border-blue-500/20">
@@ -1033,15 +1256,12 @@ export default function App() {
                                       </div>
                                     )}
                                     <div className="flex items-center justify-between bg-zinc-900 px-2 py-1.5 rounded border border-zinc-800">
-                                      <span className="text-[10px] text-zinc-500 font-bold uppercase">Limit:</span>
-                                      <input
-                                        type="number"
-                                        step="0.01" min="0.01" max="0.99"
-                                        value={limitPrices[`${market.id}-${idx}`] || market.outcomePrices[idx]}
-                                        onChange={(e) => setLimitPrices((prev) => ({ ...prev, [`${market.id}-${idx}`]: e.target.value }))}
-                                        className="bg-transparent text-xs font-mono w-12 text-right focus:outline-none text-zinc-300"
-                                      />
-                                      <span className="text-[10px] text-zinc-500 ml-1">USDC</span>
+                                      <span className="text-[10px] text-zinc-500 font-bold uppercase">Market Price:</span>
+                                      <span className="text-xs font-mono text-zinc-300">
+                                        {book?.asks?.[0]?.price
+                                          ? `${(parseFloat(book.asks[0].price) * 100).toFixed(1)}¢ ask`
+                                          : `${(implied * 100).toFixed(1)}¢`}
+                                      </span>
                                     </div>
                                   </div>
                                 </div>
@@ -1129,6 +1349,70 @@ export default function App() {
                                   Edge: +{rec.estimatedEdge.toFixed(1)}¢
                                 </span>
                               )}
+                            </div>
+
+                            <div className="mb-3 p-3 rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/5">
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="text-[10px] uppercase tracking-widest font-bold text-fuchsia-300">
+                                  Astrology Trading Assist
+                                </div>
+                                <div
+                                  className={cn(
+                                    "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                                    rec.astrologyBias === "BULLISH"
+                                      ? "bg-green-500/20 text-green-400"
+                                      : rec.astrologyBias === "BEARISH"
+                                        ? "bg-red-500/20 text-red-400"
+                                        : "bg-zinc-700 text-zinc-300"
+                                  )}
+                                >
+                                  {rec.astrologyBias || "NEUTRAL"}
+                                </div>
+                              </div>
+                              <div className="text-xs text-zinc-400 mb-1">
+                                Astrology confidence: <span className="text-zinc-200 font-bold">{rec.astrologyConfidence ?? 0}%</span>
+                              </div>
+                              <div className="text-xs text-zinc-400 leading-relaxed">
+                                {rec.astrologyReasoning || "Astrology layer unavailable."}
+                              </div>
+                            </div>
+
+                            <div className="mb-3 p-3 rounded-xl border border-yellow-500/20 bg-yellow-500/5">
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="text-[10px] uppercase tracking-widest font-bold text-yellow-300">
+                                  Reversal Risk
+                                </div>
+                                <div className="text-[10px] text-zinc-400 uppercase font-bold">
+                                  {rec.direction === "DOWN"
+                                    ? "Chance of sudden BUY squeeze"
+                                    : rec.direction === "UP"
+                                      ? "Chance of sudden SELL flush"
+                                      : "Two-way reversal risk"}
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-2 gap-3 mb-2">
+                                <div className="bg-zinc-950/60 rounded-lg border border-zinc-800 px-3 py-2">
+                                  <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Reversal</div>
+                                  <div className="text-lg font-bold font-mono text-yellow-300">
+                                    {rec.reversalProbability ?? 0}%
+                                  </div>
+                                </div>
+                                <div className="bg-zinc-950/60 rounded-lg border border-zinc-800 px-3 py-2">
+                                  <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">
+                                    {rec.direction === "DOWN"
+                                      ? "Opposite Buy Pressure"
+                                      : rec.direction === "UP"
+                                        ? "Opposite Sell Pressure"
+                                        : "Opposite Pressure"}
+                                  </div>
+                                  <div className="text-lg font-bold font-mono text-orange-300">
+                                    {rec.oppositePressureProbability ?? 0}%
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="text-xs text-zinc-400 leading-relaxed">
+                                {rec.reversalReasoning || "Reversal layer unavailable."}
+                              </div>
                             </div>
 
                             {/* Detected candle patterns */}
@@ -1225,20 +1509,44 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="glass-card max-w-md w-full p-8 border-blue-500/30"
+              className="glass-card max-w-md w-full max-h-[90vh] overflow-hidden border-blue-500/30 flex flex-col"
             >
-              <div className="flex items-center gap-3 mb-6 text-blue-400">
+              <div className="flex items-center gap-3 p-6 pb-4 text-blue-400 shrink-0">
                 <AlertTriangle className="w-8 h-8" />
                 <h3 className="text-2xl font-bold">Confirm Trade</h3>
               </div>
 
-              <div className="space-y-4 mb-8">
+              <div className="space-y-4 px-6 pb-6 overflow-y-auto flex-1 min-h-0">
                 <div className="p-4 bg-zinc-900 rounded-xl border border-zinc-800">
                   <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Market</div>
                   <div className="text-sm font-medium leading-tight">{confirmTradeData.market.question}</div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
+                  <div className="p-4 bg-zinc-900 rounded-xl border border-zinc-800 col-span-2">
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-3">Execution Mode</div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(["PASSIVE", "AGGRESSIVE"] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => setExecutionMode(mode)}
+                          className={cn(
+                            "rounded-lg border px-3 py-2 text-xs font-bold uppercase tracking-wider transition-colors",
+                            executionMode === mode
+                              ? "border-blue-500/40 bg-blue-500/10 text-blue-300"
+                              : "border-zinc-800 text-zinc-400"
+                          )}
+                        >
+                          {mode}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="mt-3 text-[10px] text-zinc-500">
+                      {executionMode === "PASSIVE" && "Passive: place near current best bid, better price but slower fill."}
+                      {executionMode === "AGGRESSIVE" && "Aggressive: cross to current best ask, faster fill but more expensive."}
+                    </div>
+                  </div>
                   <div className="p-4 bg-zinc-900 rounded-xl border border-zinc-800">
                     <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Outcome</div>
                     <div className={cn("text-lg font-bold", confirmTradeData.outcomeIndex === 0 ? "text-green-500" : "text-red-500")}>
@@ -1270,6 +1578,15 @@ export default function App() {
                     >
                       Use Kelly
                     </button>
+                    <label className="mt-3 flex items-center gap-2 text-[10px] text-zinc-400 font-bold uppercase tracking-widest">
+                      <input
+                        type="checkbox"
+                        checked={autoRepriceEnabled}
+                        onChange={(e) => setAutoRepriceEnabled(e.target.checked)}
+                        className="rounded border-zinc-700 bg-zinc-900"
+                      />
+                      Auto Reprice Once
+                    </label>
                   </div>
                 </div>
 
@@ -1282,6 +1599,28 @@ export default function App() {
                     <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Minimum</div>
                     <div className={cn("text-lg font-bold font-mono", preview.spend >= preview.minimumUsdc ? "text-green-400" : "text-yellow-400")}>
                       ${preview.minimumUsdc.toFixed(2)}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="p-4 bg-zinc-900 rounded-xl border border-zinc-800">
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Best Bid / Ask</div>
+                    <div className="text-sm font-bold font-mono">
+                      {preview.bestBid > 0 ? `${(preview.bestBid * 100).toFixed(1)}c` : "--"} / {preview.bestAsk > 0 ? `${(preview.bestAsk * 100).toFixed(1)}c` : "--"}
+                    </div>
+                    <div className="text-[10px] text-zinc-500 mt-1">Spread: {(preview.spread * 100).toFixed(1)}c</div>
+                  </div>
+                  <div className="p-4 bg-zinc-900 rounded-xl border border-zinc-800">
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-1">Distance To Fill</div>
+                    <div className={cn(
+                      "text-lg font-bold font-mono",
+                      preview.distanceToFill <= 0.0001 ? "text-green-400" : "text-yellow-400"
+                    )}>
+                      {preview.distanceToFill <= 0.0001 ? "At Market" : `${(preview.distanceToFill * 100).toFixed(1)}c`}
+                    </div>
+                    <div className="text-[10px] text-zinc-500 mt-1">
+                      {preview.distanceToFill <= 0.0001 ? "Should fill faster if liquidity stays." : "Your order is resting below ask."}
                     </div>
                   </div>
                 </div>
@@ -1306,14 +1645,15 @@ export default function App() {
                 })()}
 
                 <div className="p-4 bg-blue-500/10 rounded-xl border border-blue-500/20">
-                  <div className="text-[10px] uppercase tracking-widest text-blue-400 font-bold mb-1">Limit Price</div>
+                  <div className="text-[10px] uppercase tracking-widest text-blue-400 font-bold mb-1">Market Execution Price</div>
                   <div className="text-xl font-bold font-mono">
-                    {(parseFloat(limitPrices[`${confirmTradeData.market.id}-${confirmTradeData.outcomeIndex}`] || confirmTradeData.market.outcomePrices[confirmTradeData.outcomeIndex]) * 100).toFixed(1)}¢
+                    {(preview.price * 100).toFixed(1)}¢
                   </div>
+                  <div className="text-[10px] text-blue-200/80 mt-1">Mode: {executionMode}</div>
                 </div>
               </div>
 
-              <div className="flex gap-4">
+              <div className="flex gap-4 p-6 pt-4 border-t border-zinc-800/80 shrink-0">
                 <button onClick={() => { setConfirmTradeData(null); setConfirmTradeAmount(""); }} className="btn-secondary flex-1 py-3 rounded-xl font-bold uppercase tracking-wider">
                   Cancel
                 </button>
