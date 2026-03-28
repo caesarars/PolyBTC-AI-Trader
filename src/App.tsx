@@ -29,15 +29,19 @@ import {
 } from "recharts";
 import ReactMarkdown from "react-markdown";
 import CandlestickChart from "./components/CandlestickChart";
+import BotDashboard from "./components/BotDashboard";
+import BotLogSidebar from "./components/BotLogSidebar";
 
-// ── Kelly Criterion (quarter-Kelly for safety) ──────────────────────────────
+// ── Kelly Criterion (15% Kelly, hard-capped at 3% of bankroll) ──────────────
 function kellyBet(bankroll: number, confidence: number, impliedPrice: number): number {
   const p = confidence / 100;
   const q = 1 - p;
   const b = (1 - impliedPrice) / impliedPrice; // net odds
   const kelly = (p * b - q) / b;
   if (kelly <= 0) return 0;
-  return parseFloat((bankroll * kelly * 0.25).toFixed(2)); // 25% Kelly
+  const bet = bankroll * kelly * 0.15; // 15% Kelly
+  const maxBet = bankroll * 0.03;      // hard cap: 3% of bankroll
+  return parseFloat(Math.min(bet, maxBet).toFixed(2));
 }
 
 // ── Window countdown (seconds left in current 5-min session) ────────────────
@@ -133,6 +137,7 @@ export default function App() {
   const [btcHistory, setBtcHistory] = useState<BTCHistory[]>([]);
   const [indicators, setIndicators] = useState<BTCIndicators | null>(null);
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
+  const [page, setPage] = useState<"markets" | "bot">("markets");
   const [loading, setLoading] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
@@ -301,7 +306,8 @@ export default function App() {
       sentiment,
       indicators,
       { ...orderBooks, ...books },
-      marketHistories[market.id] || []
+      marketHistories[market.id] || [],
+      300 - countdown
     );
     setRecommendations((prev) => ({ ...prev, [market.id]: rec }));
     setAnalyzingId(null);
@@ -407,7 +413,7 @@ export default function App() {
   const hasEdge = (market: Market): boolean => {
     const rec = recommendations[market.id];
     if (!rec || rec.decision === "NO_TRADE") return false;
-    return rec.estimatedEdge >= 5; // at least 5¢ edge
+    return rec.estimatedEdge >= 8 && rec.riskLevel === "LOW"; // at least 8¢ edge, LOW risk only
   };
 
   const getTradePreview = (market: Market, outcomeIndex: number, amount: string) => {
@@ -637,7 +643,7 @@ export default function App() {
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-6xl mx-auto">
       {/* ── Header ── */}
-      <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-12 gap-6">
+      <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-6">
         <div>
           <h1 className="text-4xl font-bold tracking-tight mb-2 flex items-center gap-3">
             <Activity className="text-blue-500 w-10 h-10" />
@@ -711,7 +717,35 @@ export default function App() {
         </div>
       </header>
 
-      <main className="grid grid-cols-1 gap-8">
+      {/* ── Page tabs ── */}
+      <div className="flex gap-1 mb-8 bg-zinc-900 rounded-xl p-1 w-fit">
+        <button
+          type="button"
+          onClick={() => setPage("markets")}
+          className={cn(
+            "flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-bold transition-all",
+            page === "markets" ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"
+          )}
+        >
+          <Activity className="w-4 h-4" />
+          Markets
+        </button>
+        <button
+          type="button"
+          onClick={() => setPage("bot")}
+          className={cn(
+            "flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-bold transition-all",
+            page === "bot" ? "bg-blue-600 text-white" : "text-zinc-500 hover:text-zinc-300"
+          )}
+        >
+          <Zap className="w-4 h-4" />
+          Bot
+        </button>
+      </div>
+
+      {page === "bot" && <BotDashboard />}
+
+      <main className={cn("grid grid-cols-1 gap-8", page !== "markets" && "hidden")}>
         {/* ── Indicators bar ── */}
         {indicators && (
           <section className="glass-card p-4 flex flex-wrap gap-6 items-center">
@@ -1351,32 +1385,6 @@ export default function App() {
                               )}
                             </div>
 
-                            <div className="mb-3 p-3 rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/5">
-                              <div className="flex items-center justify-between mb-2">
-                                <div className="text-[10px] uppercase tracking-widest font-bold text-fuchsia-300">
-                                  Astrology Trading Assist
-                                </div>
-                                <div
-                                  className={cn(
-                                    "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
-                                    rec.astrologyBias === "BULLISH"
-                                      ? "bg-green-500/20 text-green-400"
-                                      : rec.astrologyBias === "BEARISH"
-                                        ? "bg-red-500/20 text-red-400"
-                                        : "bg-zinc-700 text-zinc-300"
-                                  )}
-                                >
-                                  {rec.astrologyBias || "NEUTRAL"}
-                                </div>
-                              </div>
-                              <div className="text-xs text-zinc-400 mb-1">
-                                Astrology confidence: <span className="text-zinc-200 font-bold">{rec.astrologyConfidence ?? 0}%</span>
-                              </div>
-                              <div className="text-xs text-zinc-400 leading-relaxed">
-                                {rec.astrologyReasoning || "Astrology layer unavailable."}
-                              </div>
-                            </div>
-
                             <div className="mb-3 p-3 rounded-xl border border-yellow-500/20 bg-yellow-500/5">
                               <div className="flex items-center justify-between mb-2">
                                 <div className="text-[10px] uppercase tracking-widest font-bold text-yellow-300">
@@ -1667,6 +1675,9 @@ export default function App() {
           })()
         )}
       </AnimatePresence>
+
+      {/* ── Bot Log Sidebar ── */}
+      <BotLogSidebar />
     </div>
   );
 }

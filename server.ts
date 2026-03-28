@@ -7,6 +7,7 @@ import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 import { MongoClient, Db, Collection } from "mongodb";
+import { analyzeMarket } from "./src/services/gemini.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,13 +81,47 @@ const MONGODB_PRICE_SNAPSHOTS_COLLECTION = process.env.MONGODB_PRICE_SNAPSHOTS_C
 const MONGODB_CHART_COLLECTION = process.env.MONGODB_CHART_COLLECTION || "chart";
 const MONGODB_POSITION_AUTOMATION_COLLECTION =
   process.env.MONGODB_POSITION_AUTOMATION_COLLECTION || "position_automation";
-const BTC_PRICE_CACHE_MS = 15_000;
-const BTC_HISTORY_CACHE_MS = 30_000;
-const BTC_INDICATORS_CACHE_MS = 30_000;
+const BTC_PRICE_CACHE_MS = 5_000;
+const BTC_HISTORY_CACHE_MS = 15_000;
+const BTC_INDICATORS_CACHE_MS = 15_000;
 const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL_SECONDS || 60 * 60 * 24 * 14);
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
-const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 20_000);
-const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 15_000);
+const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_000);
+const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 10_000);
+
+// ── Bot configuration ────────────────────────────────────────────────────────
+const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 10_000);
+const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 68);
+const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 8);
+const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.15);
+const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 50);
+const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.10);
+
+// ── Bot runtime state ────────────────────────────────────────────────────────
+let botEnabled = process.env.BOT_AUTO_START === "true";
+let botRunning = false;
+let botInterval: NodeJS.Timeout | null = null;
+let botSessionStartBalance: number | null = null;
+let botSessionTradesCount = 0;
+let botLastWindowStart = 0;
+const botAnalyzedThisWindow = new Set<string>();
+
+interface BotLogEntry {
+  timestamp: string;
+  market: string;
+  decision: string;
+  direction: string;
+  confidence: number;
+  edge: number;
+  riskLevel: string;
+  reasoning: string;
+  tradeExecuted: boolean;
+  tradeAmount?: number;
+  tradePrice?: number;
+  orderId?: string | null;
+  error?: string;
+}
+const botLog: BotLogEntry[] = [];
 
 type CacheDocument<T> = {
   _id: string;
@@ -707,6 +742,65 @@ function computeBtcIndicatorsFromHistory(history: BtcCandle[]) {
       ? "STRONG_DOWN"
       : "MIXED";
 
+  // MACD (12, 26, 9) - full rolling calculation for accurate signal line
+  const k12 = 2 / 13;
+  const k26 = 2 / 27;
+  let e12 = closes[0];
+  let e26 = closes[0];
+  const macdHistory: number[] = [];
+  for (const price of closes) {
+    e12 = price * k12 + e12 * (1 - k12);
+    e26 = price * k26 + e26 * (1 - k26);
+    macdHistory.push(e12 - e26);
+  }
+  const kMacd = 2 / 10;
+  let macdSignalVal = macdHistory[0];
+  for (const m of macdHistory) {
+    macdSignalVal = m * kMacd + macdSignalVal * (1 - kMacd);
+  }
+  const macdLine = macdHistory[macdHistory.length - 1];
+  const macdHistogram = macdLine - macdSignalVal;
+  const macdTrend = macdHistogram > 0 ? "BULLISH" : macdHistogram < 0 ? "BEARISH" : "NEUTRAL";
+
+  // Bollinger Bands (20, 2)
+  const bbPeriod = Math.min(20, closes.length);
+  const bbCloses = closes.slice(-bbPeriod);
+  const bbMiddle = bbCloses.reduce((a, b) => a + b, 0) / bbCloses.length;
+  const bbVariance = bbCloses.reduce((sum, c) => sum + Math.pow(c - bbMiddle, 2), 0) / bbCloses.length;
+  const bbStdDev = Math.sqrt(bbVariance);
+  const bbUpper = bbMiddle + 2 * bbStdDev;
+  const bbLower = bbMiddle - 2 * bbStdDev;
+  const currentClose = closes[closes.length - 1];
+  const bbPosition =
+    currentClose > bbUpper
+      ? "ABOVE_UPPER"
+      : currentClose > bbMiddle + bbStdDev
+        ? "NEAR_UPPER"
+        : currentClose < bbLower
+          ? "BELOW_LOWER"
+          : currentClose < bbMiddle - bbStdDev
+            ? "NEAR_LOWER"
+            : "MIDDLE";
+
+  // 5-candle momentum (%)
+  const momentum5 =
+    closes.length >= 6
+      ? parseFloat((((closes[closes.length - 1] - closes[closes.length - 6]) / closes[closes.length - 6]) * 100).toFixed(3))
+      : 0;
+
+  // Pre-computed signal alignment score
+  // Positive = bullish signals, Negative = bearish signals
+  let signalScore = 0;
+  if (ema9 > ema21) signalScore += 1; else signalScore -= 1;
+  if (rsi < 35) signalScore += 2;
+  else if (rsi > 65) signalScore -= 2;
+  if (macdHistogram > 0) signalScore += 1; else if (macdHistogram < 0) signalScore -= 1;
+  if (trend === "STRONG_UP") signalScore += 2; else if (trend === "STRONG_DOWN") signalScore -= 2;
+  if (momentum5 > 0.15) signalScore += 1; else if (momentum5 < -0.15) signalScore -= 1;
+  // BB: near lower = potential bullish reversal, near upper = potential bearish
+  if (bbPosition === "NEAR_LOWER" || bbPosition === "BELOW_LOWER") signalScore += 1;
+  else if (bbPosition === "NEAR_UPPER" || bbPosition === "ABOVE_UPPER") signalScore -= 1;
+
   return {
     rsi: parseFloat(rsi.toFixed(2)),
     ema9: parseFloat(ema9.toFixed(2)),
@@ -716,6 +810,16 @@ function computeBtcIndicatorsFromHistory(history: BtcCandle[]) {
     last3Candles: last3,
     trend,
     currentPrice: closes[closes.length - 1],
+    macd: parseFloat(macdLine.toFixed(2)),
+    macdSignal: parseFloat(macdSignalVal.toFixed(2)),
+    macdHistogram: parseFloat(macdHistogram.toFixed(2)),
+    macdTrend: macdTrend as "BULLISH" | "BEARISH" | "NEUTRAL",
+    bbUpper: parseFloat(bbUpper.toFixed(2)),
+    bbMiddle: parseFloat(bbMiddle.toFixed(2)),
+    bbLower: parseFloat(bbLower.toFixed(2)),
+    bbPosition: bbPosition as "ABOVE_UPPER" | "NEAR_UPPER" | "MIDDLE" | "NEAR_LOWER" | "BELOW_LOWER",
+    momentum5,
+    signalScore,
   };
 }
 
@@ -1160,13 +1264,34 @@ async function startServer() {
   };
 
   const recommendAutomationLevels = (averagePrice: number) => {
-    const tpDistance = Math.max(0.06, averagePrice * 0.18);
-    const slDistance = Math.max(0.03, averagePrice * 0.1);
-    const trailingDistance = Math.max(0.02, averagePrice * 0.06);
+    // TP/SL scaled to absolute price zone — binaries have non-linear payoff
+    let tpTarget: number;
+    let slTarget: number;
+    let trailingDistance: number;
+
+    if (averagePrice < 0.35) {
+      tpTarget = Math.min(0.78, averagePrice + 0.30);
+      slTarget = Math.max(0.01, averagePrice - 0.12);
+      trailingDistance = 0.10;
+    } else if (averagePrice < 0.50) {
+      tpTarget = Math.min(0.75, averagePrice + 0.22);
+      slTarget = Math.max(0.01, averagePrice - 0.10);
+      trailingDistance = 0.08;
+    } else if (averagePrice < 0.65) {
+      tpTarget = Math.min(0.82, averagePrice + 0.18);
+      slTarget = Math.max(0.01, averagePrice - 0.12);
+      trailingDistance = 0.07;
+    } else {
+      // High-price entry: limited upside, tight risk
+      tpTarget = Math.min(0.90, averagePrice + 0.10);
+      slTarget = Math.max(0.01, averagePrice - 0.08);
+      trailingDistance = 0.05;
+    }
+
     return {
-      takeProfit: Math.min(0.99, averagePrice + tpDistance).toFixed(2),
-      stopLoss: Math.max(0.01, averagePrice - slDistance).toFixed(2),
-      trailingStop: Math.min(0.25, trailingDistance).toFixed(2),
+      takeProfit: tpTarget.toFixed(2),
+      stopLoss: slTarget.toFixed(2),
+      trailingStop: trailingDistance.toFixed(2),
     };
   };
 
@@ -1273,7 +1398,380 @@ async function startServer() {
 
   startPositionAutomationMonitor();
 
+  // ── Bot logging helper ────────────────────────────────────────────────────
+  const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
+  const botPrint = (level: "INFO" | "WARN" | "TRADE" | "OK" | "SKIP" | "ERR", msg: string) => {
+    const icons: Record<string, string> = {
+      INFO:  "─",
+      WARN:  "⚠",
+      TRADE: "💰",
+      OK:    "✓",
+      SKIP:  "✗",
+      ERR:   "✖",
+    };
+    console.log(`[${ts()}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
+  };
+
+  // ── Bot cycle ──────────────────────────────────────────────────────────────
+  const runBotCycle = async () => {
+    if (botRunning || !botEnabled) return;
+    botRunning = true;
+    try {
+      const nowUtcSeconds = Math.floor(Date.now() / 1000);
+      const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+      const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
+      const windowRemaining = MARKET_SESSION_SECONDS - windowElapsedSeconds;
+      const mm = String(Math.floor(windowRemaining / 60)).padStart(2, "0");
+      const ss = String(windowRemaining % 60).padStart(2, "0");
+
+      // Reset per-window state when a new 5-min window starts
+      if (currentWindowStart !== botLastWindowStart) {
+        botAnalyzedThisWindow.clear();
+        botLastWindowStart = currentWindowStart;
+        botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
+      }
+
+      // Only trade in the valid entry zone (30s–270s elapsed)
+      if (windowElapsedSeconds < 30 || windowElapsedSeconds > 270) {
+        botPrint("SKIP", `Window ${windowElapsedSeconds < 30 ? "too early (< 30s)" : "closing soon (> 270s)"} — ${mm}:${ss} remaining. Waiting.`);
+        return;
+      }
+
+      // Fetch current market
+      const slug = `btc-updown-5m-${currentWindowStart}`;
+      const parseArr = (val: any): any[] => {
+        if (Array.isArray(val)) return val;
+        if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
+        return [];
+      };
+
+      botPrint("INFO", `Scanning window ${mm}:${ss} remaining | elapsed=${windowElapsedSeconds}s | slug=${slug}`);
+
+      let markets: any[] = [];
+      try {
+        const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
+        const event = eventRes.data;
+        markets = (event?.markets || []).map((m: any) => ({
+          ...m,
+          outcomes: parseArr(m.outcomes),
+          outcomePrices: parseArr(m.outcomePrices),
+          clobTokenIds: parseArr(m.clobTokenIds),
+          eventSlug: event.slug,
+          eventTitle: event.title,
+          eventId: event.id,
+          startDate: event.startDate,
+          endDate: event.endDate,
+        }));
+        if (markets.length === 0) {
+          botPrint("WARN", `No markets found for slug: ${slug}`);
+          return;
+        }
+        botPrint("INFO", `Found ${markets.length} market(s) for window`);
+      } catch {
+        botPrint("ERR", `Failed to fetch market for slug: ${slug}`);
+        return;
+      }
+
+      for (const market of markets) {
+        if (botAnalyzedThisWindow.has(market.id)) {
+          botPrint("SKIP", `Already analyzed this window: ${market.question?.slice(0, 50)}`);
+          continue;
+        }
+        botAnalyzedThisWindow.add(market.id);
+
+        botPrint("INFO", `Analyzing: ${market.question?.slice(0, 60)}`);
+
+        try {
+          // Fetch all data in parallel
+          botPrint("INFO", "Fetching BTC price, history, indicators, sentiment...");
+          const [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData] = await Promise.all([
+            getBtcPrice(),
+            getBtcHistory(),
+            getBtcIndicators(),
+            axios.get("https://api.alternative.me/fng/", { timeout: 5000 })
+              .then((r) => r.data.data[0]).catch(() => null),
+          ]);
+          botPrint("OK", `BTC $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+
+          // Fetch order books with computed imbalance + liquidity
+          botPrint("INFO", "Fetching order books...");
+          const tokenIds: string[] = market.clobTokenIds || [];
+          const orderBooks: Record<string, any> = {};
+          await Promise.all(tokenIds.map(async (tid, idx) => {
+            try {
+              const client = await getClobClient();
+              const raw: any = client
+                ? await client.getOrderBook(tid)
+                : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
+              const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
+              const sumNotional = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
+              const bidSize = sumSize(raw.bids);
+              const askSize = sumSize(raw.asks);
+              const total = bidSize + askSize;
+              const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
+              const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
+              const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
+              orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
+              const outcome = market.outcomes?.[idx] ?? `Token${idx}`;
+              botPrint("OK", `OrderBook [${outcome}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} imbalance=${(imbalance * 100).toFixed(0)}% (${imbalanceSignal}) liquidity=$${totalLiquidityUsdc}`);
+            } catch {
+              botPrint("WARN", `Failed to fetch order book for token ${tid.slice(0, 12)}...`);
+            }
+          }));
+
+          // Fetch Polymarket price history for velocity signal
+          let marketHistory: { t: number; yes: number; no: number }[] = [];
+          const yesId = tokenIds[0];
+          if (yesId) {
+            try {
+              const [yRes, nRes] = await Promise.all([
+                axios.get("https://clob.polymarket.com/prices-history", { params: { market: yesId, interval: "1m", fidelity: 10 }, timeout: 5000 }),
+                tokenIds[1] ? axios.get("https://clob.polymarket.com/prices-history", { params: { market: tokenIds[1], interval: "1m", fidelity: 10 }, timeout: 5000 }) : Promise.resolve({ data: [] }),
+              ]);
+              const yesData: { t: number; p: number }[] = Array.isArray(yRes.data) ? yRes.data : (yRes.data?.history ?? []);
+              const noData: { t: number; p: number }[] = Array.isArray(nRes.data) ? nRes.data : (nRes.data?.history ?? []);
+              const noMap = new Map(noData.map((d) => [d.t, d.p]));
+              marketHistory = yesData.map((d) => ({ t: d.t, yes: d.p, no: noMap.get(d.t) ?? 1 - d.p }));
+              const latestYes = marketHistory[marketHistory.length - 1]?.yes;
+              botPrint("OK", `Market history: ${marketHistory.length} points | Latest YES: ${latestYes !== undefined ? (latestYes * 100).toFixed(1) + "¢" : "?"}`);
+            } catch {
+              botPrint("WARN", "Market price history unavailable — velocity signal disabled");
+            }
+          }
+
+          botPrint("INFO", "Calling Gemini AI for analysis...");
+          const rec = await analyzeMarket(
+            market,
+            btcPriceData?.price ?? null,
+            btcHistoryResult?.history ?? [],
+            sentimentData,
+            btcIndicatorsData,
+            orderBooks,
+            marketHistory,
+            windowElapsedSeconds
+          );
+
+          // Log AI result
+          const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
+          botPrint(
+            rec.decision === "TRADE" ? "INFO" : "SKIP",
+            `AI Result: ${decisionIcon} ${rec.decision} ${rec.direction} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}¢ | risk=${rec.riskLevel}`
+          );
+          botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
+
+          const qualifies =
+            rec.decision === "TRADE" &&
+            rec.confidence >= BOT_MIN_CONFIDENCE &&
+            rec.estimatedEdge >= BOT_MIN_EDGE &&
+            rec.riskLevel === "LOW";
+
+          if (rec.decision === "TRADE" && !qualifies) {
+            const reasons: string[] = [];
+            if (rec.confidence < BOT_MIN_CONFIDENCE) reasons.push(`conf ${rec.confidence}% < ${BOT_MIN_CONFIDENCE}%`);
+            if (rec.estimatedEdge < BOT_MIN_EDGE) reasons.push(`edge ${rec.estimatedEdge}¢ < ${BOT_MIN_EDGE}¢`);
+            if (rec.riskLevel !== "LOW") reasons.push(`risk=${rec.riskLevel} (need LOW)`);
+            botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")}`);
+          }
+
+          const logEntry: BotLogEntry = {
+            timestamp: new Date().toISOString(),
+            market: market.question || market.id,
+            decision: rec.decision,
+            direction: rec.direction,
+            confidence: rec.confidence,
+            edge: rec.estimatedEdge,
+            riskLevel: rec.riskLevel,
+            reasoning: rec.reasoning,
+            tradeExecuted: false,
+          };
+
+          if (qualifies) {
+            botPrint("TRADE", `SIGNAL QUALIFIED ✓ — preparing to execute ${rec.direction} trade`);
+            const client = await getClobClient();
+            if (!client) {
+              logEntry.error = "CLOB client not ready — trade skipped.";
+              botPrint("ERR", "CLOB client not initialized. Check POLYGON_PRIVATE_KEY.");
+            } else {
+              // Initialise session balance on first qualifying trade
+              if (botSessionStartBalance === null) {
+                try {
+                  const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                  botSessionStartBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+                  botPrint("OK", `Session initialized. Starting balance: $${botSessionStartBalance.toFixed(2)} USDC`);
+                } catch { /* non-fatal */ }
+              }
+
+              // Session loss guard
+              let currentBalance = botSessionStartBalance ?? 0;
+              try {
+                const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+                botPrint("INFO", `Current balance: $${currentBalance.toFixed(2)} USDC (session start: $${botSessionStartBalance?.toFixed(2) ?? "?"})`);
+              } catch { /* use last known */ }
+
+              const sessionLossPct = botSessionStartBalance && botSessionStartBalance > 0
+                ? (botSessionStartBalance - currentBalance) / botSessionStartBalance
+                : 0;
+
+              if (sessionLossPct >= BOT_SESSION_LOSS_LIMIT) {
+                botPrint("WARN", `━━━ SESSION LOSS LIMIT HIT: ${(sessionLossPct * 100).toFixed(1)}% drawdown ≥ ${BOT_SESSION_LOSS_LIMIT * 100}% limit. BOT HALTED. ━━━`);
+                botEnabled = false;
+                logEntry.reasoning = `SESSION STOP: Down ${(sessionLossPct * 100).toFixed(1)}% — bot halted.`;
+                botLog.unshift(logEntry);
+                if (botLog.length > 100) botLog.pop();
+                break;
+              }
+
+              // Compute Kelly bet capped at 3% bankroll and BOT_MAX_BET_USDC
+              const outcomeIndex = rec.direction === "UP" ? 0 : 1;
+              const tokenId: string = market.clobTokenIds?.[outcomeIndex];
+              if (tokenId) {
+                const impliedPrice = parseFloat(market.outcomePrices[outcomeIndex] || "0.5");
+                const p = rec.confidence / 100;
+                const b = (1 - impliedPrice) / impliedPrice;
+                const kelly = (p * b - (1 - p)) / b;
+                const rawBet = kelly > 0 ? currentBalance * kelly * BOT_KELLY_FRACTION : 0;
+                const betAmount = parseFloat(Math.min(rawBet, BOT_MAX_BET_USDC, currentBalance * 0.03).toFixed(2));
+                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${betAmount.toFixed(2)} (max_bet=$${BOT_MAX_BET_USDC}, 3%_bankroll=$${(currentBalance * 0.03).toFixed(2)})`);
+
+                if (betAmount < 1) {
+                  botPrint("SKIP", `Bet too small ($${betAmount.toFixed(2)} < $1 minimum). Skipping trade.`);
+                  logEntry.reasoning += ` | Skipped: Kelly bet too small ($${betAmount.toFixed(2)}).`;
+                } else {
+                  const ob = orderBooks[tokenId];
+                  const bestAsk = Number(ob?.asks?.[0]?.price || impliedPrice.toString());
+                  const bestBid = Number(ob?.bids?.[0]?.price || "0");
+                  botPrint("TRADE", `━━━ EXECUTING ORDER ━━━`);
+                  botPrint("TRADE", `Direction : ${rec.direction === "UP" ? "▲ UP (YES)" : "▼ DOWN (NO)"}`);
+                  botPrint("TRADE", `Amount    : $${betAmount.toFixed(2)} USDC`);
+                  botPrint("TRADE", `Price     : ${(bestAsk * 100).toFixed(1)}¢ (ask) | ${(bestBid * 100).toFixed(1)}¢ (bid)`);
+                  botPrint("TRADE", `Confidence: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`);
+                  try {
+                    const tradeResult = await executePolymarketTrade({
+                      tokenID: tokenId,
+                      amount: betAmount,
+                      side: Side.BUY,
+                      price: bestAsk,
+                      executionMode: "AGGRESSIVE",
+                      amountMode: "SPEND",
+                    });
+
+                    // Auto-arm TP/SL based on entry price zone
+                    const levels = recommendAutomationLevels(bestAsk);
+                    await savePositionAutomation({
+                      assetId: tokenId,
+                      market: market.question || market.id,
+                      outcome: market.outcomes?.[outcomeIndex] || rec.direction,
+                      averagePrice: bestAsk.toFixed(4),
+                      size: tradeResult.orderSize.toFixed(6),
+                      takeProfit: levels.takeProfit,
+                      stopLoss: levels.stopLoss,
+                      trailingStop: levels.trailingStop,
+                      armed: true,
+                    });
+
+                    botSessionTradesCount++;
+                    logEntry.tradeExecuted = true;
+                    logEntry.tradeAmount = betAmount;
+                    logEntry.tradePrice = bestAsk;
+                    logEntry.orderId = tradeResult.orderID;
+                    botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
+                    botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}¢ distance — automation ARMED`);
+                    botPrint("OK", `Session trades: ${botSessionTradesCount} | Balance: ~$${currentBalance.toFixed(2)}`);
+                  } catch (tradeErr: any) {
+                    logEntry.error = tradeErr?.message || String(tradeErr);
+                    botPrint("ERR", `Trade execution failed: ${logEntry.error}`);
+                  }
+                }
+              }
+            }
+          } else if (rec.decision === "NO_TRADE") {
+            botPrint("SKIP", `No trade — waiting for next qualifying setup`);
+          }
+
+          botLog.unshift(logEntry);
+          if (botLog.length > 100) botLog.pop();
+        } catch (err: any) {
+          botPrint("ERR", `Analysis error: ${err?.message || String(err)}`);
+        }
+      }
+    } finally {
+      botRunning = false;
+    }
+  };
+
+  const startBot = () => {
+    if (botInterval) return;
+    console.log("");
+    console.log("╔═══════════════════════════════════════════════════╗");
+    console.log("║          PolyBTC AI Trading Bot — STARTED         ║");
+    console.log("╚═══════════════════════════════════════════════════╝");
+    botPrint("INFO", `Min confidence : ${BOT_MIN_CONFIDENCE}%`);
+    botPrint("INFO", `Min edge       : ${BOT_MIN_EDGE}¢`);
+    botPrint("INFO", `Max bet        : $${BOT_MAX_BET_USDC} USDC`);
+    botPrint("INFO", `Kelly fraction : ${BOT_KELLY_FRACTION * 100}%`);
+    botPrint("INFO", `Session limit  : -${BOT_SESSION_LOSS_LIMIT * 100}% halt`);
+    botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
+    console.log("");
+    void runBotCycle();
+    botInterval = setInterval(() => void runBotCycle(), BOT_SCAN_INTERVAL_MS);
+  };
+
+  const stopBot = () => {
+    if (botInterval) { clearInterval(botInterval); botInterval = null; }
+    botEnabled = false;
+    console.log("");
+    botPrint("WARN", "Bot stopped by user.");
+    console.log("");
+  };
+
+  if (botEnabled) startBot();
+
   app.use(express.json());
+
+  // ── Bot control API ────────────────────────────────────────────────────────
+  app.get("/api/bot/status", (_req, res) => {
+    const nowUtcSeconds = Math.floor(Date.now() / 1000);
+    const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+    const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
+    res.json({
+      enabled: botEnabled,
+      running: botRunning,
+      sessionStartBalance: botSessionStartBalance,
+      sessionTradesCount: botSessionTradesCount,
+      windowElapsedSeconds,
+      analyzedThisWindow: botAnalyzedThisWindow.size,
+      config: {
+        minConfidence: BOT_MIN_CONFIDENCE,
+        minEdge: BOT_MIN_EDGE,
+        kellyFraction: BOT_KELLY_FRACTION,
+        maxBetUsdc: BOT_MAX_BET_USDC,
+        sessionLossLimit: BOT_SESSION_LOSS_LIMIT,
+        scanIntervalMs: BOT_SCAN_INTERVAL_MS,
+      },
+    });
+  });
+
+  app.post("/api/bot/control", (req, res) => {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled (boolean) is required." });
+    }
+    if (enabled) {
+      botEnabled = true;
+      botSessionStartBalance = null; // reset session on re-enable
+      botSessionTradesCount = 0;
+      startBot();
+      res.json({ enabled: true, message: "Bot started." });
+    } else {
+      stopBot();
+      res.json({ enabled: false, message: "Bot stopped." });
+    }
+  });
+
+  app.get("/api/bot/log", (_req, res) => {
+    res.json({ log: botLog });
+  });
 
   // API Proxy for Polymarket — BTC Up/Down 5-Minute Events (5 timeframes)
   app.get("/api/polymarket/markets", async (req, res) => {
@@ -1349,15 +1847,19 @@ async function startServer() {
       // Compute order book imbalance: totalBidSize / (totalBidSize + totalAskSize)
       const sumSize = (orders: any[]) =>
         (orders || []).reduce((acc: number, o: any) => acc + parseFloat(o.size || "0"), 0);
+      const sumNotional = (orders: any[]) =>
+        (orders || []).reduce((acc: number, o: any) => acc + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
       const bidSize = sumSize(raw.bids);
       const askSize = sumSize(raw.asks);
       const total = bidSize + askSize;
       const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
-      const imbalanceSignal = imbalance > 0.65 ? "BUY_PRESSURE"
-                            : imbalance < 0.35 ? "SELL_PRESSURE"
+      const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE"
+                            : imbalance < 0.40 ? "SELL_PRESSURE"
                             : "NEUTRAL";
+      // Total USDC liquidity (notional value of all resting orders)
+      const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
 
-      res.json({ ...raw, imbalance, imbalanceSignal });
+      res.json({ ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc });
     } catch (error: any) {
       console.error("Polymarket CLOB API Error:", error.message);
       res.status(500).json({ error: "Failed to fetch order book" });

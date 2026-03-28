@@ -9,6 +9,7 @@ export interface OrderBook {
   hash?: string;
   imbalance?: number;
   imbalanceSignal?: "BUY_PRESSURE" | "SELL_PRESSURE" | "NEUTRAL";
+  totalLiquidityUsdc?: number;
 }
 
 export interface BTCIndicators {
@@ -20,6 +21,20 @@ export interface BTCIndicators {
   trend: "STRONG_UP" | "STRONG_DOWN" | "MIXED";
   last3Candles: { open: number; high: number; low: number; close: number; direction: "UP" | "DOWN" }[];
   currentPrice: number;
+  // MACD
+  macd: number;
+  macdSignal: number;
+  macdHistogram: number;
+  macdTrend: "BULLISH" | "BEARISH" | "NEUTRAL";
+  // Bollinger Bands
+  bbUpper: number;
+  bbMiddle: number;
+  bbLower: number;
+  bbPosition: "ABOVE_UPPER" | "NEAR_UPPER" | "MIDDLE" | "NEAR_LOWER" | "BELOW_LOWER";
+  // Momentum
+  momentum5: number;
+  // Pre-computed signal alignment score (-6 bullish to +6 bearish, negative = bullish)
+  signalScore: number;
 }
 
 export interface Market {
@@ -32,7 +47,6 @@ export interface Market {
   clobTokenIds: string[];
   active: boolean;
   closed: boolean;
-  endDate: string;
   image: string;
   icon: string;
   category: string;
@@ -75,9 +89,6 @@ export interface AIRecommendation {
   reasoning: string;
   riskLevel: "LOW" | "MEDIUM" | "HIGH";
   dataMode?: "FULL_DATA" | "POLYMARKET_ONLY";
-  astrologyBias?: "BULLISH" | "BEARISH" | "NEUTRAL";
-  astrologyConfidence?: number;
-  astrologyReasoning?: string;
   reversalProbability?: number;
   oppositePressureProbability?: number;
   reversalReasoning?: string;
