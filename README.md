@@ -1,340 +1,220 @@
 # PolyBTC AI Trader
 
-Bot dashboard untuk:
-- scan market BTC 5 menit di Polymarket
-- kasih analisa AI
-- place trade
-- track order
-- lihat open positions, PnL, winrate
-- set take profit / stop loss dari UI
+> Bot trading otomatis berbasis AI untuk pasar prediksi BTC 5-menit di Polymarket — dengan analisa teknikal, eksekusi order CLOB, adaptive learning, dan dashboard real-time.
 
-## Yang Perlu Disiapkan
+---
 
-Sebelum jalanin project ini, kamu butuh:
-- `Node.js`
-- akun `Polymarket`
-- wallet Polygon yang dipakai untuk akun Polymarket
-- `Gemini API key`
+## Fitur Utama
 
-## Install
+| Fitur | Deskripsi |
+|---|---|
+| **AI Analysis** | Google Gemini menganalisa order book, indikator teknikal, dan sentimen pasar sebelum tiap keputusan trade |
+| **Auto Trading** | Eksekusi order otomatis ke Polymarket CLOB dengan position sizing Kelly Criterion |
+| **Technical Indicators** | RSI(14), EMA(9/21), MACD, Bollinger Bands, volume spike, signal score alignment |
+| **Adaptive Learning** | Bot menyimpan pola loss dan menyesuaikan confidence untuk trade berikutnya |
+| **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI |
+| **Performance Tracking** | Realized PnL, unrealized ROI, win rate, trade history lengkap |
+| **Live Dashboard** | Candlestick chart real-time, order book, log bot, dan session stats |
+| **MongoDB Cache** | Cache BTC price & candle history untuk resiliensi saat provider eksternal rate-limit |
 
-1. Install dependency
+---
+
+## Tech Stack
+
+**Frontend**
+- React 19 + Vite + TypeScript
+- Tailwind CSS + Framer Motion
+- Lightweight Charts (candlestick) + Recharts (analytics)
+- Lucide React (icons)
+
+**Backend**
+- Node.js + Express (TypeScript via `tsx`)
+- Polymarket CLOB Client (`@polymarket/clob-client`)
+- Ethers.js 5 (wallet signing, blockchain interaction)
+- Google Gemini AI (`@google/genai`)
+- MongoDB (optional caching)
+
+---
+
+## Cara Kerja
+
+Bot berjalan dalam siklus 5 detik:
+
+1. **Scan** — Ambil daftar pasar BTC 5-menit aktif di Polymarket
+2. **Analisa** — Hitung indikator teknikal (60 candle), baca order book, kirim ke Gemini AI
+3. **Keputusan** — AI return `TRADE / NO_TRADE` + direction, confidence, estimated edge, risk level
+4. **Gate Check** — Validasi timing window (10–285 detik), likuiditas order book ($150+), signal alignment (min 2 dari 4)
+5. **Eksekusi** — Submit order ke Polymarket CLOB dengan size dari Kelly Criterion (max 3% bankroll)
+6. **Tracking** — Monitor fill status, hitung PnL saat window tutup
+7. **Learning** — Simpan pola loss, kurangi confidence kalau setup serupa muncul lagi
+
+---
+
+## Prasyarat
+
+- Node.js 18+
+- Akun Polymarket dengan wallet Polygon dan saldo USDC
+- [Google AI Studio API Key](https://aistudio.google.com/) untuk Gemini
+- (Opsional) MongoDB Atlas untuk caching
+
+---
+
+## Instalasi
 
 ```bash
+# 1. Install dependencies
 npm install
-```
 
-2. Copy file env example
+# 2. Copy file env
+cp .env.example .env   # Linux/Mac
+copy .env.example .env # Windows
 
-```bash
-copy .env.example .env
-```
+# 3. Isi .env (lihat panduan di bawah)
 
-3. Isi `.env`
-
-4. Jalankan app
-
-```bash
+# 4. Jalankan app
 npm run dev
 ```
 
-## Tutorial Isi `.env` Untuk Orang Awam
+Buka `http://localhost:5173` di browser.
 
-File `.env` itu tempat nyimpen data rahasia dan konfigurasi.
+---
 
-Jangan pernah share file `.env` ke orang lain.
-Jangan commit file `.env` ke GitHub.
+## Konfigurasi `.env`
 
-Format dasarnya seperti ini:
+> **PENTING:** Jangan pernah commit file `.env` ke GitHub. File ini sudah ada di `.gitignore`.
+
+### Wajib
 
 ```env
-POLYGON_PRIVATE_KEY=...
+# Wallet Polygon yang terhubung ke akun Polymarket
+POLYGON_PRIVATE_KEY=0x...
+
+# Credentials API Polymarket (bisa di-derive otomatis dari wallet jika tidak ada)
 POLYMARKET_API_KEY=...
 POLYMARKET_API_SECRET=...
 POLYMARKET_API_PASSPHRASE=...
+
+# Tipe signature: 0 = wallet EOA biasa, 1 = profile/proxy wallet Polymarket
 POLYMARKET_SIGNATURE_TYPE=1
-POLYMARKET_FUNDER_ADDRESS=...
+
+# Profile address Polymarket (sering beda dengan address wallet signer)
+POLYMARKET_FUNDER_ADDRESS=0x...
+
+# RPC Polygon (sudah ada fallback otomatis, tidak perlu diubah)
 POLYGON_RPC_URLS=https://1rpc.io/matic,https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org
-GEMINI_API_KEY=...
-MONGODB_URI=...
-MONGODB_DB_NAME=polybtc
-MONGODB_CACHE_COLLECTION=market_cache
-MONGODB_PRICE_SNAPSHOTS_COLLECTION=btc_price_snapshots
-MONGODB_CHART_COLLECTION=chart
-MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
-BTC_BACKGROUND_SYNC_MS=20000
-POSITION_AUTOMATION_SYNC_MS=15000
-BTC_PRICE_SNAPSHOT_TTL_SECONDS=1209600
-BTC_CANDLE_TTL_SECONDS=2592000
-```
 
-Di bawah ini penjelasan satu-satu.
-
-### 1. `POLYGON_PRIVATE_KEY`
-
-Ini private key wallet Polygon yang dipakai untuk sign request ke Polymarket.
-
-Contoh:
-
-```env
-POLYGON_PRIVATE_KEY=0xabc123...
-```
-
-Cara ambil:
-- buka wallet kamu yang dipakai untuk Polymarket
-- cari menu `Export Private Key`
-- copy private key itu ke `.env`
-
-Penting:
-- ini data paling sensitif
-- siapa pun yang punya ini bisa ambil alih wallet kamu
-- jangan screenshot
-- jangan kirim ke chat
-- jangan upload ke GitHub
-
-### 2. `POLYMARKET_API_KEY`
-### 3. `POLYMARKET_API_SECRET`
-### 4. `POLYMARKET_API_PASSPHRASE`
-
-Tiga nilai ini adalah credential API dari akun Polymarket kamu.
-
-Kalau project gagal pakai nilai lama, backend project ini akan coba derive key lagi otomatis dari wallet signer. Tapi tetap lebih bagus kalau kamu isi dengan benar.
-
-Cara ambil untuk orang awam:
-- login ke akun Polymarket kamu
-- buka bagian API / developer credentials kalau tersedia
-- kalau kamu tidak punya key manual, biasanya app ini tetap bisa derive dari wallet yang benar
-
-Kalau kamu sudah punya:
-
-```env
-POLYMARKET_API_KEY=your_key
-POLYMARKET_API_SECRET=your_secret
-POLYMARKET_API_PASSPHRASE=your_passphrase
-```
-
-### 5. `POLYMARKET_SIGNATURE_TYPE`
-
-Ini penanda tipe akun Polymarket kamu.
-
-Nilai yang umum:
-- `0` = wallet EOA biasa
-- `1` = profile / proxy wallet Polymarket
-
-Kalau kamu pakai profile address Polymarket dan balance yang benar baru kebaca saat signature type `1`, isi:
-
-```env
-POLYMARKET_SIGNATURE_TYPE=1
-```
-
-Kalau salah isi:
-- balance bisa kebaca salah
-- order bisa gagal
-- funder address bisa tidak sinkron
-
-### 6. `POLYMARKET_FUNDER_ADDRESS`
-
-Ini address profile Polymarket kamu.
-
-Sering beda dengan address wallet signer.
-
-Contoh:
-
-```env
-POLYMARKET_FUNDER_ADDRESS=0x1234...
-```
-
-Cara lihat:
-- login ke `polymarket.com`
-- buka settings / profile
-- cari profile address atau funder address
-
-Kalau balance di profile Polymarket kamu beda dengan balance wallet, biasanya kamu wajib isi field ini.
-
-### 7. `POLYGON_RPC_URLS`
-
-Ini daftar RPC Polygon yang dipakai backend untuk baca blockchain.
-
-Default aman:
-
-```env
-POLYGON_RPC_URLS=https://1rpc.io/matic,https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org
-```
-
-Kalau satu RPC mati, app akan coba fallback ke yang lain.
-
-Biasanya tidak perlu diubah kalau kamu tidak tahu ini apa.
-
-### 8. `GEMINI_API_KEY`
-
-Ini API key untuk fitur analisa AI.
-
-Cara ambil:
-- buka Google AI Studio
-- buat API key
-- copy hasilnya ke `.env`
-
-Contoh:
-
-```env
+# API key Google Gemini untuk analisa AI
 GEMINI_API_KEY=AIza...
 ```
 
-Kalau kosong:
-- app tetap bisa buka dashboard
-- tapi analisa AI tidak akan jalan
-
-### 9. `MONGODB_URI`
-### 10. `MONGODB_DB_NAME`
-
-Ini optional, tapi sangat disarankan.
-
-Fungsinya:
-- nyimpen latest BTC price
-- nyimpen short candle history BTC
-- jadi cache internal kalau provider public seperti Binance / CoinGecko lagi error atau rate limit
-
-Contoh:
+### Opsional (MongoDB Cache)
 
 ```env
-MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/cryptoNews
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/
 MONGODB_DB_NAME=polybtc
 MONGODB_CACHE_COLLECTION=market_cache
 MONGODB_PRICE_SNAPSHOTS_COLLECTION=btc_price_snapshots
 MONGODB_CHART_COLLECTION=chart
-BTC_BACKGROUND_SYNC_MS=20000
 MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
+
+# Interval sync background (milliseconds)
+BTC_BACKGROUND_SYNC_MS=20000
 POSITION_AUTOMATION_SYNC_MS=15000
-BTC_PRICE_SNAPSHOT_TTL_SECONDS=1209600
-BTC_CANDLE_TTL_SECONDS=2592000
+
+# TTL data cache (seconds)
+BTC_PRICE_SNAPSHOT_TTL_SECONDS=1209600   # 14 hari
+BTC_CANDLE_TTL_SECONDS=2592000           # 30 hari
 ```
 
-Kalau tidak diisi:
-- app tetap jalan
-- tapi BTC endpoint akan lebih bergantung ke provider public langsung
+---
 
-Arti nilai tambahannya:
-- `MONGODB_DB_NAME`: nama database Mongo yang dipakai app
-- `MONGODB_CACHE_COLLECTION`: collection cache latest
-- `MONGODB_PRICE_SNAPSHOTS_COLLECTION`: collection histori snapshot harga
-- `MONGODB_CHART_COLLECTION`: collection candle chart BTC 1m
-- `MONGODB_POSITION_AUTOMATION_COLLECTION`: collection backend TP/SL and trailing stop
-- `BTC_BACKGROUND_SYNC_MS`: interval backend refresh data BTC ke Mongo
-- `POSITION_AUTOMATION_SYNC_MS`: interval backend monitor TP/SL positions
-- `BTC_PRICE_SNAPSHOT_TTL_SECONDS`: berapa lama price snapshot disimpan
-- `BTC_CANDLE_TTL_SECONDS`: berapa lama candle 1m disimpan
+## API Endpoints
 
-Penting:
-- jangan pakai URI MongoDB asli di file yang di-commit
-- kalau URI ini pernah kebocoran ke chat / screenshot / GitHub, rotate password database
+| Method | Endpoint | Deskripsi |
+|---|---|---|
+| GET | `/api/bot/status` | Status bot, session stats, konfigurasi |
+| POST | `/api/bot/control` | Enable/disable bot `{ enabled: boolean }` |
+| GET | `/api/bot/log` | Log keputusan trade |
+| GET | `/api/bot/learning` | State adaptive learning (pola loss, confidence) |
+| GET | `/api/polymarket/markets` | Daftar pasar BTC aktif |
+| GET | `/api/polymarket/orderbook/:tokenID` | Order book + imbalance signal |
+| POST | `/api/polymarket/trade` | Eksekusi trade manual |
+| GET | `/api/polymarket/performance` | PnL, win rate, trade history |
+| GET | `/api/polymarket/balance` | Saldo USDC |
+| GET | `/api/btc-price` | Harga BTC terkini |
+| GET | `/api/btc-history` | 60 candle 1-menit terakhir |
+| GET | `/api/btc-indicators` | RSI, MACD, Bollinger Bands, dll |
+| GET | `/api/sentiment` | Fear & Greed index |
+| GET | `/api/debug/btc-cache` | Status MongoDB cache |
+| GET/POST | `/api/polymarket/automation` | Kelola TP/SL automation per posisi |
 
-## Contoh `.env`
+---
 
-Ini contoh bentuk file yang benar:
+## Keamanan
 
-```env
-# Polymarket CLOB Credentials
-POLYGON_PRIVATE_KEY=0xyour_polygon_private_key
-POLYMARKET_API_KEY=your_polymarket_api_key
-POLYMARKET_API_SECRET=your_polymarket_api_secret
-POLYMARKET_API_PASSPHRASE=your_polymarket_api_passphrase
-POLYMARKET_SIGNATURE_TYPE=1
-POLYMARKET_FUNDER_ADDRESS=0xyour_polymarket_profile_or_funder_address
-POLYGON_RPC_URLS=https://1rpc.io/matic,https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org
+- Private key adalah data paling sensitif — siapa pun yang punya ini bisa kontrol wallet
+- Gunakan wallet khusus trading bot, **bukan** wallet utama
+- Jika private key pernah bocor (screenshot, chat, GitHub): segera pindahkan dana ke wallet baru
+- Jika MongoDB URI bocor: rotate password database segera
+- Jangan pernah share, screenshot, atau upload `.env` ke mana pun
 
-# Gemini API Key
-GEMINI_API_KEY=your_gemini_api_key
+---
 
-# Optional MongoDB cache
-MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/cryptoNews
-MONGODB_DB_NAME=cryptoNews
-```
+## Troubleshooting
 
-## Cara Cek `.env` Sudah Benar
+### Balance tidak muncul atau salah
+- Cek `POLYMARKET_SIGNATURE_TYPE` (coba `0` atau `1`)
+- Cek `POLYMARKET_FUNDER_ADDRESS` (harus address profile Polymarket, bukan wallet signer)
 
-Setelah isi `.env`, jalankan:
+### Order `OPEN` tidak fill
+- Order sudah masuk ke exchange tapi belum ada lawan di harga tersebut — tunggu atau cancel manual
 
-```bash
-npm run dev
-```
-
-Lalu cek di dashboard:
-- `Trading Balance` muncul
-- market BTC aktif muncul
-- order book muncul
-- analisa AI bisa jalan
-
-Kalau balance salah:
-- cek `POLYMARKET_FUNDER_ADDRESS`
-- cek `POLYMARKET_SIGNATURE_TYPE`
-
-Kalau trade gagal auth:
-- cek `POLYGON_PRIVATE_KEY`
-- cek API key Polymarket
-
-Kalau analisa AI gagal:
-- cek `GEMINI_API_KEY`
-
-Kalau data BTC sering 500:
-- isi `MONGODB_URI`
-- restart server
-- biarkan backend pakai cache internal MongoDB
-
-Kalau mau cek cache Mongo jalan atau tidak:
-
-```text
-GET /api/debug/btc-cache
-```
-
-Endpoint ini akan kasih tahu:
-- cache latest ada atau tidak
-- jumlah snapshot harga
-- jumlah candle 1m
-- source data terakhir
-- setting TTL dan background sync
-
-## Fitur Yang Sudah Ada
-
-- BTC 5-minute market scanner
-- AI analysis
-- Polymarket order tracker
-- trade history
-- winrate
-- realized PnL
-- open positions
-- unrealized ROI
-- take profit / stop loss
-
-## Catatan Keamanan
-
-- `.env` jangan di-upload ke GitHub
-- private key jangan dibagikan
-- kalau private key pernah bocor, segera pindahkan dana ke wallet baru
-- lebih aman pakai wallet khusus untuk trading bot, jangan wallet utama
-
-## Troubleshooting Singkat
-
-### Balance salah
-
-Cek:
-- `POLYMARKET_SIGNATURE_TYPE`
-- `POLYMARKET_FUNDER_ADDRESS`
-
-### Order `OPEN` tapi tidak fill
-
-Artinya:
-- order sudah live di exchange
-- tapi belum ada lawan transaksi di harga kamu
-
-### `Trade terlalu kecil`
-
-Artinya:
-- market punya minimum share size
-- amount USDC kamu masih di bawah minimum untuk limit price itu
+### Error "trade terlalu kecil"
+- Market punya minimum share size — amount USDC di bawah minimum untuk limit price itu
 
 ### AI fallback mode
+- Feed BTC eksternal gagal, bot pakai data Polymarket saja
+- Anggap confidence lebih konservatif saat ini aktif
 
-Artinya:
-- feed BTC eksternal gagal
-- analisa masih jalan pakai data Polymarket saja
-- confidence sebaiknya dianggap lebih konservatif
+### Data BTC sering error 500
+- Isi `MONGODB_URI` di `.env` untuk aktifkan cache internal
+- Restart server, biarkan backend sync data ke MongoDB
+- Debug cache: `GET /api/debug/btc-cache`
+
+---
+
+## Scripts
+
+```bash
+npm run dev      # Jalankan server + frontend (development)
+npm run build    # Build frontend untuk production
+npm run preview  # Preview build production
+npm run lint     # Type check TypeScript
+```
+
+---
+
+## Struktur Project
+
+```
+├── src/
+│   ├── App.tsx                  # Main app + logika trading utama
+│   ├── types.ts                 # TypeScript interfaces
+│   ├── components/
+│   │   ├── BotDashboard.tsx     # Dashboard kontrol bot
+│   │   ├── BotLogSidebar.tsx    # Live log sidebar
+│   │   └── CandlestickChart.tsx # Chart candlestick BTC
+│   ├── services/
+│   │   └── gemini.ts            # AI analysis service
+│   └── lib/
+│       └── utils.ts             # Helper utilities
+├── server.ts                    # Express backend (REST API + bot engine)
+├── vite.config.ts               # Konfigurasi Vite
+└── .env.example                 # Template environment variables
+```
+
+---
+
+## Disclaimer
+
+Project ini dibuat untuk tujuan edukasi dan eksperimen trading. Perdagangan aset kripto dan prediction market mengandung risiko tinggi. Tidak ada jaminan profit. Gunakan dengan risiko sendiri.
