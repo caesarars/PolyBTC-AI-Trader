@@ -11,9 +11,15 @@
 | **AI Analysis** | Google Gemini menganalisa order book, indikator teknikal, dan sentimen pasar sebelum tiap keputusan trade |
 | **Auto Trading** | Eksekusi order otomatis ke Polymarket CLOB dengan position sizing Kelly Criterion |
 | **Technical Indicators** | RSI(14), EMA(9/21), MACD, Bollinger Bands, volume spike, signal score alignment |
-| **Adaptive Learning** | Bot menyimpan pola loss dan menyesuaikan confidence untuk trade berikutnya |
+| **Adaptive Learning** | Bot menyimpan pola loss **dan win**, menyesuaikan confidence, dan memberi Gemini konteks setup yang berhasil/gagal |
+| **Volatility-Adjusted Kelly** | Bet size dikurangi otomatis saat BTC choppy (ATR > baseline) — max 50% Kelly saat pasar sangat volatile |
+| **Near-Expiry Exit** | Posisi profitable dipaksa keluar ≤60 detik sebelum window tutup — mencegah binary price collapse membalikkan profit |
+| **Entry Price Gate** | Hard gate: skip trade jika bestAsk > 80¢ — token near-resolved tidak punya edge yang layak |
+| **Live Kelly Pricing** | Kelly Criterion pakai harga live orderbook (bestAsk), bukan outcomePrices stale dari API |
 | **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI |
-| **Performance Tracking** | Realized PnL, unrealized ROI, win rate, trade history lengkap |
+| **Bot Mode** | Mode AGGRESSIVE (default) dan CONSERVATIVE — beda threshold confidence, Kelly, max bet, dan session loss limit |
+| **Performance Tracking** | Realized PnL, win rate, trade history lengkap dengan divergence stats |
+| **SSE Real-time** | Log sidebar dan dashboard update live via Server-Sent Events — tidak ada polling |
 | **Live Dashboard** | Candlestick chart real-time, order book, log bot, dan session stats |
 | **MongoDB Cache** | Cache BTC price & candle history untuk resiliensi saat provider eksternal rate-limit |
 
