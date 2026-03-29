@@ -333,13 +333,7 @@ export async function analyzeMarket(
     };
   }
 
-  // Soft gate: order book should show some directional lean (>= 55% or <= 45% imbalance)
-  // In aggressive mode we only block truly flat 50/50 books with zero edge signal
-  const hasDirectionalPressure = gateTokenIds.some((tid) => {
-    const ob = orderBooks[tid];
-    return ob && (ob.imbalance >= 0.55 || ob.imbalance <= 0.45);
-  });
-  // No hard block — neutral books are allowed; AI will factor it in
+  // Order book imbalance is passed to the prompt — AI evaluates it per trade rules (>60/40 to count as signal)
 
   // Pre-AI gate: require at least 2 of 4 signals aligned (aggressive mode allows thinner setups)
   if (hasBtcHistory && alignment.bullish < 2 && alignment.bearish < 2) {
@@ -491,30 +485,67 @@ Interpretation: ${
 }
 
 `;
-})()}${lossPatternBlock}${winPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
-1. MINIMUM ALIGNMENT: Output TRADE if at least 2 of these 4 signals agree on the same direction:
+})()}${lossPatternBlock}${winPatternBlock}== TRADE RULES (precision over frequency — only trade clear, quantifiable edges) ==
+
+CRITICAL CALIBRATION: This is a 5-minute binary BTC market. The base rate is exactly 50/50 — a coin flip.
+Technical indicators (RSI, EMA, MACD) measure what BTC HAS ALREADY DONE, not what it will do next.
+For a trade to be worth placing, you need clear evidence that the true probability is ≥ 70%.
+Confidence calibration: 50% = coin flip (no edge), 60% = slight lean (not enough), 70% = real signal, 80%+ = strong signal.
+Fewer high-conviction trades beat many marginal trades. When in doubt, output NO_TRADE.
+
+1. MINIMUM ALIGNMENT: Require at least 3 of these 4 signals agreeing on the SAME direction:
    - 60m bias
    - 5m confirmation
    - 1m trigger
    - Technical signal score (positive = bullish, negative = bearish)
-   Only output NO_TRADE if ALL 4 signals are flat/MIXED with zero directional lean.
-2. MINIMUM CONFIDENCE: Output TRADE with confidence >= 52%. Only NO_TRADE below 52%.
-3. MINIMUM EDGE: Edge exists when your probability estimate differs from implied price by more than 0.05 cents. Always output your honest edge estimate — even 0.1¢ is a valid edge worth trading.
-4. RISK LEVEL: 4/4 signals aligned = "LOW". 2-3/4 signals = "MEDIUM". Flat signals or reversal risk > 60% = "HIGH". Both LOW and MEDIUM setups should be traded.
-5. TRADE OFTEN (confidence 52%+): Any 2+ aligned signals + any order book lean = 52-65%. 3+ aligned = 65-78%. All 4 aligned + volume = 78%+. Push toward TRADE whenever there is any directional bias. Lean toward action.
-6. MACD + EMA CROSS: If either MACD histogram or EMA cross shows direction, treat as a signal. Both conflicting = neutral only.
-7. RSI EXTREMES: RSI < 35 = bullish momentum setup; RSI > 65 = bearish momentum setup. Mild extremes (35-45, 55-65) are opportunities, not blockers.
-8. BOLLINGER BAND CONTEXT: Near lower band = potential long. Near upper band = potential short. Both are valid setups — trade the bounce or the breakout based on alignment.
-9. ORDER BOOK PRESSURE: Any lean in the order book (even slight) adds to signal count. Neutral book is still acceptable if technicals align.
-10. POLYMARKET MOMENTUM: Velocity > +0.02/min = UP confirmation. Velocity < -0.02/min = DOWN confirmation. Even weak momentum is a signal.
-11. Reversal risk:
-    - reversalProbability: estimate honestly but do NOT use it to block trades unless > 60%
-    - oppositePressureProbability: same — only flag HIGH if truly extreme
-    - Only set riskLevel = HIGH if reversal probability > 60% AND signals are split 2/2 or worse
-12. WINDOW TIMING: windowElapsedSeconds < 10 = too early (output NO_TRADE). windowElapsedSeconds > 285 = too late (output NO_TRADE). ALL other times (10-285s) are valid entry zones — trade them.
-13. LOSS PATTERN LEARNING: If the ADAPTIVE LEARNING section above contains recent losses, study them. If the current setup matches a loss pattern (same direction + similar RSI/EMA/signal/window conditions), reduce your confidence by 10% and increase riskLevel by one step. Never repeat the exact same setup that already lost — look for a meaningfully different context before trading the same direction again.
-14. WIN PATTERN REPLICATION: If the ADAPTIVE LEARNING section above contains recent wins, study them. If the current setup closely matches a win pattern (same direction + similar RSI/EMA/signal/window conditions), increase your confidence by 5% and treat the signal as confirmed. A setup that has already won under similar conditions is a higher-probability entry.
-15. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): If the PRICE LAG DIVERGENCE section shows strength=STRONG or MODERATE — this overrides all other signals. The Polymarket price has NOT caught up to the real BTC move yet. Set decision=TRADE in the divergence direction with confidence >= 75% and riskLevel="LOW". This is the best edge available in these markets.
+   Exception: if PRICE LAG DIVERGENCE is STRONG or MODERATE, 2/4 alignment is sufficient.
+   Output NO_TRADE if fewer than 3 signals align AND no strong divergence is present.
+
+2. MINIMUM CONFIDENCE: Output TRADE only if confidence >= 70%.
+   Below 70% you cannot clearly beat the 50% base rate — output NO_TRADE.
+   Do NOT output confidence 70%+ unless at least 3 signals are genuinely aligned.
+
+3. REAL EDGE: Edge = your estimated probability minus the 50% base rate.
+   A 70% estimate = +20% edge over coin flip. A 60% estimate = +10% = not tradeable.
+   Only report estimatedEdge when backed by at least 3 aligned signals or strong divergence.
+   If you are uncertain or signals are mixed, output NO_TRADE — do not fabricate edge.
+
+4. RISK LEVEL: 4/4 signals aligned = "LOW". 3/4 signals = "MEDIUM". 2/4 or fewer = "HIGH" (only trade if STRONG divergence).
+   Set riskLevel = HIGH if reversalProbability > 50% OR if signals are split.
+
+5. QUALITY OVER FREQUENCY: Do NOT trade just because signals slightly lean one way.
+   Neutral, ambiguous, or contradictory setups = NO_TRADE.
+   The goal is profitable trades, not maximum trade count.
+
+6. MACD + EMA CROSS: Only count as a signal if it clearly agrees with the trade direction.
+   Conflicting MACD and EMA = they cancel each other — count as 0 signals, not 1.
+
+7. RSI CONTEXT: RSI reflects what BTC has already done, not what it will do.
+   Only use RSI as a signal when it aligns with 60m + 5m trend AND divergence is present.
+   RSI alone or with only 1 other signal is NOT sufficient justification for a trade.
+
+8. BOLLINGER BAND: Supporting signal only. Count as 1 signal only when price is at the band (within 0.5%).
+   Price near the middle of the band = neutral, adds nothing.
+
+9. ORDER BOOK PRESSURE: Count as 1 signal only when imbalance is clearly skewed (>60/40 bid/ask ratio).
+   A slightly tilted or neutral book does not count.
+
+10. POLYMARKET MOMENTUM: Count velocity as a signal only when strong (>0.05¢/min).
+    Weak velocity (<0.05¢/min) is market noise — do not count.
+
+11. WINDOW TIMING: windowElapsedSeconds < 10 = too early (NO_TRADE). windowElapsedSeconds > 285 = too late (NO_TRADE).
+    Optimal entry zone: 30–200s — enough price discovery has occurred, enough time remains.
+
+12. LOSS PATTERN LEARNING: If current setup matches a recent loss pattern, output NO_TRADE unless
+    this setup has at least 3 clearly aligned signals AND strong divergence is present.
+
+13. WIN PATTERN REPLICATION: If current setup closely matches a recent win pattern with 3+ aligned signals,
+    increase confidence by 5%. Do not apply this to setups with fewer than 3 aligned signals.
+
+14. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): STRONG or MODERATE divergence overrides all other rules.
+    The Polymarket price has NOT priced in the BTC move yet — this is a real, quantifiable mispricing.
+    Trade in divergence direction with confidence >= 75%, riskLevel="LOW".
+    WEAK divergence only adds 1 signal count — not sufficient to trade on its own.
 
 Respond with JSON only:
 {

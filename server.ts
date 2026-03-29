@@ -184,8 +184,8 @@ const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
-const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 52);
-const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.05);
+const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 70);
+const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.10);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30);
@@ -194,8 +194,8 @@ const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30
 let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
 
 const CONSERVATIVE_CONFIG = {
-  minConfidence:    68,
-  minEdge:          0.08,
+  minConfidence:    75,
+  minEdge:          0.12,
   kellyFraction:    0.20,
   maxBetUsdc:       50,
   sessionLossLimit: 0.15,
