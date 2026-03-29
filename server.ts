@@ -2529,7 +2529,30 @@ async function startServer() {
               const outcomeIndex = rec.direction === "UP" ? 0 : 1;
               const tokenId: string = market.clobTokenIds?.[outcomeIndex];
               if (tokenId) {
-                const impliedPrice = parseFloat(market.outcomePrices[outcomeIndex] || "0.5");
+                // Fetch live order book price FIRST — before Kelly calc.
+                // market.outcomePrices can be stale/mid; bestAsk is the real fill cost.
+                const ob = orderBooks[tokenId];
+                const bestAsk = Number(ob?.asks?.[0]?.price || "0");
+                const bestBid = Number(ob?.bids?.[0]?.price || "0");
+
+                // ── Hard gate: max entry price ──────────────────────────────
+                // Paying > 80¢ for a binary leaves ≤ 20¢ max profit.
+                // At these prices the edge collapses — token is nearly resolved.
+                const MAX_ENTRY_PRICE = 0.80;
+                if (bestAsk > 0 && bestAsk > MAX_ENTRY_PRICE) {
+                  botPrint("SKIP", `Entry price too high: bestAsk=${( bestAsk * 100).toFixed(0)}¢ > ${MAX_ENTRY_PRICE * 100}¢ max. Token near-resolved — no edge. Skipping.`);
+                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}¢ > ${MAX_ENTRY_PRICE * 100}¢ max entry price.`;
+                  botLog.unshift(logEntry);
+                  if (botLog.length > 100) botLog.pop();
+                  pushSSE("cycle", { ts: new Date().toISOString() });
+                  continue;
+                }
+
+                // Use bestAsk as impliedPrice for Kelly when available —
+                // this reflects the actual fill cost, not a stale API mid-price.
+                const marketImplied = parseFloat(market.outcomePrices[outcomeIndex] || "0.5");
+                const impliedPrice = bestAsk > 0 ? bestAsk : marketImplied;
+
                 const p = rec.confidence / 100;
                 const b = (1 - impliedPrice) / impliedPrice;
                 const kelly = (p * b - (1 - p)) / b;
@@ -2567,16 +2590,14 @@ async function startServer() {
                 // Final bet: clamped to what we can actually afford
                 const betAmount = parseFloat(Math.min(kellyCapped, spendable).toFixed(2));
 
-                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} (${(cfg.balanceCap * 100).toFixed(0)}% bal cap=$${(currentBalance * cfg.balanceCap).toFixed(2)}) → spendable=$${spendable.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC [${botMode}]`);
+                botPrint("INFO", `Kelly calc: implied=${(impliedPrice * 100).toFixed(0)}¢ (${bestAsk > 0 ? "live ask" : "market mid"}) raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC [${botMode}]`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < 1) {
                   botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC). Balance may be too low or Kelly fraction too conservative. Skipping.`);
                   logEntry.reasoning += ` | Skipped: Adjusted bet $${betAmount.toFixed(2)} < $1 minimum (balance=$${currentBalance.toFixed(2)}).`;
                 } else {
-                  const ob = orderBooks[tokenId];
-                  const bestAsk = Number(ob?.asks?.[0]?.price || impliedPrice.toString());
-                  const bestBid = Number(ob?.bids?.[0]?.price || "0");
+                  // ob, bestAsk, bestBid already fetched above for the hard gate
                   botPrint("TRADE", `━━━ EXECUTING ORDER ━━━`);
                   botPrint("TRADE", `Direction : ${rec.direction === "UP" ? "▲ UP (YES)" : "▼ DOWN (NO)"}`);
                   botPrint("TRADE", `Amount    : $${betAmount.toFixed(2)} USDC`);
