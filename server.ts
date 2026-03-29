@@ -3,6 +3,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
@@ -11,6 +12,94 @@ import { analyzeMarket } from "./src/services/gemini.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ── Persistence: data/ directory ──────────────────────────────────────────────
+const DATA_DIR        = path.join(__dirname, "data");
+const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
+const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+interface TradeLogEntry {
+  ts: string;                       // ISO timestamp
+  market: string;
+  direction: "UP" | "DOWN";
+  confidence: number;
+  edge: number;
+  betAmount: number;
+  entryPrice: number;
+  pnl: number;
+  result: "WIN" | "LOSS";
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  divergenceDirection?: string;
+  divergenceStrength?: string;
+  btcDelta30s?: number;
+  yesDelta30s?: number;
+  windowElapsedSeconds: number;
+  orderId: string | null;
+}
+
+function saveTradeLog(entry: TradeLogEntry): void {
+  try {
+    fs.appendFileSync(TRADE_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
+  } catch (e: any) {
+    console.error("[Persist] Failed to write trade_log.jsonl:", e.message);
+  }
+}
+
+function loadTradeLog(): TradeLogEntry[] {
+  try {
+    if (!fs.existsSync(TRADE_LOG_FILE)) return [];
+    return fs.readFileSync(TRADE_LOG_FILE, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as TradeLogEntry);
+  } catch (e: any) {
+    console.error("[Persist] Failed to read trade_log.jsonl:", e.message);
+    return [];
+  }
+}
+
+interface PersistedLearning {
+  lossMemory: LossMemory[];
+  consecutiveLosses: number;
+  consecutiveWins: number;
+  adaptiveConfidenceBoost: number;
+  savedAt: string;
+}
+
+function saveLearning(): void {
+  try {
+    const payload: PersistedLearning = {
+      lossMemory,
+      consecutiveLosses,
+      consecutiveWins,
+      adaptiveConfidenceBoost,
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(LOSS_MEMORY_FILE, JSON.stringify(payload, null, 2), "utf8");
+  } catch (e: any) {
+    console.error("[Persist] Failed to save loss_memory.json:", e.message);
+  }
+}
+
+function loadLearning(): void {
+  try {
+    if (!fs.existsSync(LOSS_MEMORY_FILE)) return;
+    const raw = fs.readFileSync(LOSS_MEMORY_FILE, "utf8");
+    const data: PersistedLearning = JSON.parse(raw);
+    lossMemory.push(...(data.lossMemory || []));
+    consecutiveLosses       = data.consecutiveLosses       ?? 0;
+    consecutiveWins         = data.consecutiveWins         ?? 0;
+    adaptiveConfidenceBoost = data.adaptiveConfidenceBoost ?? 0;
+    console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss patterns, streak=${consecutiveLosses}L/${consecutiveWins}W, boost=+${adaptiveConfidenceBoost}%`);
+  } catch (e: any) {
+    console.error("[Persist] Failed to load loss_memory.json:", e.message);
+  }
+}
 
 // 5-minute market session window in seconds
 const MARKET_SESSION_SECONDS = 300;
@@ -97,6 +186,34 @@ const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30);
 
+// ── Bot mode: AGGRESSIVE (default) vs CONSERVATIVE ───────────────────────────
+let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
+
+const CONSERVATIVE_CONFIG = {
+  minConfidence:    68,
+  minEdge:          0.08,
+  kellyFraction:    0.20,
+  maxBetUsdc:       50,
+  sessionLossLimit: 0.15,
+  balanceCap:       0.10,
+  entryWindowStart: 30,
+  entryWindowEnd:   240,
+} as const;
+
+function getActiveConfig() {
+  if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG;
+  return {
+    minConfidence:    BOT_MIN_CONFIDENCE,
+    minEdge:          BOT_MIN_EDGE,
+    kellyFraction:    BOT_KELLY_FRACTION,
+    maxBetUsdc:       BOT_MAX_BET_USDC,
+    sessionLossLimit: BOT_SESSION_LOSS_LIMIT,
+    balanceCap:       0.25,
+    entryWindowStart: 10,
+    entryWindowEnd:   285,
+  };
+}
+
 // ── Bot runtime state ────────────────────────────────────────────────────────
 let botEnabled = process.env.BOT_AUTO_START === "true";
 let botRunning = false;
@@ -122,6 +239,45 @@ interface PreFetchCache {
 }
 let preFetchCache: PreFetchCache | null = null;
 let preFetchRunning = false;
+
+// ── Divergence tracker (BTC vs YES token lag detector) ────────────────────────
+interface PricePoint { ts: number; price: number; }
+const btcRingBuffer: PricePoint[] = [];   // 5s samples, 10-min window
+const yesRingBuffer: PricePoint[] = [];   // YES token ask price
+let currentWindowYesTokenId: string | null = null;
+let currentWindowNoTokenId:  string | null = null;
+
+interface DivergenceState {
+  btcDelta30s: number;       // raw $ BTC change in last 30s
+  btcDelta60s: number;       // raw $ BTC change in last 60s
+  yesDelta30s: number;       // YES token ¢ change in last 30s
+  divergence: number;        // 0.0–1.0+ normalized score
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK" | "NONE";
+  currentBtcPrice: number | null;
+  currentYesAsk:   number | null;
+  currentNoAsk:    number | null;
+  updatedAt: number;         // unix seconds
+}
+let divergenceState: DivergenceState | null = null;
+let divergenceTrackerInterval: NodeJS.Timeout | null = null;
+
+// ── Current entry snapshot (shown in dashboard widget) ────────────────────────
+interface EntrySnapshot {
+  market: string;
+  windowStart: number;
+  yesPrice: number | null;
+  noPrice: number | null;
+  direction: string | null;
+  confidence: number | null;
+  edge: number | null;
+  riskLevel: string | null;
+  estimatedBet: number | null;
+  btcPrice: number | null;
+  divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
+  updatedAt: string;
+}
+let currentEntrySnapshot: EntrySnapshot | null = null;
 
 interface BotLogEntry {
   timestamp: string;
@@ -246,6 +402,7 @@ type PositionAutomationDocument = {
   stopLoss: string;
   trailingStop: string;
   armed: boolean;
+  windowEnd?: number;       // unix seconds — when the 5-min market resolves
   highestPrice?: string;
   trailingStopPrice?: string;
   lastPrice?: string;
@@ -253,15 +410,6 @@ type PositionAutomationDocument = {
   lastExitOrderId?: string | null;
   updatedAt: Date;
   lastTriggeredAt?: Date | null;
-};
-
-type TradePerformancePosition = {
-  assetId: string;
-  market: string;
-  outcome: string;
-  size: string;
-  costBasis: string;
-  averagePrice: string;
 };
 
 async function getMongoDb() {
@@ -1001,96 +1149,6 @@ async function buildAuthenticatedClobClient(wallet: ethers.Wallet) {
   );
 }
 
-function computePerformanceData(trades: any[]) {
-  const sortedTrades = [...trades].sort(
-    (a, b) => new Date(b.match_time).getTime() - new Date(a.match_time).getTime()
-  );
-
-  const inventory = new Map<string, { qty: number; cost: number; outcome: string; market: string }>();
-  let realizedPnl = 0;
-  let winCount = 0;
-  let lossCount = 0;
-
-  const history = sortedTrades.map((trade) => {
-    const qty = Number(trade.size || "0");
-    const price = Number(trade.price || "0");
-    const notional = qty * price;
-    const key = trade.asset_id;
-    const current = inventory.get(key) || { qty: 0, cost: 0, outcome: trade.outcome, market: trade.market };
-    let tradePnl = 0;
-
-    if (trade.side === Side.BUY) {
-      current.qty += qty;
-      current.cost += notional;
-      inventory.set(key, current);
-    } else {
-      const avgCost = current.qty > 0 ? current.cost / current.qty : 0;
-      const matchedQty = Math.min(qty, current.qty);
-      tradePnl = (price - avgCost) * matchedQty;
-      realizedPnl += tradePnl;
-
-      if (matchedQty > 0) {
-        if (tradePnl > 0) winCount += 1;
-        else if (tradePnl < 0) lossCount += 1;
-      }
-
-      current.qty = Math.max(0, current.qty - qty);
-      current.cost = Math.max(0, current.cost - avgCost * qty);
-      inventory.set(key, current);
-    }
-
-    return {
-      id: trade.id,
-      market: trade.market,
-      outcome: trade.outcome,
-      side: trade.side,
-      traderSide: trade.trader_side,
-      status: trade.status,
-      size: qty.toFixed(4),
-      price: price.toFixed(4),
-      notional: notional.toFixed(4),
-      pnl: tradePnl.toFixed(4),
-      matchTime: trade.match_time,
-      transactionHash: trade.transaction_hash,
-      assetId: trade.asset_id,
-    };
-  });
-
-  const openPositions = Array.from(inventory.entries())
-    .filter(([, position]) => position.qty > 0)
-    .map(([assetId, position]) => ({
-      assetId,
-      market: position.market,
-      outcome: position.outcome,
-      size: position.qty.toFixed(4),
-      costBasis: position.cost.toFixed(4),
-      averagePrice: position.qty > 0 ? (position.cost / position.qty).toFixed(4) : "0.0000",
-    })) as TradePerformancePosition[];
-
-  const closedTrades = winCount + lossCount;
-  const winRate = closedTrades > 0 ? (winCount / closedTrades) * 100 : 0;
-  const openExposure = openPositions.reduce((sum, position) => sum + Number(position.costBasis), 0);
-
-  return {
-    summary: {
-      totalMatchedTrades: history.length,
-      closedTrades,
-      winCount,
-      lossCount,
-      winRate: winRate.toFixed(2),
-      realizedPnl: realizedPnl.toFixed(4),
-      openExposure: openExposure.toFixed(4),
-    },
-    history,
-    openPositions,
-  };
-}
-
-async function getOpenPositionsSnapshot(client: ClobClient) {
-  const trades = await client.getTrades();
-  const performance = computePerformanceData(trades);
-  return performance.openPositions;
-}
 
 async function getClobClient() {
   if (clobClient) return clobClient;
@@ -1120,12 +1178,127 @@ async function getClobClient() {
   return clobClientInitPromise;
 }
 
+// ── Divergence Tracker: BTC price vs YES token price lag detector ─────────────
+// Runs every 5s independently. Fills ring buffers and computes divergence score.
+function startDivergenceTracker() {
+  if (divergenceTrackerInterval) return;
+
+  const tick = async () => {
+    try {
+      const now = Math.floor(Date.now() / 1000);
+
+      // 1. BTC price sample
+      const btcData = await getBtcPrice();
+      const btcPrice = btcData?.price ? parseFloat(btcData.price as any) : null;
+      if (btcPrice && btcPrice > 0) {
+        btcRingBuffer.push({ ts: now, price: btcPrice });
+        if (btcRingBuffer.length > 120) btcRingBuffer.shift(); // 10-min cap
+      }
+
+      // 2. YES / NO token ask price sample (current window)
+      let yesAsk: number | null = null;
+      let noAsk:  number | null = null;
+
+      if (currentWindowYesTokenId) {
+        try {
+          const r = await axios.get(
+            `https://clob.polymarket.com/book?token_id=${currentWindowYesTokenId}`,
+            { timeout: 4000 }
+          );
+          const asks: any[] = r.data?.asks ?? [];
+          const bids: any[] = r.data?.bids ?? [];
+          yesAsk = asks.length > 0 ? parseFloat(asks[0].price)
+                 : bids.length > 0 ? parseFloat(bids[0].price) : null;
+          if (yesAsk && yesAsk > 0) {
+            yesRingBuffer.push({ ts: now, price: yesAsk });
+            if (yesRingBuffer.length > 120) yesRingBuffer.shift();
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      if (currentWindowNoTokenId) {
+        try {
+          const r = await axios.get(
+            `https://clob.polymarket.com/book?token_id=${currentWindowNoTokenId}`,
+            { timeout: 4000 }
+          );
+          const asks: any[] = r.data?.asks ?? [];
+          const bids: any[] = r.data?.bids ?? [];
+          noAsk = asks.length > 0 ? parseFloat(asks[0].price)
+                : bids.length > 0 ? parseFloat(bids[0].price) : null;
+        } catch { /* non-fatal */ }
+      }
+
+      // 3. Compute 30s and 60s deltas from ring buffers
+      const btcNow = btcRingBuffer.length > 0 ? btcRingBuffer[btcRingBuffer.length - 1].price : null;
+      const yesNow = yesRingBuffer.length > 0 ? yesRingBuffer[yesRingBuffer.length - 1].price : null;
+
+      const findNearest = (buf: PricePoint[], targetTs: number) =>
+        buf.reduce<PricePoint | null>((best, p) => {
+          if (p.ts > targetTs) return best;
+          if (!best || Math.abs(p.ts - targetTs) < Math.abs(best.ts - targetTs)) return p;
+          return best;
+        }, null);
+
+      const btc30ref = findNearest(btcRingBuffer, now - 30);
+      const btc60ref = findNearest(btcRingBuffer, now - 60);
+      const yes30ref = findNearest(yesRingBuffer, now - 30);
+
+      const btcDelta30s = btcNow && btc30ref ? btcNow - btc30ref.price : 0;
+      const btcDelta60s = btcNow && btc60ref ? btcNow - btc60ref.price : 0;
+      const yesDelta30s = yesNow && yes30ref ? (yesNow - yes30ref.price) * 100 : 0; // in ¢
+
+      // 4. Classify divergence
+      // A divergence occurs when BTC moves meaningfully but the YES token hasn't repriced
+      const BTC_STRONG = 100; // $100 in 30s
+      const BTC_MOD    = 60;  // $60
+      const BTC_WEAK   = 30;  // $30
+      const YES_LAG    = 2.0; // ¢ — YES hasn't moved at least 2¢ in BTC's direction
+
+      let direction: DivergenceState["direction"] = "NEUTRAL";
+      let strength:  DivergenceState["strength"]  = "NONE";
+      let divergence = 0;
+
+      const absBtc = Math.abs(btcDelta30s);
+
+      if (absBtc >= BTC_WEAK) {
+        direction = btcDelta30s > 0 ? "UP" : "DOWN";
+        const yesInBtcDir = direction === "UP" ? yesDelta30s : -yesDelta30s;
+        const yesLagging  = yesInBtcDir < YES_LAG; // YES hasn't caught up
+
+        divergence = absBtc / BTC_STRONG; // normalized 0–1+
+
+        if      (absBtc >= BTC_STRONG && yesLagging) strength = "STRONG";
+        else if (absBtc >= BTC_MOD    && yesLagging) strength = "MODERATE";
+        else if (absBtc >= BTC_WEAK   && yesLagging) strength = "WEAK";
+        else direction = "NEUTRAL"; // BTC moved but YES kept pace — no lag
+      }
+
+      divergenceState = {
+        btcDelta30s, btcDelta60s, yesDelta30s,
+        divergence, direction, strength,
+        currentBtcPrice: btcNow,
+        currentYesAsk: yesAsk,
+        currentNoAsk: noAsk,
+        updatedAt: now,
+      };
+
+    } catch { /* never crash the tracker */ }
+  };
+
+  void tick();
+  divergenceTrackerInterval = setInterval(() => void tick(), 5000);
+  console.log("[Divergence] Tracker started — 5s BTC vs YES token lag detector");
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  loadLearning();
   void ensureMongoCollections();
   startBtcBackgroundSync();
+  startDivergenceTracker();
 
   const formatTradeError = (error: any, context?: Record<string, unknown>) => {
     const rawMessage =
@@ -1392,16 +1565,17 @@ async function startServer() {
       const armedAutomations = await collection.find({ armed: true }).toArray();
       if (!armedAutomations.length) return;
 
-      const openPositions = await getOpenPositionsSnapshot(client);
-      const openMap = new Map(openPositions.map((position) => [position.assetId, position]));
+      const nowSeconds = Math.floor(Date.now() / 1000);
 
       for (const automation of armedAutomations) {
-        const openPosition = openMap.get(automation.assetId);
-        if (!openPosition) {
+        // ── Fix 1: time-based expiry instead of position-lookup guard ──────
+        // If the market window expired > 6 minutes ago, the position has
+        // already resolved on-chain — no point monitoring or trying to exit.
+        if (automation.windowEnd && nowSeconds > automation.windowEnd + 360) {
           await savePositionAutomation({
             assetId: automation.assetId,
             armed: false,
-            status: "Position already closed",
+            status: "Market window expired — resolved on-chain",
             lastPrice: automation.lastPrice,
           });
           continue;
@@ -1409,62 +1583,102 @@ async function startServer() {
 
         try {
           const book = await client.getOrderBook(automation.assetId);
-          const bestBid = Number(book?.bids?.[0]?.price || "0");
-          if (!(bestBid > 0)) {
+
+          // ── Fix 2: 3-tier price estimation ─────────────────────────────
+          // Tier 1: best bid (real exit price — prefer this always)
+          // Tier 2: mid-price when both sides exist
+          // Tier 3: best ask alone as conservative proxy
+          const bestBid  = Number(book?.bids?.[0]?.price || "0");
+          const bestAsk  = Number(book?.asks?.[0]?.price || "0");
+
+          let currentPrice: number;
+          if (bestBid > 0 && bestAsk > 0) {
+            currentPrice = (bestBid + bestAsk) / 2;       // Tier 2: mid
+          } else if (bestBid > 0) {
+            currentPrice = bestBid;                        // Tier 1: bid only
+          } else if (bestAsk > 0) {
+            currentPrice = bestAsk;                        // Tier 3: ask proxy
+          } else {
+            // No liquidity at all — keep armed, try next tick
             await savePositionAutomation({
               assetId: automation.assetId,
-              ...openPosition,
-              status: "No live bid available",
-              lastPrice: "",
+              status: "No order book liquidity — retrying",
+              lastPrice: automation.lastPrice ?? "",
             });
             continue;
           }
 
-          const highestPrice = Math.max(Number(automation.highestPrice || "0"), bestBid);
+          const highestPrice = Math.max(Number(automation.highestPrice || "0"), currentPrice);
           const trailingStopDistance = Number(automation.trailingStop || "0");
           const trailingStopPrice =
             trailingStopDistance > 0 ? Math.max(0.01, highestPrice - trailingStopDistance) : 0;
           const takeProfit = Number(automation.takeProfit || "0");
-          const stopLoss = Number(automation.stopLoss || "0");
+          const stopLoss   = Number(automation.stopLoss   || "0");
 
+          // Determine if a trigger condition is met (uses currentPrice for detection)
           let triggerReason: string | null = null;
-          if (takeProfit > 0 && bestBid >= takeProfit) triggerReason = "take profit";
-          if (!triggerReason && stopLoss > 0 && bestBid <= stopLoss) triggerReason = "stop loss";
-          if (!triggerReason && trailingStopPrice > 0 && bestBid <= trailingStopPrice) triggerReason = "trailing stop";
+          if (takeProfit > 0 && currentPrice >= takeProfit) triggerReason = "take profit";
+          if (!triggerReason && stopLoss > 0 && currentPrice <= stopLoss) triggerReason = "stop loss";
+          if (!triggerReason && trailingStopPrice > 0 && currentPrice <= trailingStopPrice) triggerReason = "trailing stop";
 
           if (triggerReason) {
+            // TP: only execute if there's a real bid (need an actual buyer)
+            // SL/trailing: execute AGGRESSIVE even at thin bid to limit losses
+            const isTakeProfit = triggerReason === "take profit";
+            const executionPrice = bestBid > 0 ? bestBid : (bestAsk > 0 ? bestAsk * 0.90 : null);
+
+            if (isTakeProfit && !(bestBid > 0)) {
+              // TP hit on price estimate but no buyer yet — wait for a real bid
+              await savePositionAutomation({
+                assetId: automation.assetId,
+                highestPrice: highestPrice.toFixed(4),
+                trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
+                lastPrice: currentPrice.toFixed(4),
+                status: `TP level reached (${(currentPrice * 100).toFixed(0)}¢) — waiting for bid`,
+              });
+              continue;
+            }
+
+            if (!executionPrice) {
+              await savePositionAutomation({
+                assetId: automation.assetId,
+                status: `${triggerReason} triggered but no exit price available`,
+                lastPrice: currentPrice.toFixed(4),
+              });
+              continue;
+            }
+
             const exit = await executePolymarketTrade({
               tokenID: automation.assetId,
-              amount: openPosition.size,
+              amount: automation.size,
               side: Side.SELL,
-              price: bestBid.toFixed(4),
+              price: executionPrice.toFixed(4),
+              executionMode: "AGGRESSIVE",
             });
             await savePositionAutomation({
               assetId: automation.assetId,
-              ...openPosition,
               armed: false,
               highestPrice: highestPrice.toFixed(4),
               trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
-              lastPrice: bestBid.toFixed(4),
+              lastPrice: executionPrice.toFixed(4),
               lastExitOrderId: exit.orderID,
-              status: `Exit submitted by ${triggerReason}`,
+              status: `Exit submitted by ${triggerReason} @ ${(executionPrice * 100).toFixed(0)}¢`,
               lastTriggeredAt: new Date(),
             });
             continue;
           }
 
+          // No trigger — update tracking state and keep armed
           await savePositionAutomation({
             assetId: automation.assetId,
-            ...openPosition,
             highestPrice: highestPrice.toFixed(4),
             trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
-            lastPrice: bestBid.toFixed(4),
-            status: "Monitoring",
+            lastPrice: currentPrice.toFixed(4),
+            status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢`,
           });
         } catch (error: any) {
           await savePositionAutomation({
             assetId: automation.assetId,
-            ...openPosition,
             status: `Monitor error: ${error?.message || "Unknown error"}`,
           });
         }
@@ -1761,6 +1975,28 @@ async function startServer() {
           botPrint("OK", `Adaptive learning: streak=${consecutiveWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost}% (boost=${adaptiveConfidenceBoost > 0 ? `+${adaptiveConfidenceBoost}%` : "none"})`);
         }
         botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        saveLearning();
+        saveTradeLog({
+          ts: new Date().toISOString(),
+          market: pending.market,
+          direction: pending.direction as "UP" | "DOWN",
+          confidence: pending.confidence,
+          edge: pending.edge,
+          betAmount: pending.betAmount,
+          entryPrice: pending.entryPrice,
+          pnl,
+          result: "WIN",
+          rsi: pending.rsi,
+          emaCross: pending.emaCross,
+          signalScore: pending.signalScore,
+          imbalanceSignal: pending.imbalanceSignal,
+          divergenceDirection: divergenceState?.direction,
+          divergenceStrength: divergenceState?.strength,
+          btcDelta30s: divergenceState?.btcDelta30s,
+          yesDelta30s: divergenceState?.yesDelta30s,
+          windowElapsedSeconds: pending.windowElapsedSeconds,
+          orderId: pending.orderId,
+        });
       } else {
         // ── LOSS: record memory, tighten adaptive threshold ────────────────
         consecutiveLosses++;
@@ -1792,6 +2028,28 @@ async function startServer() {
         }
         botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         botPrint("INFO", `Lesson recorded: ${lesson}`);
+        saveLearning();
+        saveTradeLog({
+          ts: new Date().toISOString(),
+          market: pending.market,
+          direction: pending.direction as "UP" | "DOWN",
+          confidence: pending.confidence,
+          edge: pending.edge,
+          betAmount: pending.betAmount,
+          entryPrice: pending.entryPrice,
+          pnl,
+          result: "LOSS",
+          rsi: pending.rsi,
+          emaCross: pending.emaCross,
+          signalScore: pending.signalScore,
+          imbalanceSignal: pending.imbalanceSignal,
+          divergenceDirection: divergenceState?.direction,
+          divergenceStrength: divergenceState?.strength,
+          btcDelta30s: divergenceState?.btcDelta30s,
+          yesDelta30s: divergenceState?.yesDelta30s,
+          windowElapsedSeconds: pending.windowElapsedSeconds,
+          orderId: pending.orderId,
+        });
       }
 
       botLog.unshift({
@@ -1831,6 +2089,10 @@ async function startServer() {
       if (currentWindowStart !== botLastWindowStart) {
         botAnalyzedThisWindow.clear();
         botLastWindowStart = currentWindowStart;
+        // Clear YES ring buffer — old window's token is no longer valid
+        yesRingBuffer.length = 0;
+        currentWindowYesTokenId = null;
+        currentWindowNoTokenId  = null;
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
       }
 
@@ -1843,8 +2105,9 @@ async function startServer() {
       }
 
       // Only trade in the valid entry zone (10s–285s elapsed) — aggressive mode
-      if (windowElapsedSeconds < 10 || windowElapsedSeconds > 285) {
-        if (windowElapsedSeconds > 285) {
+      const cfg = getActiveConfig();
+      if (windowElapsedSeconds < cfg.entryWindowStart || windowElapsedSeconds > cfg.entryWindowEnd) {
+        if (windowElapsedSeconds > cfg.entryWindowEnd) {
           const nextWindowStart = currentWindowStart + MARKET_SESSION_SECONDS;
           const pfStatus = preFetchRunning
             ? "analyzing…"
@@ -1946,6 +2209,9 @@ async function startServer() {
             // Fetch order books with computed imbalance + liquidity
             botPrint("INFO", "Fetching order books...");
             const tokenIds: string[] = market.clobTokenIds || [];
+            // Register token IDs for divergence tracker
+            if (tokenIds[0] && !currentWindowYesTokenId) currentWindowYesTokenId = tokenIds[0];
+            if (tokenIds[1] && !currentWindowNoTokenId)  currentWindowNoTokenId  = tokenIds[1];
             orderBooks = {};
             await Promise.all(tokenIds.map(async (tid, idx) => {
               try {
@@ -1990,9 +2256,20 @@ async function startServer() {
             }
           }
 
-          const effectiveMinConf = BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost;
+          const effectiveMinConf = cfg.minConfidence + adaptiveConfidenceBoost;
           if (adaptiveConfidenceBoost > 0) {
             botPrint("INFO", `Adaptive threshold active: ${effectiveMinConf}% (+${adaptiveConfidenceBoost}% from ${consecutiveLosses} loss streak | ${lossMemory.length} patterns stored)`);
+          }
+
+          // ── Read divergence state (fresh within 30s) ───────────────────
+          const divNow = Math.floor(Date.now() / 1000);
+          const div = (divergenceState && divNow - divergenceState.updatedAt < 30)
+            ? divergenceState : null;
+
+          if (div && div.strength !== "NONE") {
+            botPrint("INFO",
+              `Divergence: BTC ${div.btcDelta30s >= 0 ? "+" : ""}$${div.btcDelta30s.toFixed(0)} (30s) | YES ${div.yesDelta30s >= 0 ? "+" : ""}${div.yesDelta30s.toFixed(2)}¢ | direction=${div.direction} strength=${div.strength} score=${div.divergence.toFixed(2)}`
+            );
           }
 
           // Use pre-analyzed Gemini result if available, otherwise call fresh
@@ -2011,8 +2288,31 @@ async function startServer() {
               orderBooks,
               marketHistory,
               windowElapsedSeconds,
-              lossMemory.slice(0, 5)
+              lossMemory.slice(0, 5),
+              div
             );
+          }
+
+          // ── Apply divergence overrides AFTER AI decision ────────────────
+          if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
+            if (div.strength === "STRONG" && rec.decision !== "TRADE") {
+              // Force trade in divergence direction — market is clearly lagging BTC
+              botPrint("TRADE",
+                `DIVERGENCE OVERRIDE ✦ BTC +$${Math.abs(div.btcDelta30s).toFixed(0)} in 30s, YES only ${div.yesDelta30s.toFixed(2)}¢ — forcing ${div.direction} trade`
+              );
+              rec = { ...rec, decision: "TRADE", direction: div.direction, confidence: Math.max(rec.confidence, 72), riskLevel: "MEDIUM" };
+            } else if (div.strength === "MODERATE" && rec.decision === "TRADE" && rec.direction === div.direction) {
+              // Same direction — boost confidence
+              const boosted = Math.min(rec.confidence + 10, 95);
+              botPrint("OK", `Divergence CONFIRMS AI direction (${div.direction}) — confidence boosted ${rec.confidence}% → ${boosted}%`);
+              rec = { ...rec, confidence: boosted };
+            } else if ((div.strength === "STRONG" || div.strength === "MODERATE") && rec.decision === "TRADE" && rec.direction !== div.direction) {
+              // Conflict — BTC going one way, AI says opposite → skip
+              botPrint("WARN",
+                `DIVERGENCE CONFLICT ✦ AI says ${rec.direction} but BTC divergence says ${div.direction} (${div.strength}) — trade blocked`
+              );
+              rec = { ...rec, decision: "NO_TRADE", reasoning: rec.reasoning + ` | BLOCKED: divergence conflict (BTC ${div.direction} vs AI ${rec.direction})` };
+            }
           }
 
           // Log AI result
@@ -2023,16 +2323,50 @@ async function startServer() {
           );
           botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
 
+          // ── Update entry snapshot for dashboard widget ──────────────────
+          {
+            const outcomeIdx = rec.direction === "DOWN" ? 1 : 0;
+            const oppIdx     = outcomeIdx === 0 ? 1 : 0;
+            const tokenIds: string[] = market.clobTokenIds || [];
+            const yesAsk = orderBooks[tokenIds[0]]?.asks?.[0]?.price ?? market.outcomePrices?.[0] ?? null;
+            const noAsk  = orderBooks[tokenIds[1]]?.asks?.[0]?.price ?? market.outcomePrices?.[1] ?? null;
+            const entryAsk = orderBooks[tokenIds[outcomeIdx]]?.asks?.[0]?.price ?? market.outcomePrices?.[outcomeIdx] ?? null;
+            const impliedPrice = parseFloat(market.outcomePrices?.[outcomeIdx] ?? "0.5");
+            const p = rec.confidence / 100;
+            const b = (1 - impliedPrice) / impliedPrice;
+            const kelly = (p * b - (1 - p)) / b;
+            const rawBet = kelly > 0 && botSessionStartBalance != null
+              ? (botSessionStartBalance * kelly * cfg.kellyFraction)
+              : null;
+            currentEntrySnapshot = {
+              market: market.question || market.id,
+              windowStart: currentWindowStart,
+              yesPrice: yesAsk !== null ? parseFloat(yesAsk) : null,
+              noPrice:  noAsk  !== null ? parseFloat(noAsk)  : null,
+              direction: rec.decision === "TRADE" ? rec.direction : null,
+              confidence: rec.confidence,
+              edge: rec.estimatedEdge,
+              riskLevel: rec.riskLevel,
+              estimatedBet: rawBet !== null ? parseFloat(Math.min(rawBet, cfg.maxBetUsdc).toFixed(2)) : null,
+              btcPrice: btcPriceData?.price ?? null,
+              divergence: div && div.strength !== "NONE"
+                ? { direction: div.direction, strength: div.strength, btcDelta30s: div.btcDelta30s, yesDelta30s: div.yesDelta30s }
+                : null,
+              updatedAt: new Date().toISOString(),
+            };
+            void oppIdx; void entryAsk; // suppress unused warnings
+          }
+
           const qualifies =
             rec.decision === "TRADE" &&
             rec.confidence >= effectiveMinConf &&
-            rec.estimatedEdge >= BOT_MIN_EDGE &&
+            rec.estimatedEdge >= cfg.minEdge &&
             rec.riskLevel !== "HIGH";
 
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
             if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
-            if (rec.estimatedEdge < BOT_MIN_EDGE) reasons.push(`edge ${rec.estimatedEdge}¢ < ${BOT_MIN_EDGE}¢`);
+            if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}¢ < ${cfg.minEdge}¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")}`);
           }
@@ -2091,8 +2425,8 @@ async function startServer() {
                 ? (botSessionStartBalance - currentBalance) / botSessionStartBalance
                 : 0;
 
-              if (sessionLossPct >= BOT_SESSION_LOSS_LIMIT) {
-                botPrint("WARN", `━━━ SESSION LOSS LIMIT HIT: ${(sessionLossPct * 100).toFixed(1)}% drawdown ≥ ${BOT_SESSION_LOSS_LIMIT * 100}% limit. BOT HALTED. ━━━`);
+              if (sessionLossPct >= cfg.sessionLossLimit) {
+                botPrint("WARN", `━━━ SESSION LOSS LIMIT HIT: ${(sessionLossPct * 100).toFixed(1)}% drawdown ≥ ${cfg.sessionLossLimit * 100}% limit. BOT HALTED. ━━━`);
                 botEnabled = false;
                 logEntry.reasoning = `SESSION STOP: Down ${(sessionLossPct * 100).toFixed(1)}% — bot halted.`;
                 botLog.unshift(logEntry);
@@ -2108,10 +2442,10 @@ async function startServer() {
                 const p = rec.confidence / 100;
                 const b = (1 - impliedPrice) / impliedPrice;
                 const kelly = (p * b - (1 - p)) / b;
-                const rawBet = kelly > 0 ? currentBalance * kelly * BOT_KELLY_FRACTION : 0;
+                const rawBet = kelly > 0 ? currentBalance * kelly * cfg.kellyFraction : 0;
 
-                // Cap to Kelly formula, max bet config, and 25% of live balance (aggressive)
-                const kellyCapped = Math.min(rawBet, BOT_MAX_BET_USDC, currentBalance * 0.25);
+                // Cap to Kelly formula, max bet config, and balance cap (mode-dependent)
+                const kellyCapped = Math.min(rawBet, cfg.maxBetUsdc, currentBalance * cfg.balanceCap);
 
                 // Reserve $1 minimum buffer — never spend the last dollar
                 const BALANCE_RESERVE = 1.0;
@@ -2120,7 +2454,7 @@ async function startServer() {
                 // Final bet: clamped to what we can actually afford
                 const betAmount = parseFloat(Math.min(kellyCapped, spendable).toFixed(2));
 
-                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} (25% bal cap=$${(currentBalance * 0.25).toFixed(2)}) → spendable=$${spendable.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
+                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} (${(cfg.balanceCap * 100).toFixed(0)}% bal cap=$${(currentBalance * cfg.balanceCap).toFixed(2)}) → spendable=$${spendable.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC [${botMode}]`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < 1) {
@@ -2156,6 +2490,7 @@ async function startServer() {
                       takeProfit: levels.takeProfit,
                       stopLoss: levels.stopLoss,
                       trailingStop: levels.trailingStop,
+                      windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
                       armed: true,
                     });
 
@@ -2219,11 +2554,13 @@ async function startServer() {
     console.log("╔═══════════════════════════════════════════════════╗");
     console.log("║          PolyBTC AI Trading Bot — STARTED         ║");
     console.log("╚═══════════════════════════════════════════════════╝");
-    botPrint("INFO", `Min confidence : ${BOT_MIN_CONFIDENCE}%`);
-    botPrint("INFO", `Min edge       : ${BOT_MIN_EDGE}¢`);
-    botPrint("INFO", `Max bet        : $${BOT_MAX_BET_USDC} USDC`);
-    botPrint("INFO", `Kelly fraction : ${BOT_KELLY_FRACTION * 100}%`);
-    botPrint("INFO", `Session limit  : -${BOT_SESSION_LOSS_LIMIT * 100}% halt`);
+    const startCfg = getActiveConfig();
+    botPrint("INFO", `Mode           : ${botMode}`);
+    botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
+    botPrint("INFO", `Min edge       : ${startCfg.minEdge}¢`);
+    botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
+    botPrint("INFO", `Kelly fraction : ${startCfg.kellyFraction * 100}%`);
+    botPrint("INFO", `Session limit  : -${startCfg.sessionLossLimit * 100}% halt`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
     void runBotCycle();
@@ -2254,12 +2591,14 @@ async function startServer() {
       sessionTradesCount: botSessionTradesCount,
       windowElapsedSeconds,
       analyzedThisWindow: botAnalyzedThisWindow.size,
+      entrySnapshot: currentEntrySnapshot,
       config: {
-        minConfidence: BOT_MIN_CONFIDENCE,
-        minEdge: BOT_MIN_EDGE,
-        kellyFraction: BOT_KELLY_FRACTION,
-        maxBetUsdc: BOT_MAX_BET_USDC,
-        sessionLossLimit: BOT_SESSION_LOSS_LIMIT,
+        mode: botMode,
+        minConfidence: getActiveConfig().minConfidence,
+        minEdge: getActiveConfig().minEdge,
+        kellyFraction: getActiveConfig().kellyFraction,
+        maxBetUsdc: getActiveConfig().maxBetUsdc,
+        sessionLossLimit: getActiveConfig().sessionLossLimit,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
     });
@@ -2299,6 +2638,45 @@ async function startServer() {
       baseMinConfidence: BOT_MIN_CONFIDENCE,
       lossMemoryCount: lossMemory.length,
       recentLosses: lossMemory.slice(0, 10),
+    });
+  });
+
+  app.post("/api/bot/mode", (req, res) => {
+    const { mode } = req.body || {};
+    if (mode !== "AGGRESSIVE" && mode !== "CONSERVATIVE") {
+      return res.status(400).json({ error: "mode must be AGGRESSIVE or CONSERVATIVE" });
+    }
+    botMode = mode;
+    const cfg = getActiveConfig();
+    botPrint("INFO", `Bot mode switched to ${botMode} — conf≥${cfg.minConfidence}% edge≥${cfg.minEdge}¢ maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% sessionLimit=${cfg.sessionLossLimit * 100}% window=${cfg.entryWindowStart}–${cfg.entryWindowEnd}s`);
+    res.json({ ok: true, mode: botMode, config: cfg });
+  });
+
+  app.post("/api/bot/reset-confidence", (_req, res) => {
+    adaptiveConfidenceBoost = 0;
+    consecutiveLosses = 0;
+    consecutiveWins = 0;
+    saveLearning();
+    botPrint("INFO", `Adaptive confidence reset to baseline ${BOT_MIN_CONFIDENCE}% (manual override)`);
+    res.json({ ok: true, baseMinConfidence: BOT_MIN_CONFIDENCE, adaptiveConfidenceBoost: 0 });
+  });
+
+  app.get("/api/bot/trade-log", (req, res) => {
+    const all = loadTradeLog();
+    const limit = Math.min(parseInt(String(req.query.limit || "200"), 10), 1000);
+    const offset = parseInt(String(req.query.offset || "0"), 10);
+    const entries = all.slice().reverse().slice(offset, offset + limit);
+    const wins   = all.filter((e) => e.result === "WIN").length;
+    const losses = all.filter((e) => e.result === "LOSS").length;
+    const totalPnl = parseFloat(all.reduce((s, e) => s + e.pnl, 0).toFixed(2));
+    const winRate  = all.length > 0 ? parseFloat(((wins / all.length) * 100).toFixed(1)) : 0;
+    const divTrades = all.filter((e) => e.divergenceStrength === "STRONG" || e.divergenceStrength === "MODERATE");
+    const divWins   = divTrades.filter((e) => e.result === "WIN").length;
+    const divWinRate = divTrades.length > 0 ? parseFloat(((divWins / divTrades.length) * 100).toFixed(1)) : null;
+    res.json({
+      total: all.length, wins, losses, winRate, totalPnl,
+      divergence: { trades: divTrades.length, wins: divWins, winRate: divWinRate },
+      entries,
     });
   });
 
@@ -2572,18 +2950,121 @@ async function startServer() {
     }
   });
 
+  // ── Helper: resolve trading address (proxy wallet or EOA) ────────────────
+  const getTradingAddress = async (): Promise<string | null> => {
+    if (POLYMARKET_FUNDER_ADDRESS) return POLYMARKET_FUNDER_ADDRESS;
+    await getClobClient();
+    return clobWallet?.address ?? null;
+  };
+
+  // ── Current positions (open) ───────────────────────────────────────────────
+  app.get("/api/polymarket/positions", async (_req, res) => {
+    try {
+      const userAddress = await getTradingAddress();
+      if (!userAddress) return res.status(400).json({ error: "Wallet not initialized. Set POLYGON_PRIVATE_KEY in .env" });
+
+      const response = await axios.get("https://data-api.polymarket.com/positions", {
+        params: { user: userAddress, limit: 500, sizeThreshold: 0 },
+        timeout: 10000,
+      });
+      res.json({ positions: response.data ?? [], user: userAddress });
+    } catch (error: any) {
+      console.error("Positions fetch error:", error.message);
+      res.status(500).json({ error: "Failed to fetch current positions", detail: error.message });
+    }
+  });
+
+  // ── Closed positions ───────────────────────────────────────────────────────
+  app.get("/api/polymarket/closed-positions", async (_req, res) => {
+    try {
+      const userAddress = await getTradingAddress();
+      if (!userAddress) return res.status(400).json({ error: "Wallet not initialized. Set POLYGON_PRIVATE_KEY in .env" });
+
+      const response = await axios.get("https://data-api.polymarket.com/closed-positions", {
+        params: { user: userAddress, limit: 50, sortBy: "TIMESTAMP", sortDirection: "DESC" },
+        timeout: 10000,
+      });
+      res.json({ positions: response.data ?? [], user: userAddress });
+    } catch (error: any) {
+      console.error("Closed positions fetch error:", error.message);
+      res.status(500).json({ error: "Failed to fetch closed positions", detail: error.message });
+    }
+  });
+
+  // ── Performance summary (aggregated from both APIs) ────────────────────────
   app.get("/api/polymarket/performance", async (_req, res) => {
     try {
-      const client = await getClobClient();
-      if (!client) {
-        return res.status(400).json({ error: "CLOB client not initialized. Check credentials." });
-      }
+      const userAddress = await getTradingAddress();
+      if (!userAddress) return res.status(400).json({ error: "Wallet not initialized. Set POLYGON_PRIVATE_KEY in .env" });
 
-      const trades = await client.getTrades();
-      res.json(computePerformanceData(trades));
+      const [openRes, closedRes] = await Promise.allSettled([
+        axios.get("https://data-api.polymarket.com/positions", {
+          params: { user: userAddress, limit: 500, sizeThreshold: 0 },
+          timeout: 10000,
+        }),
+        axios.get("https://data-api.polymarket.com/closed-positions", {
+          params: { user: userAddress, limit: 50, sortBy: "TIMESTAMP", sortDirection: "DESC" },
+          timeout: 10000,
+        }),
+      ]);
+
+      const openPositionsRaw: any[] = openRes.status === "fulfilled" ? (openRes.value.data ?? []) : [];
+      const closedPositionsRaw: any[] = closedRes.status === "fulfilled" ? (closedRes.value.data ?? []) : [];
+
+      // Aggregate stats from closed positions
+      const winCount  = closedPositionsRaw.filter((p) => p.realizedPnl > 0).length;
+      const lossCount = closedPositionsRaw.filter((p) => p.realizedPnl < 0).length;
+      const closedTrades = closedPositionsRaw.length;
+      const winRate = closedTrades > 0 ? (winCount / closedTrades) * 100 : 0;
+      const realizedPnl = closedPositionsRaw.reduce((sum, p) => sum + (p.realizedPnl ?? 0), 0);
+
+      // Open exposure = sum of current market value of open positions
+      const openExposure = openPositionsRaw.reduce((sum, p) => sum + (p.currentValue ?? p.initialValue ?? 0), 0);
+
+      // Map open positions to the shape the frontend expects
+      const openPositions = openPositionsRaw.map((p) => ({
+        assetId:      p.asset,
+        market:       p.title,
+        outcome:      p.outcome,
+        size:         Number(p.size ?? 0).toFixed(4),
+        costBasis:    Number(p.initialValue ?? 0).toFixed(4),
+        averagePrice: Number(p.avgPrice ?? 0).toFixed(4),
+        currentValue: Number(p.currentValue ?? 0).toFixed(4),
+        cashPnl:      Number(p.cashPnl ?? 0).toFixed(4),
+        percentPnl:   Number(p.percentPnl ?? 0).toFixed(2),
+        curPrice:     Number(p.curPrice ?? 0).toFixed(4),
+        redeemable:   p.redeemable ?? false,
+      }));
+
+      res.json({
+        summary: {
+          totalMatchedTrades: closedTrades,
+          closedTrades,
+          winCount,
+          lossCount,
+          winRate: winRate.toFixed(2),
+          realizedPnl: realizedPnl.toFixed(4),
+          openExposure: openExposure.toFixed(4),
+        },
+        openPositions,
+        closedPositions: closedPositionsRaw.map((p) => ({
+          assetId:     p.asset,
+          market:      p.title,
+          outcome:     p.outcome,
+          avgPrice:    Number(p.avgPrice ?? 0).toFixed(4),
+          totalBought: Number(p.totalBought ?? 0).toFixed(4),
+          realizedPnl: Number(p.realizedPnl ?? 0).toFixed(4),
+          curPrice:    Number(p.curPrice ?? 0).toFixed(4),
+          timestamp:   p.timestamp,
+          endDate:     p.endDate,
+          eventSlug:   p.eventSlug,
+        })),
+        history: [], // legacy field kept for App.tsx compatibility
+        user: userAddress,
+      });
     } catch (error: any) {
-      console.error("Performance Lookup Error:", error);
-      res.status(500).json(formatTradeError(error));
+      console.error("Performance fetch error:", error.message);
+      res.status(500).json({ error: "Failed to fetch performance", detail: error.message });
     }
   });
 

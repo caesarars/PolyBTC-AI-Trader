@@ -216,6 +216,19 @@ interface LossPattern {
   lesson: string;
 }
 
+interface DivergenceSignal {
+  btcDelta30s: number;
+  btcDelta60s: number;
+  yesDelta30s: number;
+  divergence: number;
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK" | "NONE";
+  currentBtcPrice: number | null;
+  currentYesAsk: number | null;
+  currentNoAsk: number | null;
+  updatedAt: number;
+}
+
 export async function analyzeMarket(
   market: Market,
   btcPrice: string | null,
@@ -225,7 +238,8 @@ export async function analyzeMarket(
   orderBooks: Record<string, OrderBook>,
   marketHistory: { t: number; yes: number; no: number }[] = [],
   windowElapsedSeconds: number = 150,
-  lossPatterns: LossPattern[] = []
+  lossPatterns: LossPattern[] = [],
+  divergence: DivergenceSignal | null = null
 ): Promise<AIRecommendation> {
   const sentimentSummary = sentiment
     ? `${sentiment.value_classification} (${sentiment.value}/100)`
@@ -236,7 +250,6 @@ export async function analyzeMarket(
   const dataMode: "FULL_DATA" | "POLYMARKET_ONLY" =
     hasBtcPrice && hasBtcHistory ? "FULL_DATA" : "POLYMARKET_ONLY";
 
-  const last15 = history.slice(-15);
   const triggerAnalysis = hasBtcHistory
     ? describeOneMinuteTrigger(history)
     : { trigger: "MIXED" as const, patterns: ["BTC candlestick feed unavailable"], summary: "1m trigger unavailable." };
@@ -248,6 +261,7 @@ export async function analyzeMarket(
     : { bias: "MIXED" as const, summary: "60m bias unavailable." };
   const patterns = triggerAnalysis.patterns;
 
+  const last15 = history.slice(-15);
   const ohlcvTable =
     last15
       .map((h, i) => {
@@ -434,7 +448,27 @@ ${obLines}
 ${marketHistoryBlock}
 YES Price Velocity (per min): ${priceVelocityLabel}
 
-${lossPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
+${(() => {
+  if (!divergence || divergence.strength === "NONE") return "";
+  const btcDir = divergence.btcDelta30s >= 0 ? "UP" : "DOWN";
+  const lag = divergence.direction !== "NEUTRAL" && divergence.yesDelta30s * (divergence.direction === "UP" ? 1 : -1) < 2.0;
+  return `== PRICE LAG DIVERGENCE (HIGHEST PRIORITY SIGNAL) ==
+BTC moved: ${divergence.btcDelta30s >= 0 ? "+" : ""}$${divergence.btcDelta30s.toFixed(0)} in last 30s (${btcDir})
+BTC 60s change: ${divergence.btcDelta60s >= 0 ? "+" : ""}$${divergence.btcDelta60s.toFixed(0)}
+YES token moved: ${divergence.yesDelta30s >= 0 ? "+" : ""}${divergence.yesDelta30s.toFixed(2)}¢ in last 30s
+Market lag: ${lag ? `YES — Polymarket has NOT priced in the BTC move yet` : "NO — market already caught up"}
+Divergence direction: ${divergence.direction}
+Divergence strength: ${divergence.strength}
+Interpretation: ${
+  divergence.strength === "STRONG"
+    ? `BTC made a STRONG move ${divergence.direction} but Polymarket is lagging — this is a near-certain mispricing. TRADE ${divergence.direction} immediately.`
+    : divergence.strength === "MODERATE"
+      ? `BTC moved ${divergence.direction} and Polymarket is slow to reprice. High-confidence ${divergence.direction} entry.`
+      : `Mild BTC momentum ${divergence.direction}, Polymarket slightly lagging. Treat as supporting signal.`
+}
+
+`;
+})()}${lossPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
 1. MINIMUM ALIGNMENT: Output TRADE if at least 2 of these 4 signals agree on the same direction:
    - 60m bias
    - 5m confirmation
@@ -456,6 +490,7 @@ ${lossPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional 
     - Only set riskLevel = HIGH if reversal probability > 60% AND signals are split 2/2 or worse
 12. WINDOW TIMING: windowElapsedSeconds < 10 = too early (output NO_TRADE). windowElapsedSeconds > 285 = too late (output NO_TRADE). ALL other times (10-285s) are valid entry zones — trade them.
 13. LOSS PATTERN LEARNING: If the ADAPTIVE LEARNING section above contains recent losses, study them. If the current setup matches a loss pattern (same direction + similar RSI/EMA/signal/window conditions), reduce your confidence by 10% and increase riskLevel by one step. Never repeat the exact same setup that already lost — look for a meaningfully different context before trading the same direction again.
+14. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): If the PRICE LAG DIVERGENCE section shows strength=STRONG or MODERATE — this overrides all other signals. The Polymarket price has NOT caught up to the real BTC move yet. Set decision=TRADE in the divergence direction with confidence >= 75% and riskLevel="LOW". This is the best edge available in these markets.
 
 Respond with JSON only:
 {

@@ -16,6 +16,9 @@ import {
   BarChart3,
   Zap,
   LineChart as LineChartIcon,
+  Tag,
+  Shield,
+  Flame,
 } from "lucide-react";
 import {
   AreaChart,
@@ -32,6 +35,21 @@ function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(" ");
 }
 
+interface EntrySnapshot {
+  market: string;
+  windowStart: number;
+  yesPrice: number | null;
+  noPrice: number | null;
+  direction: string | null;
+  confidence: number | null;
+  edge: number | null;
+  riskLevel: string | null;
+  estimatedBet: number | null;
+  btcPrice: number | null;
+  divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
+  updatedAt: string;
+}
+
 interface BotStatus {
   enabled: boolean;
   running: boolean;
@@ -39,7 +57,9 @@ interface BotStatus {
   sessionTradesCount: number;
   windowElapsedSeconds: number;
   analyzedThisWindow: number;
+  entrySnapshot: EntrySnapshot | null;
   config: {
+    mode: "AGGRESSIVE" | "CONSERVATIVE";
     minConfidence: number;
     minEdge: number;
     kellyFraction: number;
@@ -82,6 +102,24 @@ interface OpenPosition {
   size: string;
   costBasis: string;
   averagePrice: string;
+  currentValue?: string;
+  cashPnl?: string;
+  percentPnl?: string;
+  curPrice?: string;
+  redeemable?: boolean;
+}
+
+interface ClosedPosition {
+  assetId: string;
+  market: string;
+  outcome: string;
+  avgPrice: string;
+  totalBought: string;
+  realizedPnl: string;
+  curPrice: string;
+  timestamp: number;
+  endDate: string;
+  eventSlug: string;
 }
 
 interface Automation {
@@ -100,11 +138,13 @@ interface Automation {
 export default function BotDashboard() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [log, setLog] = useState<BotLogEntry[]>([]);
-  const [performance, setPerformance] = useState<{ summary: PerformanceSummary; openPositions: OpenPosition[] } | null>(null);
+  const [performance, setPerformance] = useState<{ summary: PerformanceSummary; openPositions: OpenPosition[]; closedPositions: ClosedPosition[] } | null>(null);
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [balance, setBalance] = useState<string>("—");
   const [controlLoading, setControlLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [resetConfLoading, setResetConfLoading] = useState(false);
+  const [modeLoading, setModeLoading] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -133,6 +173,32 @@ export default function BotDashboard() {
     const interval = setInterval(fetchAll, 5000);
     return () => clearInterval(interval);
   }, [fetchAll]);
+
+  const handleToggleMode = async () => {
+    const currentMode = status?.config.mode ?? "AGGRESSIVE";
+    const nextMode = currentMode === "AGGRESSIVE" ? "CONSERVATIVE" : "AGGRESSIVE";
+    setModeLoading(true);
+    try {
+      await fetch("/api/bot/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: nextMode }),
+      });
+      await fetchAll();
+    } finally {
+      setModeLoading(false);
+    }
+  };
+
+  const handleResetConfidence = async () => {
+    setResetConfLoading(true);
+    try {
+      await fetch("/api/bot/reset-confidence", { method: "POST" });
+      await fetchAll();
+    } finally {
+      setResetConfLoading(false);
+    }
+  };
 
   const handleControl = async (enable: boolean) => {
     setControlLoading(true);
@@ -261,8 +327,86 @@ export default function BotDashboard() {
             </button>
           </div>
           <div className="text-[10px] text-zinc-600 space-y-0.5">
-            <div>Conf ≥{status?.config.minConfidence ?? 68}% | Edge ≥{status?.config.minEdge ?? 8}¢</div>
+            <div className="flex items-center gap-2">
+              <span>Conf ≥{status?.config.minConfidence ?? 68}% | Edge ≥{status?.config.minEdge ?? 8}¢</span>
+              <button
+                type="button"
+                onClick={handleResetConfidence}
+                disabled={resetConfLoading}
+                title="Reset adaptive confidence boost to default"
+                className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide bg-zinc-700 text-zinc-400 hover:bg-zinc-600 hover:text-white transition-colors disabled:opacity-40"
+              >
+                {resetConfLoading ? "…" : "Reset"}
+              </button>
+            </div>
             <div>Max ${status?.config.maxBetUsdc ?? 50} | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
+          </div>
+        </div>
+
+        {/* ── Bot Mode Selector ── */}
+        <div className="glass-card p-4 flex flex-col gap-3">
+          <div className="flex items-center gap-2 text-zinc-500 text-xs font-semibold uppercase tracking-wider">
+            <Shield className="w-3.5 h-3.5" />
+            Bot Mode
+          </div>
+          <div className="flex flex-col gap-2">
+            {[
+              {
+                mode: "AGGRESSIVE" as const,
+                label: "Aggressive",
+                icon: <Flame className="w-4 h-4" />,
+                color: "orange",
+                stats: ["Conf ≥52%", "Edge ≥0.05¢", "Kelly 40%", "Max $250", "10–285s"],
+              },
+              {
+                mode: "CONSERVATIVE" as const,
+                label: "Conservative",
+                icon: <Shield className="w-4 h-4" />,
+                color: "blue",
+                stats: ["Conf ≥68%", "Edge ≥0.08¢", "Kelly 20%", "Max $50", "30–240s"],
+              },
+            ].map(({ mode, label, icon, color, stats }) => {
+              const active = (status?.config.mode ?? "AGGRESSIVE") === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => !active && handleToggleMode()}
+                  disabled={modeLoading || active}
+                  className={cn(
+                    "w-full text-left rounded-lg border p-2.5 transition-all",
+                    active
+                      ? color === "orange"
+                        ? "bg-orange-500/15 border-orange-500/50 cursor-default"
+                        : "bg-blue-500/15 border-blue-500/50 cursor-default"
+                      : "bg-zinc-800/50 border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 cursor-pointer disabled:opacity-40"
+                  )}
+                >
+                  <div className={cn(
+                    "flex items-center gap-1.5 font-bold text-xs mb-1.5",
+                    active
+                      ? color === "orange" ? "text-orange-300" : "text-blue-300"
+                      : "text-zinc-400"
+                  )}>
+                    {icon}
+                    {label}
+                    {active && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ACTIVE</span>}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {stats.map((s) => (
+                      <span key={s} className={cn(
+                        "text-[9px] px-1 py-0.5 rounded font-mono",
+                        active
+                          ? color === "orange" ? "bg-orange-500/10 text-orange-400" : "bg-blue-500/10 text-blue-400"
+                          : "bg-zinc-700 text-zinc-500"
+                      )}>
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -313,6 +457,144 @@ export default function BotDashboard() {
           <div className="text-[10px] text-zinc-600">{armedCount} automations armed</div>
         </div>
       </div>
+
+      {/* ── Current Entry Price Widget ── */}
+      {(() => {
+        const snap = status?.entrySnapshot;
+        const entryPrice = snap?.direction === "UP" ? snap.yesPrice : snap?.direction === "DOWN" ? snap.noPrice : null;
+        const oppPrice   = snap?.direction === "UP" ? snap.noPrice  : snap?.direction === "DOWN" ? snap.yesPrice : null;
+        const isUp = snap?.direction === "UP";
+        const isDown = snap?.direction === "DOWN";
+        const updatedAgo = snap ? Math.floor((Date.now() - new Date(snap.updatedAt).getTime()) / 1000) : null;
+
+        return (
+          <div className="glass-card p-4 w-full">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                <Tag className="w-4 h-4" />
+                Current Entry Price
+              </h3>
+              {updatedAgo !== null && (
+                <span className="text-[10px] text-zinc-600 font-mono">{updatedAgo}s ago</span>
+              )}
+            </div>
+
+            {!snap ? (
+              <div className="flex items-center justify-center h-16 text-zinc-700 text-xs">
+                Waiting for bot to scan a market…
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {/* Market title */}
+                <p className="text-[11px] text-zinc-500 truncate">{snap.market}</p>
+
+                {/* Prices row */}
+                <div className="grid grid-cols-3 gap-3">
+                  {/* YES price */}
+                  <div className={cn(
+                    "rounded-xl p-3 flex flex-col gap-1 border",
+                    isUp ? "bg-green-500/10 border-green-500/30" : "bg-zinc-800/50 border-zinc-700/40"
+                  )}>
+                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">YES (UP)</span>
+                    <span className={cn("text-2xl font-mono font-bold", isUp ? "text-green-400" : "text-zinc-400")}>
+                      {snap.yesPrice !== null ? `${(snap.yesPrice * 100).toFixed(1)}¢` : "—"}
+                    </span>
+                    {isUp && <span className="text-[9px] text-green-500 font-bold">← ENTRY</span>}
+                  </div>
+
+                  {/* BTC price center */}
+                  <div className="bg-zinc-800/50 border border-zinc-700/40 rounded-xl p-3 flex flex-col gap-1 items-center justify-center">
+                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">BTC Price</span>
+                    <span className="text-lg font-mono font-bold text-white">
+                      {snap.btcPrice ? `$${snap.btcPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+                    </span>
+                    {snap.direction && (
+                      <span className={cn(
+                        "text-[9px] font-bold flex items-center gap-0.5",
+                        isUp ? "text-green-400" : "text-red-400"
+                      )}>
+                        {isUp ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                        {snap.direction}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* NO price */}
+                  <div className={cn(
+                    "rounded-xl p-3 flex flex-col gap-1 border",
+                    isDown ? "bg-red-500/10 border-red-500/30" : "bg-zinc-800/50 border-zinc-700/40"
+                  )}>
+                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">NO (DOWN)</span>
+                    <span className={cn("text-2xl font-mono font-bold", isDown ? "text-red-400" : "text-zinc-400")}>
+                      {snap.noPrice !== null ? `${(snap.noPrice * 100).toFixed(1)}¢` : "—"}
+                    </span>
+                    {isDown && <span className="text-[9px] text-red-500 font-bold">← ENTRY</span>}
+                  </div>
+                </div>
+
+                {/* Signal row */}
+                <div className="flex flex-wrap gap-2 text-[10px]">
+                  {snap.confidence !== null && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.confidence >= 70 ? "bg-green-500/10 text-green-400 border-green-500/30"
+                        : snap.confidence >= 55 ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
+                        : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                    )}>
+                      Conf {snap.confidence}%
+                    </span>
+                  )}
+                  {snap.edge !== null && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
+                      Edge {snap.edge}¢
+                    </span>
+                  )}
+                  {snap.riskLevel && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.riskLevel === "LOW"    ? "bg-green-500/10 text-green-400 border-green-500/30"
+                        : snap.riskLevel === "MEDIUM" ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
+                        : "bg-red-500/10 text-red-400 border-red-500/30"
+                    )}>
+                      {snap.riskLevel}
+                    </span>
+                  )}
+                  {entryPrice !== null && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">
+                      Entry {(entryPrice * 100).toFixed(1)}¢
+                    </span>
+                  )}
+                  {snap.estimatedBet !== null && snap.estimatedBet > 0 && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-purple-500/10 text-purple-400 border border-purple-500/30">
+                      ~${snap.estimatedBet.toFixed(2)} Kelly
+                    </span>
+                  )}
+                  {oppPrice !== null && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-500 border border-zinc-700">
+                      Opp {(oppPrice * 100).toFixed(1)}¢
+                    </span>
+                  )}
+                  {snap.divergence && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border flex items-center gap-1",
+                      snap.divergence.strength === "STRONG"   ? "bg-yellow-500/20 text-yellow-300 border-yellow-500/40"
+                        : snap.divergence.strength === "MODERATE" ? "bg-orange-500/15 text-orange-400 border-orange-500/30"
+                        : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                    )}>
+                      <Zap className="w-2.5 h-2.5" />
+                      LAG {snap.divergence.direction} {snap.divergence.strength}
+                      <span className="opacity-60 ml-0.5">
+                        BTC {snap.divergence.btcDelta30s >= 0 ? "+" : ""}{snap.divergence.btcDelta30s.toFixed(0)}$
+                        / YES {snap.divergence.yesDelta30s >= 0 ? "+" : ""}{snap.divergence.yesDelta30s.toFixed(1)}¢
+                      </span>
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── Session PnL Chart ── */}
       <div className="glass-card p-4 w-full">
@@ -452,50 +734,127 @@ export default function BotDashboard() {
       {performance && performance.openPositions.length > 0 && (
         <div className="glass-card p-4">
           <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
-            <BarChart3 className="w-4 h-4" />
-            Open Positions ({performance.openPositions.length})
+            <Activity className="w-4 h-4 text-blue-400" />
+            Open Positions
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">({performance.openPositions.length})</span>
           </h3>
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full text-xs">
               <thead>
                 <tr className="text-left text-[10px] uppercase tracking-widest text-zinc-600 border-b border-zinc-800">
-                  <th className="pb-2 pr-4">Market</th>
-                  <th className="pb-2 pr-4">Outcome</th>
-                  <th className="pb-2 pr-4">Size</th>
-                  <th className="pb-2 pr-4">Avg Price</th>
-                  <th className="pb-2 pr-4">Cost</th>
+                  <th className="pb-2 pr-3">Market</th>
+                  <th className="pb-2 pr-3">Side</th>
+                  <th className="pb-2 pr-3">Size</th>
+                  <th className="pb-2 pr-3">Avg Price</th>
+                  <th className="pb-2 pr-3">Cur Price</th>
+                  <th className="pb-2 pr-3">Cost</th>
+                  <th className="pb-2 pr-3">Unrealized PnL</th>
                   <th className="pb-2">TP / SL</th>
                 </tr>
               </thead>
-              <tbody>
-                {performance.openPositions.map((pos) => {
-                  const auto = automations.find((a) => a.assetId === pos.assetId);
-                  return (
-                    <tr key={pos.assetId} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-                      <td className="py-2 pr-4 text-zinc-300 max-w-[160px] truncate text-xs">{pos.market}</td>
-                      <td className="py-2 pr-4">
-                        <span className={cn("text-xs font-bold px-2 py-0.5 rounded",
-                          pos.outcome === "UP" ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"
-                        )}>
-                          {pos.outcome}
-                        </span>
-                      </td>
-                      <td className="py-2 pr-4 font-mono text-xs text-zinc-300">{parseFloat(pos.size).toFixed(2)}</td>
-                      <td className="py-2 pr-4 font-mono text-xs text-zinc-300">{(parseFloat(pos.averagePrice) * 100).toFixed(1)}¢</td>
-                      <td className="py-2 pr-4 font-mono text-xs text-zinc-300">${parseFloat(pos.costBasis).toFixed(2)}</td>
-                      <td className="py-2 text-[10px] font-mono text-zinc-500">
-                        {auto ? (
-                          <span className={cn(auto.armed ? "text-green-400" : "text-zinc-600")}>
-                            TP:{(parseFloat(auto.takeProfit) * 100).toFixed(0)}¢ SL:{(parseFloat(auto.stopLoss) * 100).toFixed(0)}¢
-                            {auto.armed && <span className="ml-1 text-green-400">●</span>}
-                          </span>
-                        ) : "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
             </table>
+            <div className="overflow-y-auto max-h-48">
+              <table className="w-full text-xs">
+                <tbody>
+                  {performance.openPositions.map((pos) => {
+                    const auto = automations.find((a) => a.assetId === pos.assetId);
+                    const cashPnl = parseFloat(pos.cashPnl ?? "0");
+                    const pctPnl  = parseFloat(pos.percentPnl ?? "0");
+                    const isUp    = pos.outcome?.toLowerCase().includes("up") || pos.outcome?.toLowerCase().includes("yes");
+                    return (
+                      <tr key={pos.assetId} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors">
+                        <td className="py-2 pr-3 text-zinc-300 max-w-[140px] truncate">{pos.market}</td>
+                        <td className="py-2 pr-3">
+                          <span className={cn("font-bold px-1.5 py-0.5 rounded",
+                            isUp ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"
+                          )}>
+                            {pos.outcome}
+                          </span>
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-zinc-300">{parseFloat(pos.size).toFixed(2)}</td>
+                        <td className="py-2 pr-3 font-mono text-zinc-300">{(parseFloat(pos.averagePrice) * 100).toFixed(1)}¢</td>
+                        <td className="py-2 pr-3 font-mono text-zinc-300">{pos.curPrice ? `${(parseFloat(pos.curPrice) * 100).toFixed(1)}¢` : "—"}</td>
+                        <td className="py-2 pr-3 font-mono text-zinc-300">${parseFloat(pos.costBasis).toFixed(2)}</td>
+                        <td className="py-2 pr-3 font-mono">
+                          <span className={cn("font-bold", cashPnl > 0 ? "text-green-400" : cashPnl < 0 ? "text-red-400" : "text-zinc-500")}>
+                            {cashPnl >= 0 ? "+" : ""}${cashPnl.toFixed(2)}
+                            <span className="ml-1 text-[10px] opacity-70">({pctPnl >= 0 ? "+" : ""}{pctPnl.toFixed(1)}%)</span>
+                          </span>
+                        </td>
+                        <td className="py-2 font-mono text-zinc-500">
+                          {auto ? (
+                            <span className={cn(auto.armed ? "text-green-400" : "text-zinc-600")}>
+                              TP:{(parseFloat(auto.takeProfit) * 100).toFixed(0)}¢ SL:{(parseFloat(auto.stopLoss) * 100).toFixed(0)}¢
+                              {auto.armed && <span className="ml-1 text-green-400">●</span>}
+                            </span>
+                          ) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Closed Positions ── */}
+      {performance && performance.closedPositions && performance.closedPositions.length > 0 && (
+        <div className="glass-card p-4">
+          <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-zinc-500" />
+            Closed Positions
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">({performance.closedPositions.length} recent)</span>
+          </h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-left text-[10px] uppercase tracking-widest text-zinc-600 border-b border-zinc-800">
+                  <th className="pb-2 pr-3">Market</th>
+                  <th className="pb-2 pr-3">Side</th>
+                  <th className="pb-2 pr-3">Avg Price</th>
+                  <th className="pb-2 pr-3">Close Price</th>
+                  <th className="pb-2 pr-3">Total Bought</th>
+                  <th className="pb-2 pr-3">Realized PnL</th>
+                  <th className="pb-2">Closed At</th>
+                </tr>
+              </thead>
+            </table>
+            <div className="overflow-y-auto max-h-48">
+              <table className="w-full text-xs">
+                <tbody>
+                  {performance.closedPositions.map((pos, i) => {
+                    const rpnl = parseFloat(pos.realizedPnl);
+                    const isWin = rpnl > 0;
+                    const isUp  = pos.outcome?.toLowerCase().includes("up") || pos.outcome?.toLowerCase().includes("yes");
+                    return (
+                      <tr key={`${pos.assetId}-${i}`} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors">
+                        <td className="py-2 pr-3 text-zinc-300 max-w-[140px] truncate">{pos.market}</td>
+                        <td className="py-2 pr-3">
+                          <span className={cn("font-bold px-1.5 py-0.5 rounded",
+                            isUp ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"
+                          )}>
+                            {pos.outcome}
+                          </span>
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-zinc-400">{(parseFloat(pos.avgPrice) * 100).toFixed(1)}¢</td>
+                        <td className="py-2 pr-3 font-mono text-zinc-400">{(parseFloat(pos.curPrice) * 100).toFixed(1)}¢</td>
+                        <td className="py-2 pr-3 font-mono text-zinc-400">{parseFloat(pos.totalBought).toFixed(2)}</td>
+                        <td className="py-2 pr-3 font-mono">
+                          <span className={cn("font-bold", isWin ? "text-green-400" : rpnl < 0 ? "text-red-400" : "text-zinc-500")}>
+                            {rpnl >= 0 ? "+" : ""}${rpnl.toFixed(2)}
+                          </span>
+                        </td>
+                        <td className="py-2 font-mono text-zinc-500 text-[10px]">
+                          {pos.timestamp ? new Date(pos.timestamp * 1000).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

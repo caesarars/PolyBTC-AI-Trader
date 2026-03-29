@@ -63,7 +63,7 @@ interface LearningState {
 type Tab = "trades" | "live";
 
 export default function BotLogSidebar() {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<Tab>("live");
   const [log, setLog] = useState<BotLogEntry[]>([]);
   const [rawLog, setRawLog] = useState<RawLogEntry[]>([]);
