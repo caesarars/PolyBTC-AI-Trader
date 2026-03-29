@@ -16,6 +16,7 @@
 | **Near-Expiry Exit** | Posisi profitable dipaksa keluar ≤60 detik sebelum window tutup — mencegah binary price collapse membalikkan profit |
 | **Entry Price Gate** | Hard gate: skip trade jika bestAsk > 80¢ — token near-resolved tidak punya edge yang layak |
 | **Live Kelly Pricing** | Kelly Criterion pakai harga live orderbook (bestAsk), bukan outcomePrices stale dari API |
+| **Calibrated AI Confidence** | Gemini diwajibkan ≥70% confidence (AGGRESSIVE) / ≥75% (CONSERVATIVE) — base rate 50% tertulis eksplisit di prompt, minimum 3/4 sinyal harus align |
 | **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI |
 | **Bot Mode** | Mode AGGRESSIVE (default) dan CONSERVATIVE — beda threshold confidence, Kelly, max bet, dan session loss limit |
 | **Performance Tracking** | Realized PnL, win rate, trade history lengkap dengan divergence stats |
@@ -49,10 +50,10 @@ Bot berjalan dalam siklus 5 detik:
 1. **Scan** — Ambil daftar pasar BTC 5-menit aktif di Polymarket
 2. **Analisa** — Hitung indikator teknikal (60 candle), baca order book, kirim ke Gemini AI
 3. **Keputusan** — AI return `TRADE / NO_TRADE` + direction, confidence, estimated edge, risk level
-4. **Gate Check** — Validasi timing window (10–285 detik), likuiditas order book ($150+), signal alignment (min 2 dari 4)
-5. **Eksekusi** — Submit order ke Polymarket CLOB dengan size dari Kelly Criterion (max 3% bankroll)
-6. **Tracking** — Monitor fill status, hitung PnL saat window tutup
-7. **Learning** — Simpan pola loss, kurangi confidence kalau setup serupa muncul lagi
+4. **Gate Check** — Validasi timing window (10–285 detik), likuiditas order book ($500+), entry price ≤80¢, signal alignment (min 3 dari 4)
+5. **Eksekusi** — Submit order ke Polymarket CLOB dengan size dari Kelly Criterion berbasis harga live orderbook (bestAsk), disesuaikan volatilitas BTC (ATR)
+6. **Tracking** — Monitor fill status, hitung PnL saat window tutup, paksa exit jika ≤60 detik tersisa dan posisi profitable
+7. **Learning** — Simpan pola loss DAN win, sesuaikan confidence threshold berdasarkan streak
 
 ---
 
@@ -218,6 +219,39 @@ npm run lint     # Type check TypeScript
 ├── vite.config.ts               # Konfigurasi Vite
 └── .env.example                 # Template environment variables
 ```
+
+---
+
+## Kalibrasi & Edge Philosophy
+
+Bot ini dirancang untuk **presisi, bukan frekuensi**. Berikut prinsip yang diterapkan:
+
+### Base Rate Problem
+Pasar binary BTC 5-menit pada dasarnya adalah coin flip (50/50). Sinyal teknikal seperti RSI, EMA, dan MACD mengukur apa yang **sudah terjadi** pada BTC — bukan arah 5 menit ke depan. Satu-satunya edge yang benar-benar valid adalah **price lag divergence**: ketika BTC sudah bergerak signifikan tapi Polymarket belum meng-update harganya.
+
+### Threshold Aktif
+
+| Parameter | AGGRESSIVE | CONSERVATIVE |
+|---|---|---|
+| Min Confidence | 70% | 75% |
+| Min Edge | 0.10 | 0.12 |
+| Kelly Fraction | 40% | 20% |
+| Max Bet | $250 | $50 |
+| Session Loss Limit | 25% | 15% |
+| Max Entry Price | 80¢ | 80¢ |
+
+### Signal Alignment
+Minimal **3 dari 4 sinyal** harus sepakat sebelum trade dieksekusi (kecuali divergence STRONG/MODERATE, cukup 2/4):
+- 60m bias (arah trend jangka menengah)
+- 5m confirmation (konfirmasi swing)
+- 1m trigger (entry trigger)
+- Technical signal score (RSI + MACD + EMA combined)
+
+### Edge Formula
+```
+real_edge = your_probability - 0.50 (base rate)
+```
+Confidence 70% = +20% edge di atas coin flip. Di bawah 70% = tidak cukup untuk menutup spread dan slippage.
 
 ---
 
