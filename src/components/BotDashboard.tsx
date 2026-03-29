@@ -365,7 +365,7 @@ export default function BotDashboard() {
           </div>
           <div className="text-[10px] text-zinc-600 space-y-0.5">
             <div className="flex items-center gap-2">
-              <span>Conf ≥{status?.config.minConfidence ?? 68}% | Edge ≥{status?.config.minEdge ?? 8}¢</span>
+              <span>Conf ≥{status?.config.minConfidence ?? 70}% | Edge ≥{status?.config.minEdge ?? 10}¢</span>
               <button
                 type="button"
                 onClick={handleResetConfidence}
@@ -393,14 +393,14 @@ export default function BotDashboard() {
                 label: "Aggressive",
                 icon: <Flame className="w-4 h-4" />,
                 color: "orange",
-                stats: ["Conf ≥52%", "Edge ≥0.05¢", "Kelly 40%", "Max $250", "10–285s"],
+                stats: ["Conf ≥70%", "Edge ≥0.10¢", "Kelly 40%", "Max $250", "10–285s"],
               },
               {
                 mode: "CONSERVATIVE" as const,
                 label: "Conservative",
                 icon: <Shield className="w-4 h-4" />,
                 color: "blue",
-                stats: ["Conf ≥68%", "Edge ≥0.08¢", "Kelly 20%", "Max $50", "30–240s"],
+                stats: ["Conf ≥75%", "Edge ≥0.12¢", "Kelly 20%", "Max $50", "30–240s"],
               },
             ].map(({ mode, label, icon, color, stats }) => {
               const active = (status?.config.mode ?? "AGGRESSIVE") === mode;
