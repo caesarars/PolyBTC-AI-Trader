@@ -2535,13 +2535,22 @@ async function startServer() {
                 const bestAsk = Number(ob?.asks?.[0]?.price || "0");
                 const bestBid = Number(ob?.bids?.[0]?.price || "0");
 
-                // ── Hard gate: max entry price ──────────────────────────────
-                // Paying > 80¢ for a binary leaves ≤ 20¢ max profit.
-                // At these prices the edge collapses — token is nearly resolved.
-                const MAX_ENTRY_PRICE = 0.80;
+                // ── Dynamic entry price gate ─────────────────────────────────
+                // Break-even win rate = entry price for binary $1 payouts.
+                // So at 70% confidence, paying 70¢ is break-even — we need
+                // a buffer to actually profit. Formula: max = (confidence - 10) / 100
+                //   70% conf → max 60¢  (EV = +10¢/share)
+                //   75% conf → max 65¢  (EV = +10¢/share)
+                //   80% conf → max 70¢  (EV = +10¢/share)
+                //   85%+ conf → max 75¢ (capped; divergence gets 85¢ exception)
+                // STRONG divergence is a structural edge (real price lag) → allow 85¢.
+                const isDivergenceStrong = div?.strength === "STRONG";
+                const MAX_ENTRY_PRICE = isDivergenceStrong
+                  ? 0.85
+                  : Math.min(0.75, (rec.confidence - 10) / 100);
                 if (bestAsk > 0 && bestAsk > MAX_ENTRY_PRICE) {
-                  botPrint("SKIP", `Entry price too high: bestAsk=${( bestAsk * 100).toFixed(0)}¢ > ${MAX_ENTRY_PRICE * 100}¢ max. Token near-resolved — no edge. Skipping.`);
-                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}¢ > ${MAX_ENTRY_PRICE * 100}¢ max entry price.`;
+                  botPrint("SKIP", `Entry price too high: bestAsk=${(bestAsk * 100).toFixed(0)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Negative EV — skipping.`);
+                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ dynamic max (conf=${rec.confidence}%).`;
                   botLog.unshift(logEntry);
                   if (botLog.length > 100) botLog.pop();
                   pushSSE("cycle", { ts: new Date().toISOString() });

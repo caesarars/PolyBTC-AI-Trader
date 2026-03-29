@@ -393,14 +393,14 @@ export default function BotDashboard() {
                 label: "Aggressive",
                 icon: <Flame className="w-4 h-4" />,
                 color: "orange",
-                stats: ["Conf ≥70%", "Edge ≥0.10¢", "Kelly 40%", "Max $250", "10–285s"],
+                stats: ["Conf ≥70%", "Entry ≤60¢", "Kelly 40%", "Max $250", "10–285s"],
               },
               {
                 mode: "CONSERVATIVE" as const,
                 label: "Conservative",
                 icon: <Shield className="w-4 h-4" />,
                 color: "blue",
-                stats: ["Conf ≥75%", "Edge ≥0.12¢", "Kelly 20%", "Max $50", "30–240s"],
+                stats: ["Conf ≥75%", "Entry ≤65¢", "Kelly 20%", "Max $50", "30–240s"],
               },
             ].map(({ mode, label, icon, color, stats }) => {
               const active = (status?.config.mode ?? "AGGRESSIVE") === mode;

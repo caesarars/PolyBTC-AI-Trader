@@ -238,7 +238,7 @@ Pasar binary BTC 5-menit pada dasarnya adalah coin flip (50/50). Sinyal teknikal
 | Kelly Fraction | 40% | 20% |
 | Max Bet | $250 | $50 |
 | Session Loss Limit | 25% | 15% |
-| Max Entry Price | 80¢ | 80¢ |
+| Max Entry Price | Dynamic: (conf−10)¢, max 75¢ | Dynamic: (conf−10)¢, max 75¢ |
 
 ### Signal Alignment
 Minimal **3 dari 4 sinyal** harus sepakat sebelum trade dieksekusi (kecuali divergence STRONG/MODERATE, cukup 2/4):
