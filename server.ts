@@ -43,6 +43,21 @@ interface TradeLogEntry {
   orderId: string | null;
 }
 
+interface CopyTraderPosition {
+  assetId: string;
+  market: string;
+  outcome: string;
+  size: string;
+  averagePrice: string;
+  currentPrice: string;
+  initialValue: string;
+  currentValue: string;
+  cashPnl: string;
+  percentPnl: string;
+  endDate: string | null;
+  eventSlug: string | null;
+}
+
 function saveTradeLog(entry: TradeLogEntry): void {
   try {
     fs.appendFileSync(TRADE_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
@@ -193,6 +208,10 @@ const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30
 // ── Bot mode: AGGRESSIVE (default) vs CONSERVATIVE ───────────────────────────
 let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
 
+// Runtime-overrideable thresholds for AGGRESSIVE mode (UI-adjustable)
+let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
+let aggressiveMinEdge       = BOT_MIN_EDGE;
+
 const CONSERVATIVE_CONFIG = {
   minConfidence:    75,
   minEdge:          0.12,
@@ -207,8 +226,8 @@ const CONSERVATIVE_CONFIG = {
 function getActiveConfig() {
   if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG;
   return {
-    minConfidence:    BOT_MIN_CONFIDENCE,
-    minEdge:          BOT_MIN_EDGE,
+    minConfidence:    aggressiveMinConfidence,
+    minEdge:          aggressiveMinEdge,
     kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
     sessionLossLimit: BOT_SESSION_LOSS_LIMIT,
@@ -2812,6 +2831,23 @@ async function startServer() {
     res.json({ ok: true, mode: botMode, config: cfg });
   });
 
+  app.post("/api/bot/config", (req, res) => {
+    const { minConfidence, minEdge } = req.body || {};
+    if (minConfidence !== undefined) {
+      const val = Number(minConfidence);
+      if (isNaN(val) || val < 50 || val > 99) return res.status(400).json({ error: "minConfidence must be 50–99" });
+      aggressiveMinConfidence = val;
+    }
+    if (minEdge !== undefined) {
+      const val = Number(minEdge);
+      if (isNaN(val) || val < 0.01 || val > 0.50) return res.status(400).json({ error: "minEdge must be 0.01–0.50" });
+      aggressiveMinEdge = val;
+    }
+    const cfg = getActiveConfig();
+    botPrint("INFO", `Config updated (AGGRESSIVE): conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢`);
+    res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, config: cfg });
+  });
+
   app.post("/api/bot/reset-confidence", (_req, res) => {
     adaptiveConfidenceBoost = 0;
     consecutiveLosses = 0;
@@ -3111,11 +3147,124 @@ async function startServer() {
   });
 
   // ── Helper: resolve trading address (proxy wallet or EOA) ────────────────
+  app.get("/api/polymarket/copy-trading/trader/:address", async (req, res) => {
+    try {
+      const address = String(req.params.address || "").trim();
+      if (!ethers.utils.isAddress(address)) {
+        return res.status(400).json({ error: "Valid Polygon wallet/profile address is required." });
+      }
+
+      const positionsRaw = await fetchOpenPositionsForUser(address);
+      const positions = positionsRaw
+        .filter((p) => Number(p.size ?? 0) > 0)
+        .sort((a, b) => Number(b.currentValue ?? b.initialValue ?? 0) - Number(a.currentValue ?? a.initialValue ?? 0))
+        .map(mapCopyTraderPosition);
+
+      const totalExposure = positions.reduce((sum, p) => sum + Number(p.currentValue || p.initialValue || 0), 0);
+      const totalCost = positions.reduce((sum, p) => sum + Number(p.initialValue || 0), 0);
+      const totalCashPnl = positions.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
+
+      res.json({
+        trader: address,
+        positions,
+        summary: {
+          openPositions: positions.length,
+          totalExposure: totalExposure.toFixed(4),
+          totalCost: totalCost.toFixed(4),
+          totalCashPnl: totalCashPnl.toFixed(4),
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: "Failed to fetch trader positions", detail: error?.message || String(error) });
+    }
+  });
+
+  app.post("/api/polymarket/copy-trading/execute", async (req, res) => {
+    try {
+      const {
+        leaderAddress,
+        assetId,
+        amount,
+        executionMode = "AGGRESSIVE",
+      } = req.body || {};
+
+      const normalizedLeaderAddress = String(leaderAddress || "").trim();
+      const normalizedAssetId = String(assetId || "").trim();
+      const spendAmount = Number(amount);
+      const normalizedExecutionMode = String(executionMode || "AGGRESSIVE").toUpperCase() as "PASSIVE" | "AGGRESSIVE";
+
+      if (!ethers.utils.isAddress(normalizedLeaderAddress)) {
+        return res.status(400).json({ error: "Valid leaderAddress is required." });
+      }
+      if (!normalizedAssetId) {
+        return res.status(400).json({ error: "assetId is required." });
+      }
+      if (!Number.isFinite(spendAmount) || spendAmount <= 0) {
+        return res.status(400).json({ error: "amount must be greater than 0." });
+      }
+      if (normalizedExecutionMode !== "PASSIVE" && normalizedExecutionMode !== "AGGRESSIVE") {
+        return res.status(400).json({ error: "executionMode must be PASSIVE or AGGRESSIVE." });
+      }
+
+      const myTradingAddress = await getTradingAddress();
+      if (myTradingAddress && myTradingAddress.toLowerCase() === normalizedLeaderAddress.toLowerCase()) {
+        return res.status(400).json({ error: "Leader address matches your configured trading address." });
+      }
+
+      const leaderPositions = await fetchOpenPositionsForUser(normalizedLeaderAddress);
+      const leaderPosition = leaderPositions.find((position) => String(position.asset || "") === normalizedAssetId);
+      if (!leaderPosition) {
+        return res.status(404).json({ error: "Selected leader position is no longer open." });
+      }
+
+      const result = await executePolymarketTrade({
+        tokenID: normalizedAssetId,
+        amount: spendAmount,
+        side: Side.BUY,
+        executionMode: normalizedExecutionMode,
+        amountMode: "SPEND",
+      });
+
+      res.json({
+        success: true,
+        trader: normalizedLeaderAddress,
+        copiedPosition: mapCopyTraderPosition(leaderPosition),
+        executionMode: normalizedExecutionMode,
+        result,
+      });
+    } catch (error: any) {
+      res.status(500).json(formatTradeError(error, req.body));
+    }
+  });
+
   const getTradingAddress = async (): Promise<string | null> => {
     if (POLYMARKET_FUNDER_ADDRESS) return POLYMARKET_FUNDER_ADDRESS;
     await getClobClient();
     return clobWallet?.address ?? null;
   };
+
+  const fetchOpenPositionsForUser = async (userAddress: string): Promise<any[]> => {
+    const response = await axios.get("https://data-api.polymarket.com/positions", {
+      params: { user: userAddress, limit: 500, sizeThreshold: 0 },
+      timeout: 10000,
+    });
+    return Array.isArray(response.data) ? response.data : [];
+  };
+
+  const mapCopyTraderPosition = (position: any): CopyTraderPosition => ({
+    assetId: String(position.asset || ""),
+    market: String(position.title || position.market || ""),
+    outcome: String(position.outcome || ""),
+    size: Number(position.size ?? 0).toFixed(4),
+    averagePrice: Number(position.avgPrice ?? 0).toFixed(4),
+    currentPrice: Number(position.curPrice ?? 0).toFixed(4),
+    initialValue: Number(position.initialValue ?? 0).toFixed(4),
+    currentValue: Number(position.currentValue ?? 0).toFixed(4),
+    cashPnl: Number(position.cashPnl ?? 0).toFixed(4),
+    percentPnl: Number(position.percentPnl ?? 0).toFixed(2),
+    endDate: position.endDate || null,
+    eventSlug: position.eventSlug || null,
+  });
 
   // ── Current positions (open) ───────────────────────────────────────────────
   app.get("/api/polymarket/positions", async (_req, res) => {

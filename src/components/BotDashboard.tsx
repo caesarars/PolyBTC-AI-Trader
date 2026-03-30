@@ -177,6 +177,10 @@ export default function BotDashboard() {
   const [resetConfLoading, setResetConfLoading] = useState(false);
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
+  const [confInput, setConfInput] = useState<string>("");
+  const [edgeInput, setEdgeInput] = useState<string>("");
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configSaved, setConfigSaved] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -234,6 +238,29 @@ export default function BotDashboard() {
       await fetchAll();
     } finally {
       setResetConfLoading(false);
+    }
+  };
+
+  const handleSaveConfig = async () => {
+    const conf = confInput !== "" ? Number(confInput) : null;
+    const edge = edgeInput !== "" ? Number(edgeInput) : null;
+    if (conf !== null && (isNaN(conf) || conf < 50 || conf > 99)) return;
+    if (edge !== null && (isNaN(edge) || edge < 0.01 || edge > 0.50)) return;
+    setConfigSaving(true);
+    try {
+      await fetch("/api/bot/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(conf !== null && { minConfidence: conf }),
+          ...(edge !== null && { minEdge: edge }),
+        }),
+      });
+      setConfigSaved(true);
+      setTimeout(() => setConfigSaved(false), 2000);
+      await fetchAll();
+    } finally {
+      setConfigSaving(false);
     }
   };
 
@@ -377,6 +404,73 @@ export default function BotDashboard() {
               </button>
             </div>
             <div>Max ${status?.config.maxBetUsdc ?? 50} | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
+          </div>
+        </div>
+
+        {/* ── Threshold Tuner ── */}
+        <div className="glass-card p-4 flex flex-col gap-3">
+          <div className="flex items-center gap-2 text-zinc-500 text-xs font-semibold uppercase tracking-wider">
+            <Activity className="w-3.5 h-3.5" />
+            Threshold Tuner
+          </div>
+          <div className="space-y-3">
+            {/* Min Confidence */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-zinc-400">Min Confidence</span>
+                <span className="font-mono text-emerald-400">
+                  {confInput !== "" ? `${confInput}%` : `${status?.config.minConfidence ?? 70}% (aktif)`}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={50} max={95} step={1}
+                value={confInput !== "" ? Number(confInput) : (status?.config.minConfidence ?? 70)}
+                onChange={(e) => setConfInput(e.target.value)}
+                className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-emerald-500 bg-zinc-700"
+              />
+              <div className="flex justify-between text-[9px] text-zinc-600 font-mono">
+                <span>50%</span><span>60%</span><span>70%</span><span>80%</span><span>95%</span>
+              </div>
+            </div>
+            {/* Min Edge */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-zinc-400">Min Edge</span>
+                <span className="font-mono text-blue-400">
+                  {edgeInput !== "" ? `${Number(edgeInput).toFixed(2)}¢` : `${(status?.config.minEdge ?? 0.10).toFixed(2)}¢ (aktif)`}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0.01} max={0.30} step={0.01}
+                value={edgeInput !== "" ? Number(edgeInput) : (status?.config.minEdge ?? 0.10)}
+                onChange={(e) => setEdgeInput(e.target.value)}
+                className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-blue-500 bg-zinc-700"
+              />
+              <div className="flex justify-between text-[9px] text-zinc-600 font-mono">
+                <span>0.01</span><span>0.10</span><span>0.20</span><span>0.30</span>
+              </div>
+            </div>
+            {/* EV preview */}
+            {confInput !== "" && edgeInput !== "" && (() => {
+              const conf = Number(confInput) / 100;
+              const maxEntry = Math.min(0.75, (Number(confInput) - 10) / 100);
+              const ev = conf * (1 - maxEntry) - (1 - conf) * maxEntry;
+              return (
+                <div className={`text-[10px] font-mono px-2 py-1 rounded ${ev > 0 ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"}`}>
+                  EV @ max entry {(maxEntry * 100).toFixed(0)}¢: {ev > 0 ? "+" : ""}{(ev * 100).toFixed(1)}¢/share {ev > 0 ? "✓" : "✗ negative"}
+                </div>
+              );
+            })()}
+            <button
+              type="button"
+              onClick={handleSaveConfig}
+              disabled={configSaving || (confInput === "" && edgeInput === "")}
+              className="w-full py-1.5 rounded-lg text-xs font-bold transition-all bg-zinc-700 text-zinc-300 hover:bg-emerald-600 hover:text-white disabled:opacity-40 disabled:cursor-default"
+            >
+              {configSaving ? "Saving…" : configSaved ? "✓ Saved" : "Apply"}
+            </button>
           </div>
         </div>
 
