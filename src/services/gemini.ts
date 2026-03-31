@@ -43,12 +43,13 @@ function computeDirectionalBias(candles: Candle[]): "UP" | "DOWN" | "MIXED" {
 }
 
 // Returns number of signals aligned in each direction
-// { bullish: 0-4, bearish: 0-4, aligned: "UP"|"DOWN"|"MIXED" }
+// { bullish: 0-5, bearish: 0-5, aligned: "UP"|"DOWN"|"MIXED" }
 function computeMultiTimeframeAlignment(
   bias: "UP" | "DOWN" | "MIXED",
   confirmation: "UP" | "DOWN" | "MIXED",
   trigger: "UP" | "DOWN" | "MIXED",
-  indicators: BTCIndicators | null
+  indicators: BTCIndicators | null,
+  fastMomentum?: FastLoopMomentum | null
 ): { bullish: number; bearish: number; aligned: "UP" | "DOWN" | "MIXED" } {
   let bullish = 0;
   let bearish = 0;
@@ -65,6 +66,12 @@ function computeMultiTimeframeAlignment(
   if (indicators) {
     if (indicators.signalScore >= 2) bullish++;
     else if (indicators.signalScore <= -2) bearish++;
+  }
+
+  // Fast loop momentum as 5th signal (only counts when MODERATE or STRONG)
+  if (fastMomentum && fastMomentum.strength !== "WEAK") {
+    if (fastMomentum.direction === "UP") bullish++;
+    else if (fastMomentum.direction === "DOWN") bearish++;
   }
 
   const aligned =
@@ -242,6 +249,14 @@ interface DivergenceSignal {
   updatedAt: number;
 }
 
+interface FastLoopMomentum {
+  raw: number;
+  volumeWeighted: number;
+  acceleration: number;
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK";
+}
+
 export async function analyzeMarket(
   market: Market,
   btcPrice: string | null,
@@ -253,7 +268,9 @@ export async function analyzeMarket(
   windowElapsedSeconds: number = 150,
   lossPatterns: LossPattern[] = [],
   divergence: DivergenceSignal | null = null,
-  winPatterns: WinPattern[] = []
+  winPatterns: WinPattern[] = [],
+  fastLoopMomentum: FastLoopMomentum | null = null,
+  assetSymbol: string = "BTC"
 ): Promise<AIRecommendation> {
   const sentimentSummary = sentiment
     ? `${sentiment.value_classification} (${sentiment.value}/100)`
@@ -288,7 +305,8 @@ export async function analyzeMarket(
     biasAnalysis.bias as "UP" | "DOWN" | "MIXED",
     confirmationAnalysis.confirmation as "UP" | "DOWN" | "MIXED",
     triggerAnalysis.trigger as "UP" | "DOWN" | "MIXED",
-    indicators
+    indicators,
+    fastLoopMomentum
   );
 
   // Hard gate: window timing — no trade in first 10s or last 15s of window (aggressive mode)
@@ -335,7 +353,7 @@ export async function analyzeMarket(
 
   // Order book imbalance is passed to the prompt — AI evaluates it per trade rules (>60/40 to count as signal)
 
-  // Pre-AI gate: require at least 2 of 4 signals aligned (aggressive mode allows thinner setups)
+  // Pre-AI gate: require at least 2 of 5 signals aligned (aggressive mode allows thinner setups)
   if (hasBtcHistory && alignment.bullish < 2 && alignment.bearish < 2) {
     return {
       decision: "NO_TRADE",
@@ -343,7 +361,7 @@ export async function analyzeMarket(
       confidence: 0,
       estimatedEdge: 0,
       candlePatterns: patterns,
-      reasoning: `Signal alignment too weak to trade. Bullish: ${alignment.bullish}/4, Bearish: ${alignment.bearish}/4. No directional edge — skipping.`,
+      reasoning: `Signal alignment too weak to trade. Bullish: ${alignment.bullish}/5, Bearish: ${alignment.bearish}/5. No directional edge — skipping.`,
       riskLevel: "HIGH",
       dataMode,
       reversalProbability: 50,
@@ -363,7 +381,7 @@ TECHNICAL INDICATORS (last 60x 1m candles):
 - Trend (last 3): ${indicators.trend}
 - Volume spike: ${indicators.volumeSpike}x avg ${indicators.volumeSpike > 2 ? "⚠ High" : "Normal"}
 - Pre-computed Signal Score: ${indicators.signalScore > 0 ? "+" : ""}${indicators.signalScore} (positive=bullish, negative=bearish, range -8 to +8)
-- Multi-TF Alignment: ${alignment.aligned} (${alignment.bullish} bullish / ${alignment.bearish} bearish out of 4 signals)
+- Multi-TF Alignment: ${alignment.aligned} (${alignment.bullish} bullish / ${alignment.bearish} bearish out of 5 signals)
 `
     : "BTC indicators unavailable.";
 
@@ -440,7 +458,7 @@ Volume: $${parseFloat(market.volume || "0").toLocaleString()} | Liquidity: $${pa
 Window: ${market.startDate} -> ${market.endDate}
 Window Position: ${windowTimeLabel} (windowElapsedSeconds=${windowElapsedSeconds})
 
-== BTC PRICE ==
+== ${assetSymbol} PRICE ==
 Current: ${hasBtcPrice ? `$${btcPrice}` : "Unavailable"}
 
 == MULTI-TIMEFRAME DECISION STACK ==
@@ -448,7 +466,7 @@ ${biasAnalysis.summary}
 ${confirmationAnalysis.summary}
 ${triggerAnalysis.summary}
 
-== BTC CANDLESTICK DATA (last 15x 1m candles, oldest to newest) ==
+== ${assetSymbol} CANDLESTICK DATA (last 15x 1m candles, oldest to newest) ==
 ${ohlcvTable}
 
 == DETECTED CANDLE PATTERNS ==
@@ -458,7 +476,14 @@ ${patterns.join(", ")}
 Fear and Greed: ${sentimentSummary}
 ${indicatorBlock}
 
-== ORDER BOOK IMBALANCE ==
+${fastLoopMomentum ? `== FAST LOOP MOMENTUM (Simmer-style CEX signal, last 5 x 1m candles) ==
+Direction: ${fastLoopMomentum.direction} | Strength: ${fastLoopMomentum.strength}
+Raw momentum: ${fastLoopMomentum.raw >= 0 ? "+" : ""}${fastLoopMomentum.raw.toFixed(3)}%
+Volume-weighted: ${fastLoopMomentum.volumeWeighted >= 0 ? "+" : ""}${fastLoopMomentum.volumeWeighted.toFixed(3)}% (volume-confirmed price pressure)
+Acceleration: ${fastLoopMomentum.acceleration >= 0 ? "+" : ""}${fastLoopMomentum.acceleration.toFixed(3)}% (positive = momentum building, negative = fading)
+Signal: ${fastLoopMomentum.strength === "STRONG" ? `Strong ${fastLoopMomentum.direction} CEX pressure — counts as 5th aligned signal` : fastLoopMomentum.strength === "MODERATE" ? `Moderate ${fastLoopMomentum.direction} pressure — counts as 5th signal` : "Weak/flat — not counted as signal"}
+
+` : ""}== ORDER BOOK IMBALANCE ==
 ${obLines}
 
 == POLYMARKET PRICE HISTORY (recent) ==
@@ -490,27 +515,28 @@ Interpretation: ${
 CRITICAL CALIBRATION: This is a 5-minute binary BTC market. The base rate is exactly 50/50 — a coin flip.
 Technical indicators (RSI, EMA, MACD) measure what BTC HAS ALREADY DONE, not what it will do next.
 For a trade to be worth placing, you need clear evidence that the true probability is ≥ 70%.
-Confidence calibration: 50% = coin flip (no edge), 60% = slight lean (not enough), 70% = real signal, 80%+ = strong signal.
+Confidence calibration: 50% = coin flip (no edge), 60% = slight lean (marginal), 65% = real signal (minimum to trade), 75%+ = strong signal.
 Fewer high-conviction trades beat many marginal trades. When in doubt, output NO_TRADE.
 
-1. MINIMUM ALIGNMENT: Require at least 3 of these 4 signals agreeing on the SAME direction:
+1. MINIMUM ALIGNMENT: Require at least 3 of these 5 signals agreeing on the SAME direction:
    - 60m bias
    - 5m confirmation
    - 1m trigger
    - Technical signal score (positive = bullish, negative = bearish)
-   Exception: if PRICE LAG DIVERGENCE is STRONG or MODERATE, 2/4 alignment is sufficient.
+   - Fast loop momentum (CEX volume-weighted, only counts if MODERATE or STRONG strength)
+   Exception: if PRICE LAG DIVERGENCE is STRONG or MODERATE, 2/5 alignment is sufficient.
    Output NO_TRADE if fewer than 3 signals align AND no strong divergence is present.
 
-2. MINIMUM CONFIDENCE: Output TRADE only if confidence >= 70%.
-   Below 70% you cannot clearly beat the 50% base rate — output NO_TRADE.
-   Do NOT output confidence 70%+ unless at least 3 signals are genuinely aligned.
+2. MINIMUM CONFIDENCE: Output TRADE only if confidence >= 65%.
+   Below 65% you cannot clearly beat the 50% base rate — output NO_TRADE.
+   Do NOT output confidence 65%+ unless at least 3 signals are genuinely aligned.
 
 3. REAL EDGE: Edge = your estimated probability minus the 50% base rate.
    A 70% estimate = +20% edge over coin flip. A 60% estimate = +10% = not tradeable.
    Only report estimatedEdge when backed by at least 3 aligned signals or strong divergence.
    If you are uncertain or signals are mixed, output NO_TRADE — do not fabricate edge.
 
-4. RISK LEVEL: 4/4 signals aligned = "LOW". 3/4 signals = "MEDIUM". 2/4 or fewer = "HIGH" (only trade if STRONG divergence).
+4. RISK LEVEL: 5/5 signals aligned = "LOW". 4/5 or 3/5 signals = "MEDIUM". 2/5 or fewer = "HIGH" (only trade if STRONG divergence).
    Set riskLevel = HIGH if reversalProbability > 50% OR if signals are split.
 
 5. QUALITY OVER FREQUENCY: Do NOT trade just because signals slightly lean one way.

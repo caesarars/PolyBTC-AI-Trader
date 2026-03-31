@@ -19,6 +19,10 @@ import {
   Tag,
   Shield,
   Flame,
+  Gauge,
+  Bell,
+  FlaskConical,
+  BarChart2,
 } from "lucide-react";
 import {
   AreaChart,
@@ -46,7 +50,9 @@ interface EntrySnapshot {
   riskLevel: string | null;
   estimatedBet: number | null;
   btcPrice: number | null;
+  asset?: string; // "BTC" | "ETH" | "SOL"
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
+  fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
   updatedAt: string;
 }
 
@@ -166,6 +172,48 @@ interface TradeLogStats {
   entries: TradeLogEntry[];
 }
 
+interface FastLoopMomentumSnap {
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK";
+  vw: number;
+}
+
+interface MomentumPoint {
+  ts: number;
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK";
+  vw: number;
+  raw: number;
+  accel: number;
+}
+
+interface BacktestData {
+  totalWindows: number;
+  signaledCount: number;
+  correctCount: number;
+  winRate: number | null;
+  results: Array<{
+    ts: number;
+    fastMom: FastLoopMomentumSnap | null;
+    rsi: number | null;
+    emaCross: string | null;
+    signalScore: number | null;
+    signaled: boolean;
+    signalDirection: string | null;
+    actualDir: string | null;
+    correct: boolean | null;
+    entryClose: number;
+    exitClose: number | null;
+  }>;
+}
+
+interface AnalyticsData {
+  total: number;
+  byHour: Array<{ label: string; hour: number; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
+  byDivergence: Array<{ label: string; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
+  byDirection: Array<{ label: string; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
+}
+
 export default function BotDashboard() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [log, setLog] = useState<BotLogEntry[]>([]);
@@ -181,16 +229,28 @@ export default function BotDashboard() {
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [configSaving, setConfigSaving] = useState(false);
   const [configSaved, setConfigSaved] = useState(false);
+  const [momentumHistory, setMomentumHistory] = useState<MomentumPoint[]>([]);
+  const [notifStatus, setNotifStatus] = useState<{ telegram: boolean; discord: boolean } | null>(null);
+  const [backtestData, setBacktestData] = useState<BacktestData | null>(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "analytics">("dashboard");
+  const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
+  const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, momRes, notifRes, analyticsRes, calibRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
         fetch("/api/polymarket/automation").then((r) => r.json()),
         fetch("/api/polymarket/balance").then((r) => r.json()),
         fetch("/api/bot/trade-log?limit=50").then((r) => r.json()),
+        fetch("/api/bot/momentum-history").then((r) => r.json()),
+        fetch("/api/notifications/status").then((r) => r.json()),
+        fetch("/api/analytics").then((r) => r.json()),
+        fetch("/api/bot/calibration").then((r) => r.json()),
       ]);
 
       if (statusRes.status === "fulfilled") setStatus(statusRes.value as BotStatus);
@@ -203,6 +263,12 @@ export default function BotDashboard() {
       if (balRes.status === "fulfilled" && !(balRes.value as any).error) {
         setBalance((balRes.value as any).balance || "—");
       }
+      if (momRes.status === "fulfilled") setMomentumHistory((momRes.value as any).history || []);
+      if (notifRes.status === "fulfilled") setNotifStatus(notifRes.value as any);
+      if (analyticsRes.status === "fulfilled" && !(analyticsRes.value as any).error) {
+        setAnalyticsData(analyticsRes.value as AnalyticsData);
+      }
+      if (calibRes.status === "fulfilled") setCalibration(calibRes.value as any);
     } catch {}
   }, []);
 
@@ -284,6 +350,27 @@ export default function BotDashboard() {
     setRefreshing(false);
   };
 
+  const handleRunBacktest = async () => {
+    setBacktestLoading(true);
+    try {
+      const res = await fetch("/api/backtest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      const data = await res.json();
+      setBacktestData(data);
+    } catch {}
+    setBacktestLoading(false);
+  };
+
+  const handleToggleCalibrator = async () => {
+    setCalibTogglingLoading(true);
+    try {
+      const res = await fetch("/api/bot/calibration/toggle", { method: "POST" });
+      const data = await res.json();
+      setCalibration(prev => ({ ...prev, enabled: data.enabled }));
+      await fetchAll(); // refresh calibration state
+    } catch {}
+    setCalibTogglingLoading(false);
+  };
+
   const pnl = performance ? parseFloat(performance.summary.realizedPnl) : 0;
   const pnlPositive = pnl > 0;
   const winCount = performance?.summary.winCount ?? 0;
@@ -341,7 +428,7 @@ export default function BotDashboard() {
             <Bot className="w-6 h-6 text-blue-400" />
             Bot Control Center
           </h2>
-          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC market trading engine</p>
+          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC · ETH · SOL market trading engine</p>
         </div>
         <button
           onClick={handleRefresh}
@@ -350,6 +437,420 @@ export default function BotDashboard() {
         >
           <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
         </button>
+      </div>
+
+      {/* ── Tab Navigation ── */}
+      <div className="flex gap-1 border-b border-zinc-800 pb-0">
+        {(["dashboard", "backtest", "analytics"] as const).map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setActiveTab(tab)}
+            className={cn(
+              "px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-t-lg transition-colors",
+              activeTab === tab
+                ? "bg-zinc-800 text-white border border-b-zinc-800 border-zinc-700"
+                : "text-zinc-500 hover:text-zinc-300"
+            )}
+          >
+            {tab === "dashboard" && <><BarChart3 className="w-3 h-3 inline mr-1" />Dashboard</>}
+            {tab === "backtest" && <><FlaskConical className="w-3 h-3 inline mr-1" />Backtest</>}
+            {tab === "analytics" && <><BarChart2 className="w-3 h-3 inline mr-1" />Analytics</>}
+          </button>
+        ))}
+      </div>
+
+      {/* ── BACKTEST TAB ── */}
+      {activeTab === "backtest" && (
+        <div className="space-y-4">
+          <div className="glass-card p-4">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                <FlaskConical className="w-4 h-4 text-purple-400" />
+                Fast Loop Backtester
+                <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
+                  Simulate momentum signals on historical candles — no AI needed
+                </span>
+              </h3>
+              <button
+                type="button"
+                onClick={handleRunBacktest}
+                disabled={backtestLoading}
+                className="px-4 py-2 rounded-lg text-xs font-bold bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 transition-colors"
+              >
+                {backtestLoading ? "Running…" : "Run Backtest"}
+              </button>
+            </div>
+            {!backtestData ? (
+              <div className="text-center py-8 text-zinc-600 text-xs">
+                Click "Run Backtest" to simulate FastLoop momentum signals on the last ~40 historical windows
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {[
+                    { label: "Total Windows", value: String(backtestData.totalWindows), sub: "simulated", color: "text-white" },
+                    { label: "Signals Fired", value: String(backtestData.signaledCount), sub: `${backtestData.totalWindows > 0 ? ((backtestData.signaledCount / backtestData.totalWindows) * 100).toFixed(0) : 0}% of windows`, color: "text-cyan-400" },
+                    { label: "Correct", value: String(backtestData.correctCount), sub: `${backtestData.signaledCount - backtestData.correctCount} wrong`, color: "text-green-400" },
+                    { label: "Signal Win Rate", value: backtestData.winRate != null ? `${backtestData.winRate}%` : "—", sub: "FastLoop only (no AI)", color: backtestData.winRate != null ? backtestData.winRate >= 55 ? "text-green-400" : backtestData.winRate >= 45 ? "text-yellow-400" : "text-red-400" : "text-zinc-500" },
+                  ].map(({ label, value, sub, color }) => (
+                    <div key={label} className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+                      <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">{label}</div>
+                      <div className={cn("text-xl font-mono font-bold", color)}>{value}</div>
+                      <div className="text-[10px] text-zinc-600 mt-0.5">{sub}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-[10px] uppercase tracking-widest text-zinc-600 border-b border-zinc-800">
+                        <th className="pb-2 pr-3">Time</th>
+                        <th className="pb-2 pr-3">FastLoop</th>
+                        <th className="pb-2 pr-3">VW%</th>
+                        <th className="pb-2 pr-3">RSI</th>
+                        <th className="pb-2 pr-3">EMA</th>
+                        <th className="pb-2 pr-3">Signal</th>
+                        <th className="pb-2 pr-3">Actual</th>
+                        <th className="pb-2">Result</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...backtestData.results].reverse().map((r, i) => (
+                        <tr key={i} className="border-b border-zinc-800/40 hover:bg-zinc-800/30">
+                          <td className="py-1.5 pr-3 font-mono text-zinc-500 text-[10px]">
+                            {new Date(r.ts * 1000).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            <span className={cn("px-1.5 py-0.5 rounded text-[9px] font-bold",
+                              r.fastMom?.strength === "STRONG" ? "bg-orange-500/20 text-orange-300" :
+                              r.fastMom?.strength === "MODERATE" ? "bg-yellow-500/20 text-yellow-300" :
+                              "bg-zinc-700 text-zinc-500"
+                            )}>
+                              {r.fastMom?.direction ?? "—"} {r.fastMom?.strength ?? ""}
+                            </span>
+                          </td>
+                          <td className="py-1.5 pr-3 font-mono text-zinc-400 text-[10px]">
+                            {r.fastMom ? `${r.fastMom.vw >= 0 ? "+" : ""}${r.fastMom.vw.toFixed(3)}%` : "—"}
+                          </td>
+                          <td className="py-1.5 pr-3 font-mono text-zinc-400 text-[10px]">
+                            {r.rsi != null ? r.rsi.toFixed(0) : "—"}
+                          </td>
+                          <td className="py-1.5 pr-3 text-[10px]">
+                            <span className={cn("font-bold", r.emaCross === "BULLISH" ? "text-green-400" : r.emaCross === "BEARISH" ? "text-red-400" : "text-zinc-500")}>
+                              {r.emaCross ?? "—"}
+                            </span>
+                          </td>
+                          <td className="py-1.5 pr-3 text-[10px]">
+                            {r.signaled ? (
+                              <span className={cn("font-bold", r.signalDirection === "UP" ? "text-green-400" : "text-red-400")}>
+                                {r.signalDirection === "UP" ? "▲" : "▼"} {r.signalDirection}
+                              </span>
+                            ) : <span className="text-zinc-600">–</span>}
+                          </td>
+                          <td className="py-1.5 pr-3 text-[10px]">
+                            <span className={cn("font-bold", r.actualDir === "UP" ? "text-green-400" : r.actualDir === "DOWN" ? "text-red-400" : "text-zinc-500")}>
+                              {r.actualDir ?? "—"}
+                            </span>
+                          </td>
+                          <td className="py-1.5 text-[10px] font-bold">
+                            {r.signaled
+                              ? r.correct === true ? <span className="text-green-400">✓ WIN</span>
+                              : r.correct === false ? <span className="text-red-400">✗ LOSS</span>
+                              : <span className="text-zinc-500">?</span>
+                              : <span className="text-zinc-700">skip</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── ANALYTICS TAB ── */}
+      {activeTab === "analytics" && (
+        <div className="space-y-4">
+          {!analyticsData || analyticsData.total === 0 ? (
+            <div className="glass-card p-8 text-center text-zinc-600 text-sm">
+              No trades in log yet. Analytics appear after your first executed trade.
+            </div>
+          ) : (
+            <>
+              <div className="glass-card p-4">
+                <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
+                  <BarChart2 className="w-4 h-4 text-blue-400" />
+                  Win Rate by Hour (UTC)
+                  <span className="text-xs font-normal text-zinc-600 ml-1">{analyticsData.total} total trades</span>
+                </h3>
+                <ResponsiveContainer width="100%" height={180}>
+                  <AreaChart data={analyticsData.byHour} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+                    <XAxis dataKey="label" tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fill: "#52525b", fontSize: 9 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${v}%`} domain={[0, 100]} width={32} />
+                    <ReferenceLine y={50} stroke="#52525b" strokeDasharray="3 3" />
+                    <Tooltip
+                      contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }}
+                      formatter={(v: any) => [`${v}%`, "Win Rate"]}
+                    />
+                    <Area type="monotone" dataKey="winRate" stroke="#3b82f6" fill="#3b82f620" strokeWidth={2} dot={{ fill: "#3b82f6", r: 3 }} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="glass-card p-4">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
+                    <Zap className="w-4 h-4 text-yellow-400" />
+                    By Divergence Signal
+                  </h3>
+                  <div className="space-y-2.5">
+                    {analyticsData.byDivergence.map((d) => (
+                      <div key={d.label} className="flex items-center gap-3">
+                        <span className="text-[10px] text-zinc-400 w-20 font-mono shrink-0">{d.label}</span>
+                        <div className="flex-1 bg-zinc-800 rounded-full h-2 overflow-hidden">
+                          <div
+                            className={cn("h-full rounded-full transition-all", d.winRate != null && d.winRate >= 55 ? "bg-green-500" : d.winRate != null && d.winRate >= 45 ? "bg-yellow-500" : "bg-red-500")}
+                            style={{ width: `${d.winRate ?? 0}%` }}
+                          />
+                        </div>
+                        <span className={cn("text-xs font-mono font-bold w-12 text-right", d.winRate != null && d.winRate >= 55 ? "text-green-400" : d.winRate != null && d.winRate >= 45 ? "text-yellow-400" : "text-red-400")}>
+                          {d.winRate != null ? `${d.winRate}%` : "—"}
+                        </span>
+                        <span className="text-[10px] text-zinc-600 w-10 text-right">{d.total}tr</span>
+                        <span className={cn("text-[10px] font-mono w-14 text-right", d.pnl >= 0 ? "text-green-400" : "text-red-400")}>
+                          {d.pnl >= 0 ? "+" : ""}${d.pnl.toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="glass-card p-4">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
+                    <TrendingUp className="w-4 h-4 text-green-400" />
+                    By Direction
+                  </h3>
+                  <div className="space-y-2.5">
+                    {analyticsData.byDirection.map((d) => (
+                      <div key={d.label} className="flex items-center gap-3">
+                        <span className={cn("text-[10px] font-mono font-bold w-14 shrink-0", d.label === "UP" ? "text-green-400" : "text-red-400")}>
+                          {d.label === "UP" ? "▲" : "▼"} {d.label}
+                        </span>
+                        <div className="flex-1 bg-zinc-800 rounded-full h-2 overflow-hidden">
+                          <div
+                            className={cn("h-full rounded-full", d.winRate != null && d.winRate >= 55 ? "bg-green-500" : "bg-yellow-500")}
+                            style={{ width: `${d.winRate ?? 0}%` }}
+                          />
+                        </div>
+                        <span className={cn("text-xs font-mono font-bold w-12 text-right", d.winRate != null && d.winRate >= 55 ? "text-green-400" : "text-yellow-400")}>
+                          {d.winRate != null ? `${d.winRate}%` : "—"}
+                        </span>
+                        <span className="text-[10px] text-zinc-600 w-10 text-right">{d.total}tr</span>
+                        <span className={cn("text-[10px] font-mono w-14 text-right font-bold", d.pnl >= 0 ? "text-green-400" : "text-red-400")}>
+                          {d.pnl >= 0 ? "+" : ""}${d.pnl.toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── DASHBOARD TAB ── */}
+      {activeTab === "dashboard" && (
+      <div className="space-y-6">
+
+      {/* ── FastLoop Momentum Widget ── */}
+      {(() => {
+        const fm = status?.entrySnapshot?.fastLoopMomentum ?? (momentumHistory.length > 0 ? momentumHistory[momentumHistory.length - 1] : null);
+        const chartData = momentumHistory.slice(-20).map((p, i) => ({
+          i,
+          time: new Date(p.ts * 1000).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
+          vw: parseFloat(p.vw.toFixed(4)),
+        }));
+        return (
+          <div className="glass-card p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                <Gauge className="w-4 h-4 text-cyan-400" />
+                Fast Loop Momentum
+              </h3>
+              {fm && (
+                <span className={cn(
+                  "px-2 py-0.5 rounded-full text-[10px] font-bold border",
+                  fm.strength === "STRONG"   ? "bg-orange-500/20 text-orange-300 border-orange-500/40" :
+                  fm.strength === "MODERATE" ? "bg-yellow-500/20 text-yellow-300 border-yellow-500/40" :
+                                               "bg-zinc-800 text-zinc-500 border-zinc-700"
+                )}>
+                  {fm.strength}
+                </span>
+              )}
+            </div>
+            {!fm ? (
+              <div className="text-zinc-600 text-xs text-center py-4">Waiting for first bot cycle…</div>
+            ) : (
+              <div className="space-y-3">
+                <div className={cn("grid gap-2", "raw" in fm ? "grid-cols-4" : "grid-cols-2")}>
+                  <div className="bg-zinc-800/60 rounded-lg p-2 text-center">
+                    <div className="text-[9px] text-zinc-500 uppercase mb-1">Direction</div>
+                    <div className={cn("text-base font-mono font-bold", fm.direction === "UP" ? "text-green-400" : fm.direction === "DOWN" ? "text-red-400" : "text-zinc-500")}>
+                      {fm.direction === "UP" ? "▲" : fm.direction === "DOWN" ? "▼" : "—"} {fm.direction}
+                    </div>
+                  </div>
+                  <div className="bg-zinc-800/60 rounded-lg p-2 text-center">
+                    <div className="text-[9px] text-zinc-500 uppercase mb-1">Vol-Weighted</div>
+                    <div className={cn("text-base font-mono font-bold", fm.vw > 0 ? "text-green-400" : fm.vw < 0 ? "text-red-400" : "text-zinc-500")}>
+                      {fm.vw >= 0 ? "+" : ""}{fm.vw.toFixed(3)}%
+                    </div>
+                  </div>
+                  {"raw" in fm && (
+                    <div className="bg-zinc-800/60 rounded-lg p-2 text-center">
+                      <div className="text-[9px] text-zinc-500 uppercase mb-1">Raw</div>
+                      <div className={cn("text-base font-mono font-bold", (fm as MomentumPoint).raw > 0 ? "text-green-400" : (fm as MomentumPoint).raw < 0 ? "text-red-400" : "text-zinc-500")}>
+                        {(fm as MomentumPoint).raw >= 0 ? "+" : ""}{(fm as MomentumPoint).raw.toFixed(3)}%
+                      </div>
+                    </div>
+                  )}
+                  {"accel" in fm && (
+                    <div className="bg-zinc-800/60 rounded-lg p-2 text-center">
+                      <div className="text-[9px] text-zinc-500 uppercase mb-1">Accel</div>
+                      <div className={cn("text-base font-mono font-bold", (fm as MomentumPoint).accel > 0 ? "text-emerald-400" : (fm as MomentumPoint).accel < 0 ? "text-orange-400" : "text-zinc-500")}>
+                        {(fm as MomentumPoint).accel >= 0 ? "+" : ""}{(fm as MomentumPoint).accel.toFixed(3)}%
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {chartData.length > 1 && (
+                  <div>
+                    <div className="text-[9px] text-zinc-600 mb-1">VW Momentum — last {chartData.length} cycles</div>
+                    <ResponsiveContainer width="100%" height={70}>
+                      <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="momGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%"  stopColor="#06b6d4" stopOpacity={0.3} />
+                            <stop offset="95%" stopColor="#06b6d4" stopOpacity={0.02} />
+                          </linearGradient>
+                        </defs>
+                        <ReferenceLine y={0} stroke="#52525b" strokeDasharray="3 3" />
+                        <Area type="monotone" dataKey="vw" stroke="#06b6d4" fill="url(#momGrad)" strokeWidth={1.5} dot={false} />
+                        <Tooltip
+                          contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6, fontSize: 10 }}
+                          formatter={(v: any) => [`${Number(v) >= 0 ? "+" : ""}${Number(v).toFixed(3)}%`, "VW Momentum"]}
+                          labelFormatter={(l) => chartData[l as number]?.time ?? ""}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* ── Notifications Status ── */}
+      <div className="glass-card p-4">
+        <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
+          <Bell className="w-4 h-4 text-indigo-400" />
+          Push Notifications
+        </h3>
+        <div className="flex gap-3 flex-wrap items-center">
+          {([
+            { label: "Telegram", active: notifStatus?.telegram, hint: "set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID" },
+            { label: "Discord",  active: notifStatus?.discord,  hint: "set DISCORD_WEBHOOK_URL" },
+          ] as const).map(({ label, active, hint }) => (
+            <div key={label} className={cn(
+              "flex items-center gap-2 px-3 py-2 rounded-lg border text-xs",
+              active ? "bg-green-500/10 border-green-500/30 text-green-400" : "bg-zinc-800/50 border-zinc-700/50 text-zinc-500"
+            )}>
+              <span className={cn("w-1.5 h-1.5 rounded-full", active ? "bg-green-400 animate-pulse" : "bg-zinc-600")} />
+              <span className="font-bold">{label}</span>
+              <span className="text-[9px] opacity-60">{active ? "connected" : hint}</span>
+            </div>
+          ))}
+          <span className="text-[10px] text-zinc-600">Alerts: trade execution + STRONG divergence</span>
+        </div>
+      </div>
+
+      {/* ── Auto-Calibrator Widget ── */}
+      <div className="glass-card p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+            <FlaskConical className="w-4 h-4 text-purple-400" />
+            Auto-Calibrator
+          </h3>
+          <button
+            type="button"
+            aria-label={calibration.enabled ? "Disable auto-calibrator" : "Enable auto-calibrator"}
+            onClick={handleToggleCalibrator}
+            disabled={calibTogglingLoading}
+            className={cn(
+              "relative w-12 h-6 rounded-full transition-colors duration-200 disabled:opacity-50 focus:outline-none",
+              calibration.enabled ? "bg-purple-600" : "bg-zinc-700"
+            )}
+          >
+            <span className={cn(
+              "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200",
+              calibration.enabled ? "translate-x-6" : "translate-x-0"
+            )} />
+          </button>
+        </div>
+
+        {!calibration.enabled ? (
+          <p className="text-[11px] text-zinc-600">
+            When enabled, runs FastLoop backtest at the start of each 5-min window and automatically adjusts signal thresholds + confidence based on recent accuracy.
+          </p>
+        ) : calibration.state ? (
+          <div className="flex flex-col gap-2">
+            <div className="grid grid-cols-3 gap-2 text-[11px]">
+              <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Win Rate</span>
+                <span className={cn(
+                  "font-bold text-base",
+                  (calibration.state.winRate ?? 0) >= 65 ? "text-green-400"
+                    : (calibration.state.winRate ?? 0) >= 50 ? "text-yellow-400"
+                    : "text-red-400"
+                )}>
+                  {calibration.state.winRate != null ? `${calibration.state.winRate}%` : "—"}
+                </span>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Min Strength</span>
+                <span className={cn(
+                  "font-bold text-sm",
+                  calibration.state.fastLoopMinStrength === "STRONG" ? "text-red-400" : "text-blue-400"
+                )}>
+                  {calibration.state.fastLoopMinStrength}
+                </span>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Conf Δ</span>
+                <span className={cn(
+                  "font-bold text-sm",
+                  calibration.state.confidenceDelta > 0 ? "text-red-400"
+                    : calibration.state.confidenceDelta < 0 ? "text-green-400"
+                    : "text-zinc-400"
+                )}>
+                  {calibration.state.confidenceDelta > 0 ? `+${calibration.state.confidenceDelta}%` : calibration.state.confidenceDelta < 0 ? `${calibration.state.confidenceDelta}%` : "±0%"}
+                </span>
+              </div>
+            </div>
+            <p className="text-[10px] text-zinc-500 italic">{calibration.state.note}</p>
+            <p className="text-[9px] text-zinc-700">
+              {calibration.state.correctCount}/{calibration.state.signaledCount} signals correct · {calibration.state.totalWindows} windows sampled
+              {calibration.state.runAt ? ` · updated ${new Date(calibration.state.runAt * 1000).toLocaleTimeString()}` : ""}
+            </p>
+          </div>
+        ) : (
+          <p className="text-[11px] text-zinc-500 animate-pulse">Running calibration…</p>
+        )}
       </div>
 
       {/* ── Bot ON/OFF + Window + Session Row ── */}
@@ -487,7 +988,7 @@ export default function BotDashboard() {
                 label: "Aggressive",
                 icon: <Flame className="w-4 h-4" />,
                 color: "orange",
-                stats: ["Conf ≥70%", "Entry ≤60¢", "Kelly 40%", "Max $250", "10–285s"],
+                stats: ["Conf ≥65%", "Entry ≤55¢", "Kelly 40%", "Max $250", "10–285s"],
               },
               {
                 mode: "CONSERVATIVE" as const,
@@ -616,8 +1117,18 @@ export default function BotDashboard() {
               </div>
             ) : (
               <div className="flex flex-col gap-3">
-                {/* Market title */}
-                <p className="text-[11px] text-zinc-500 truncate">{snap.market}</p>
+                {/* Market title + asset badge */}
+                <div className="flex items-center gap-2">
+                  {snap.asset && (
+                    <span className={cn(
+                      "text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0",
+                      snap.asset === "BTC" ? "bg-orange-500/15 text-orange-400 border-orange-500/30"
+                        : snap.asset === "ETH" ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
+                        : "bg-purple-500/15 text-purple-400 border-purple-500/30"
+                    )}>{snap.asset}</span>
+                  )}
+                  <p className="text-[11px] text-zinc-500 truncate">{snap.market}</p>
+                </div>
 
                 {/* Prices row */}
                 <div className="grid grid-cols-3 gap-3">
@@ -633,9 +1144,9 @@ export default function BotDashboard() {
                     {isUp && <span className="text-[9px] text-green-500 font-bold">← ENTRY</span>}
                   </div>
 
-                  {/* BTC price center */}
+                  {/* Asset price center */}
                   <div className="bg-zinc-800/50 border border-zinc-700/40 rounded-xl p-3 flex flex-col gap-1 items-center justify-center">
-                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">BTC Price</span>
+                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">{snap.asset ?? "BTC"} Price</span>
                     <span className="text-lg font-mono font-bold text-white">
                       {snap.btcPrice ? `$${snap.btcPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
                     </span>
@@ -668,7 +1179,7 @@ export default function BotDashboard() {
                   {snap.confidence !== null && (
                     <span className={cn(
                       "px-2 py-0.5 rounded-full font-bold border",
-                      snap.confidence >= 70 ? "bg-green-500/10 text-green-400 border-green-500/30"
+                      snap.confidence >= 65 ? "bg-green-500/10 text-green-400 border-green-500/30"
                         : snap.confidence >= 55 ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
                         : "bg-zinc-800 text-zinc-400 border-zinc-700"
                     )}>
@@ -715,7 +1226,7 @@ export default function BotDashboard() {
                       <Zap className="w-2.5 h-2.5" />
                       LAG {snap.divergence.direction} {snap.divergence.strength}
                       <span className="opacity-60 ml-0.5">
-                        BTC {snap.divergence.btcDelta30s >= 0 ? "+" : ""}{snap.divergence.btcDelta30s.toFixed(0)}$
+                        {snap.asset ?? "BTC"} {snap.divergence.btcDelta30s >= 0 ? "+" : ""}{snap.divergence.btcDelta30s.toFixed(0)}$
                         / YES {snap.divergence.yesDelta30s >= 0 ? "+" : ""}{snap.divergence.yesDelta30s.toFixed(1)}¢
                       </span>
                     </span>
@@ -1210,6 +1721,9 @@ export default function BotDashboard() {
           </div>
         )}
       </div>
+
+      </div>
+      )}
     </div>
   );
 }
