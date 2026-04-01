@@ -1,6 +1,6 @@
 # PolyBTC AI Trader
 
-> Bot trading otomatis berbasis AI untuk pasar prediksi BTC · ETH · SOL 5-menit di Polymarket — dengan FastLoop momentum, analisa multi-aset, eksekusi order CLOB, adaptive learning, dan dashboard real-time.
+> Bot trading otomatis berbasis AI untuk pasar prediksi BTC · ETH · SOL 5-menit di Polymarket — dengan FastLoop momentum, analisa multi-aset, eksekusi order CLOB, adaptive learning, pressure alignment filter, dan dashboard real-time.
 
 ---
 
@@ -10,23 +10,29 @@
 |---|---|
 | **Multi-Asset** | Scan BTC, ETH, dan SOL secara paralel setiap 5 menit — masing-masing dengan indikator, divergence threshold, dan analisa AI sendiri |
 | **FastLoop Momentum** | Volume-weighted momentum dari 5 candle 1-menit terakhir (terinspirasi Simmer SDK) — arah, kekuatan (STRONG/MODERATE/WEAK), dan akselerasi |
-| **Fast Path ⚡** | Bypass Gemini AI sepenuhnya saat FastLoop STRONG + 4/5 sinyal aligned — eksekusi dalam ~0ms vs ~3s |
+| **Divergence Fast Path ⚡** | Bypass Gemini AI sepenuhnya saat STRONG divergence terdeteksi — eksekusi dalam <1s vs ~3s |
+| **Correlated Multi-Asset Entry** | Saat BTC diverge STRONG, bot otomatis masuk ETH+SOL di arah yang sama (70% Kelly) — manfaatkan price lag lintas aset |
 | **AI Analysis** | Google Gemini menganalisa order book, indikator teknikal, FastLoop momentum, dan sentimen pasar sebelum tiap keputusan trade |
+| **Pressure Alignment Filter** | Hanya trade saat arah order book (BUY/SELL pressure) searah dengan sinyal — dari data: BUY_PRESSURE 67% WR vs SELL_PRESSURE 20% WR |
+| **Dynamic Kelly Fraction** | Kelly fraction naik otomatis seiring confidence: 65-74%→25%, 75-84%→50%, 85-89%→55%, ≥90%→65% |
+| **Profit Lock** | Saat posisi mencapai 70% dari jarak TP, trailing stop otomatis dikencangkan ke 3¢ — kunci profit sebelum reversal |
+| **Spike Capture** | Jika dalam 90 detik pertama posisi sudah naik +8¢, langsung exit — ambil spike sebelum mean-revert |
+| **TP/SL Monitor 3s** | Monitor posisi setiap 3 detik (bukan 10s) — tidak ada lagi spike TP yang terlewat |
+| **Instant TP Execution** | TP tidak lagi "waiting for bid" — execute langsung saat trigger, fallback ke ask×0.97 jika tidak ada bid |
+| **Heartbeat** | Kirim heartbeat ke Polymarket setiap 5s — mencegah open orders di-cancel otomatis (docs: timeout 10s) |
 | **AMM Price Fix** | Pakai `outcomePrices` (AMM implied) sebagai harga referensi entry — bukan CLOB ask yang hampir selalu 99¢ di market illiquid |
 | **Auto-Calibrator** | Jalankan FastLoop backtest otomatis di awal tiap window — sesuaikan `minStrength` dan confidence delta berdasarkan win rate terkini |
 | **Auto Trading** | Eksekusi order otomatis ke Polymarket CLOB dengan position sizing Kelly Criterion |
-| **5-Signal Alignment** | Minimum 3/5 sinyal harus sepakat: 60m bias, 5m confirmation, 1m trigger, technical score, FastLoop momentum |
 | **Divergence Tracker** | Deteksi price lag antara CEX (BTC/ETH/SOL) dan Polymarket setiap 5 detik — threshold berbeda per aset |
-| **Pre-filter** | Skip Gemini jika FastLoop NEUTRAL+WEAK dan tidak ada divergence — hemat ~3s latency per cycle |
 | **Window AI Cache** | Gemini hanya dipanggil sekali per window; price-gate retry hanya re-fetch order book (~0.5s) |
 | **Technical Indicators** | RSI(14), EMA(9/21), MACD, Bollinger Bands, volume spike, signal score alignment |
-| **Adaptive Learning** | Bot menyimpan pola loss **dan win**, menyesuaikan confidence, dan memberi Gemini konteks setup yang berhasil/gagal |
+| **Adaptive Learning** | Bot menyimpan pola loss **dan win**, menyesuaikan confidence per aset, dan memberi Gemini konteks setup yang berhasil/gagal |
 | **Volatility-Adjusted Kelly** | Bet size dikurangi otomatis saat pasar choppy (ATR > baseline) |
 | **Near-Expiry Exit** | Posisi profitable dipaksa keluar ≤60 detik sebelum window tutup |
 | **Bot Mode** | Mode AGGRESSIVE (default) dan CONSERVATIVE — beda threshold confidence, Kelly, max bet, dan session loss limit |
 | **Push Notifications** | Alert Telegram dan Discord saat trade dieksekusi atau divergence STRONG terdeteksi |
 | **Analytics** | Win rate per jam (UTC), per kekuatan divergence, per arah (UP/DOWN) |
-| **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI |
+| **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI — dengan profit lock dan spike capture |
 | **SSE Real-time** | Log sidebar dan dashboard update live via Server-Sent Events |
 | **MongoDB Cache** | Cache price & candle history untuk resiliensi saat provider eksternal rate-limit |
 
@@ -54,15 +60,17 @@
 Bot berjalan dalam siklus 5 detik, memproses BTC → ETH → SOL secara berurutan:
 
 1. **Scan** — Ambil market aktif untuk tiap aset dari Polymarket Gamma API
-2. **FastLoop** — Hitung volume-weighted momentum (5 candle 1m) → STRONG/MODERATE/WEAK
-3. **Pre-filter** — Jika FastLoop WEAK + tidak ada divergence → skip AI, lanjut ke aset berikutnya
-4. **Fast Path** — Jika FastLoop STRONG + 4/5 sinyal aligned → bypass Gemini, synthesize keputusan langsung
-5. **Kalibrasi** — Jika auto-calibrator aktif, hasil backtest 40 window menentukan minStrength dan confidence delta
-6. **AI Analysis** — Kirim data ke Gemini (jika tidak fast path) dengan konteks FastLoop, divergence, dan learning patterns
-7. **Gate Check** — Validasi timing, likuiditas, AMM entry price, signal alignment (min 3/5)
-8. **Eksekusi** — Submit order ke Polymarket CLOB dengan size dari Kelly Criterion
-9. **Tracking** — Monitor fill, hitung PnL saat window tutup, paksa exit jika ≤60 detik tersisa dan profitable
-10. **Learning** — Simpan pola loss dan win, sesuaikan threshold
+2. **Pressure Check** — Cek order book imbalance signal (BUY/SELL/NEUTRAL pressure)
+3. **FastLoop** — Hitung volume-weighted momentum (5 candle 1m) → STRONG/MODERATE/WEAK
+4. **Pre-filter** — Jika FastLoop WEAK + tidak ada divergence → skip AI, lanjut ke aset berikutnya
+5. **Early Guard** — Blok trade <60 detik jika tidak ada divergence dan BTC flat (coin-flip guard)
+6. **AI Analysis** — Kirim data ke Gemini dengan konteks FastLoop, divergence, dan learning patterns
+7. **Pressure Alignment Filter** — Tolak trade jika arah bertentangan dengan order book pressure
+8. **Gate Check** — Validasi timing, likuiditas, AMM entry price, dynamic Kelly fraction
+9. **Eksekusi** — Submit order ke Polymarket CLOB, arm TP/SL/trailing automation
+10. **Correlated Entry** — Jika BTC diverge STRONG, otomatis enter ETH+SOL di arah sama
+11. **Monitor** — TP/SL/trailing stop dicek setiap 3s; profit lock + spike capture aktif
+12. **Learning** — Simpan pola loss dan win per aset, sesuaikan threshold
 
 ---
 
@@ -84,11 +92,74 @@ Acceleration  = momentum(candle 3-4) - momentum(candle 1-2)
 | MODERATE | ≥ 0.05% |
 | WEAK | < 0.05% |
 
-### Peran dalam bot
-- **Signal ke-5** dalam 5-signal alignment (MODERATE atau STRONG dihitung)
-- **Pre-filter trigger**: WEAK + no divergence → skip AI
-- **Fast Path trigger**: STRONG + 4/5 aligned → bypass Gemini
-- **Auto-calibrator**: backtest akurasi FastLoop per window, sesuaikan threshold otomatis
+---
+
+## Pressure Alignment Filter
+
+Berdasarkan analisa 23 live trades:
+
+| Order Book Signal | Win Rate | PnL Total | Keputusan |
+|---|---|---|---|
+| BUY_PRESSURE | **67%** | +$8.84 | ✅ Trade |
+| NEUTRAL | 40% | -$1.55 | ✅ Trade |
+| SELL_PRESSURE | 20% | -$7.64 | ❌ Block |
+
+**Rule:**
+- Trade UP (beli YES) → block jika YES book = `SELL_PRESSURE`
+- Trade DOWN (beli NO) → block jika YES book = `BUY_PRESSURE`
+- Kalau pressure berubah di cycle berikutnya → bot re-evaluasi otomatis
+
+---
+
+## Dynamic Kelly Fraction
+
+Kelly fraction menyesuaikan diri dengan tingkat keyakinan AI (AGGRESSIVE mode):
+
+| Confidence | Kelly Fraction | Keterangan |
+|---|---|---|
+| 65–74% | **25%** | Borderline signal, bet kecil |
+| 75–84% | **50%** | Normal |
+| 85–89% | **55%** | Signal kuat |
+| ≥ 90% | **65%** | Sangat yakin |
+
+CONSERVATIVE mode: flat 20%.
+
+---
+
+## TP/SL Strategy
+
+### Target levels (per entry price zone)
+| Entry | Take Profit | Stop Loss | Trailing |
+|---|---|---|---|
+| < 35¢ | entry +18¢ (max 68¢) | entry −10¢ | 7¢ |
+| 35–49¢ | entry +14¢ (max 68¢) | entry −9¢ | 6¢ |
+| 50–64¢ | entry +11¢ (max 74¢) | entry −9¢ | 5¢ |
+| ≥ 65¢ | entry +8¢ (max 84¢) | entry −7¢ | 4¢ |
+
+### Profit Lock
+Saat unrealized gain ≥ 70% dari jarak TP → trailing stop dikencangkan ke **3¢** otomatis.
+Contoh: entry 48¢, TP 62¢ (jarak 14¢) → saat harga 58¢+ → trailing 3¢ aktif.
+
+### Spike Capture
+Jika dalam **90 detik pertama** posisi naik **+8¢ atau lebih** → exit langsung.
+Early spike di binary market hampir selalu mean-revert.
+
+### Execution
+- Monitor setiap **3 detik** (bukan 10s)
+- TP terpicu → execute **langsung** (tidak tunggu bid)
+- Tidak ada bid → fallback ke `ask × 0.97` (3¢ slippage tolerance)
+
+---
+
+## Correlated Multi-Asset Entry
+
+Saat BTC STRONG divergence terpicu via Fast Path:
+
+1. BTC trade dieksekusi normal
+2. Bot langsung cek ETH dan SOL (parallel)
+3. Jika market tersedia dan belum traded di window ini → enter di arah yang sama
+4. Kelly fraction: 70% dari normal (signal adalah BTC-derived, bukan independent)
+5. Confidence: 72% (sedikit lebih rendah dari BTC's 78)
 
 ---
 
@@ -102,8 +173,6 @@ Toggle dari dashboard. Saat aktif, menjalankan backtest FastLoop di awal tiap wi
 | 50–65% | Signal rata-rata → minStrength=MODERATE, confDelta=0% |
 | < 50% | Signal lemah → minStrength=STRONG only, confDelta=+5% |
 
-Bot otomatis lebih ketat saat pasar choppy, lebih agresif saat momentum bersih.
-
 ---
 
 ## Multi-Asset Support
@@ -114,12 +183,18 @@ Bot otomatis lebih ketat saat pasar choppy, lebih agresif saat momentum bersih.
 | ETH | `eth-updown-5m-*` | $6 dalam 30s | $1.5 |
 | SOL | `sol-updown-5m-*` | $2 dalam 30s | $0.4 |
 
-Setiap aset dianalisa secara independen dengan threshold divergence, indikator, dan sinyal masing-masing. Atur aset yang diinginkan via env:
-
 ```env
 ENABLED_ASSETS=BTC,ETH,SOL   # default semua
 ENABLED_ASSETS=BTC            # hanya BTC
 ```
+
+---
+
+## Heartbeat
+
+Polymarket membatalkan semua open orders jika tidak menerima heartbeat dalam 10 detik.
+
+Bot mengirim heartbeat setiap **5 detik** selama aktif. Chain ID di-track per request — jika 400 diterima, bot mengambil correct ID dari response dan melanjutkan chain tanpa reset.
 
 ---
 
@@ -161,49 +236,32 @@ Buka `http://localhost:3000` di browser.
 ### Wajib
 
 ```env
-# Wallet Polygon yang terhubung ke akun Polymarket
 POLYGON_PRIVATE_KEY=0x...
-
-# Credentials API Polymarket (bisa di-derive otomatis dari wallet jika tidak ada)
 POLYMARKET_API_KEY=...
 POLYMARKET_API_SECRET=...
 POLYMARKET_API_PASSPHRASE=...
-
-# Tipe signature: 0 = wallet EOA biasa, 1 = profile/proxy wallet Polymarket
 POLYMARKET_SIGNATURE_TYPE=1
-
-# Profile address Polymarket (sering beda dengan address wallet signer)
 POLYMARKET_FUNDER_ADDRESS=0x...
-
-# API key Google Gemini
 GEMINI_API_KEY=AIza...
 ```
 
 ### Bot Behavior
 
 ```env
-# Aset yang di-scan (default semua)
 ENABLED_ASSETS=BTC,ETH,SOL
-
-# Threshold bot (semua bisa di-override dari dashboard UI juga)
 BOT_MIN_CONFIDENCE=65
 BOT_MIN_EDGE=0.10
 BOT_KELLY_FRACTION=0.40
 BOT_MAX_BET_USDC=250
 BOT_SESSION_LOSS_LIMIT=0.30
-
-# Auto-start bot saat server menyala
 BOT_AUTO_START=false
 ```
 
 ### Push Notifications (Opsional)
 
 ```env
-# Telegram
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
-
-# Discord
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```
 
@@ -245,44 +303,39 @@ MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
 
 ---
 
-## Kalibrasi & Edge Philosophy
-
-Bot ini dirancang untuk **presisi, bukan frekuensi**.
-
-### Base Rate Problem
-Pasar binary BTC/ETH/SOL 5-menit pada dasarnya adalah coin flip (50/50). Sinyal teknikal mengukur apa yang **sudah terjadi** — bukan 5 menit ke depan. Edge yang valid berasal dari dua sumber:
-1. **Price lag divergence** — aset sudah bergerak di CEX tapi Polymarket belum update
-2. **Multi-signal consensus** — 4–5 sinyal independent menunjuk arah yang sama
-
-### Threshold Aktif
+## Threshold Aktif
 
 | Parameter | AGGRESSIVE | CONSERVATIVE |
 |---|---|---|
 | Min Confidence | 65% | 75% |
 | Min Edge | 0.10¢ | 0.12¢ |
-| Kelly Fraction | 40% | 20% |
+| Kelly Fraction | Dynamic (25–65%) | 20% flat |
 | Max Bet | $250 | $50 |
 | Session Loss Limit | 30% | 15% |
-| Max Entry Price | AMM-based: (conf−10)¢, max 75¢ | sama |
+| TP/SL Monitor | 3 detik | 3 detik |
 
-### 5-Signal Alignment
+---
 
-Minimal **3/5 sinyal** harus sepakat sebelum trade:
+## Struktur Project
 
-| Sinyal | Sumber |
-|---|---|
-| 60m bias | EMA cross + price move arah 60 menit terakhir |
-| 5m confirmation | Swing direction dari 4 candle 5-menit |
-| 1m trigger | Candle terakhir bullish/bearish |
-| Technical score | RSI + MACD + EMA combined score ≥2 atau ≤−2 |
-| FastLoop momentum | Volume-weighted momentum MODERATE atau STRONG |
-
-### Fast Path Conditions
-Bot bypass Gemini (~3s) dan synthesize keputusan langsung (~0ms) jika semua terpenuhi:
-- FastLoop **STRONG** dan directional
-- Alignment **≥ 4/5** dalam arah yang sama
-- Divergence **tidak bertentangan** dengan arah
-- **Tidak ada pola loss** yang cocok dalam 3 loss terakhir
+```
+├── src/
+│   ├── App.tsx
+│   ├── components/
+│   │   ├── BotDashboard.tsx     # Dashboard kontrol bot
+│   │   ├── BotLogSidebar.tsx    # Live log sidebar
+│   │   └── CandlestickChart.tsx # Chart candlestick
+│   ├── services/
+│   │   └── gemini.ts            # AI analysis service
+│   └── lib/
+│       └── utils.ts
+├── server.ts                    # Express backend — bot engine
+├── data/
+│   ├── loss_memory.json         # Adaptive learning state (persisted)
+│   └── trade_log.jsonl          # Trade history log
+├── vite.config.ts
+└── .env.example
+```
 
 ---
 
@@ -297,23 +350,14 @@ Bot bypass Gemini (~3s) dan synthesize keputusan langsung (~0ms) jika semua terp
 
 ## Troubleshooting
 
-### Balance tidak muncul atau salah
-- Cek `POLYMARKET_SIGNATURE_TYPE` (coba `0` atau `1`)
-- Cek `POLYMARKET_FUNDER_ADDRESS` (harus address profile Polymarket, bukan wallet signer)
-
-### Bot selalu skip dengan "No ask liquidity"
-- Sudah diperbaiki — bot kini pakai `outcomePrices` (AMM) bukan CLOB ask
-
-### ETH/SOL candles kosong
-- Provider Binance mungkin rate-limit — akan ter-cache di siklus berikutnya secara otomatis
-
-### AI fallback mode
-- Feed BTC/ETH/SOL eksternal gagal, bot pakai data Polymarket saja
-- Anggap confidence lebih konservatif saat ini aktif
-
-### Data sering error 500
-- Isi `MONGODB_URI` untuk aktifkan cache internal
-- Debug cache: `GET /api/debug/btc-cache`
+| Masalah | Solusi |
+|---|---|
+| Balance tidak muncul | Cek `POLYMARKET_SIGNATURE_TYPE` (0 atau 1) dan `POLYMARKET_FUNDER_ADDRESS` |
+| Bot skip "No ask liquidity" | Sudah diperbaiki — bot pakai `outcomePrices` (AMM) |
+| ETH/SOL candles kosong | Binance rate-limit — ter-cache otomatis di siklus berikutnya |
+| AI fallback mode | Feed eksternal gagal — bot pakai data Polymarket saja |
+| Error 500 sering | Isi `MONGODB_URI` untuk aktifkan cache internal |
+| Heartbeat failed | Cek koneksi dan POLYGON_PRIVATE_KEY — L2 auth diperlukan |
 
 ---
 
@@ -324,29 +368,6 @@ npm run dev      # Jalankan server + frontend (development)
 npm run build    # Build frontend untuk production
 npm run preview  # Preview build production
 npm run lint     # Type check TypeScript
-```
-
----
-
-## Struktur Project
-
-```
-├── src/
-│   ├── App.tsx                  # Main app
-│   ├── components/
-│   │   ├── BotDashboard.tsx     # Dashboard kontrol bot (multi-asset, calibrator, momentum)
-│   │   ├── BotLogSidebar.tsx    # Live log sidebar
-│   │   └── CandlestickChart.tsx # Chart candlestick
-│   ├── services/
-│   │   └── gemini.ts            # AI analysis service (multi-asset prompt)
-│   └── lib/
-│       └── utils.ts             # Helper utilities
-├── server.ts                    # Express backend (bot engine, FastLoop, multi-asset)
-├── data/
-│   ├── loss_memory.json         # Adaptive learning state (persisted)
-│   └── trade_log.jsonl          # Trade history log
-├── vite.config.ts               # Konfigurasi Vite
-└── .env.example                 # Template environment variables
 ```
 
 ---

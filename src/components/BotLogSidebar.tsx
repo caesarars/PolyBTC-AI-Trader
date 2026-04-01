@@ -555,7 +555,7 @@ function BotMessage({ entry }: { entry: BotLogEntry }) {
       <div className="text-zinc-600 text-[10px] truncate">{entry.market}</div>
 
       {/* Reasoning */}
-      <div className="mt-1 text-zinc-500 text-[10px] leading-relaxed line-clamp-3">
+      <div className="mt-1 text-zinc-500 text-[10px] leading-relaxed">
         {entry.reasoning}
       </div>
     </motion.div>
