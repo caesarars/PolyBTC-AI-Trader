@@ -45,7 +45,6 @@ export default function CandlestickChart({ data, height = 220 }: Props) {
       },
       timeScale: {
         borderColor: "#27272a",
-        textColor: "#71717a",
         timeVisible: true,
         secondsVisible: false,
       },

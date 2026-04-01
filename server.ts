@@ -85,6 +85,7 @@ interface PersistedLearning {
   consecutiveLosses: number;
   consecutiveWins: number;
   adaptiveConfidenceBoost: number;
+  adaptiveLossPenaltyEnabled?: boolean;
   savedAt: string;
 }
 
@@ -96,6 +97,7 @@ function saveLearning(): void {
       consecutiveLosses,
       consecutiveWins,
       adaptiveConfidenceBoost,
+      adaptiveLossPenaltyEnabled,
       savedAt: new Date().toISOString(),
     };
     fs.writeFileSync(LOSS_MEMORY_FILE, JSON.stringify(payload, null, 2), "utf8");
@@ -114,6 +116,7 @@ function loadLearning(): void {
     consecutiveLosses       = data.consecutiveLosses       ?? 0;
     consecutiveWins         = data.consecutiveWins         ?? 0;
     adaptiveConfidenceBoost = data.adaptiveConfidenceBoost ?? 0;
+    adaptiveLossPenaltyEnabled = data.adaptiveLossPenaltyEnabled ?? true;
     console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss / ${winMemory.length} win patterns, streak=${consecutiveLosses}L/${consecutiveWins}W, boost=+${adaptiveConfidenceBoost}%`);
   } catch (e: any) {
     console.error("[Persist] Failed to load loss_memory.json:", e.message);
@@ -548,6 +551,7 @@ const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0],["ET
 let consecutiveLosses = 0;
 let consecutiveWins   = 0;
 let adaptiveConfidenceBoost = 0; // legacy — used only for saveLearning() backward-compat
+let adaptiveLossPenaltyEnabled = true;
 
 function generateLesson(pending: PendingResult): string {
   const rules: string[] = [];
@@ -2655,11 +2659,13 @@ async function startServer() {
         });
         if (lossMemory.length > 20) lossMemory.pop();
 
-        if (cLosses >= 2) {
+        if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
           const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
           adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
           adaptiveConfidenceBoost = newBoost;
           botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
+        } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
+          botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
         }
         botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         botPrint("INFO", `Lesson recorded: ${lesson}`);
@@ -3559,6 +3565,7 @@ async function startServer() {
       consecutiveLosses,
       consecutiveWins,
       adaptiveConfidenceBoost,
+      adaptiveLossPenaltyEnabled,
       effectiveMinConfidence: BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost,
       baseMinConfidence: BOT_MIN_CONFIDENCE,
       lossMemoryCount: lossMemory.length,
@@ -3566,6 +3573,17 @@ async function startServer() {
       recentLosses: lossMemory.slice(0, 10),
       recentWins: winMemory.slice(0, 10),
     });
+  });
+
+  app.post("/api/bot/learning/loss-penalty", (req, res) => {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled (boolean) is required." });
+    }
+    adaptiveLossPenaltyEnabled = enabled;
+    saveLearning();
+    botPrint("INFO", `Adaptive loss penalty ${adaptiveLossPenaltyEnabled ? "ENABLED" : "DISABLED"}`);
+    res.json({ ok: true, adaptiveLossPenaltyEnabled });
   });
 
   app.get("/api/bot/momentum-history", (_req, res) => {

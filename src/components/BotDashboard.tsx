@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Bot,
@@ -89,6 +89,17 @@ interface BotLogEntry {
   tradePrice?: number;
   orderId?: string | null;
   error?: string;
+}
+
+interface LearningState {
+  consecutiveLosses: number;
+  consecutiveWins: number;
+  adaptiveConfidenceBoost: number;
+  adaptiveLossPenaltyEnabled: boolean;
+  effectiveMinConfidence: number;
+  baseMinConfidence: number;
+  lossMemoryCount: number;
+  winMemoryCount?: number;
 }
 
 interface PerformanceSummary {
@@ -237,10 +248,15 @@ export default function BotDashboard() {
   const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "analytics">("dashboard");
   const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
   const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
+  const [learning, setLearning] = useState<LearningState | null>(null);
+  const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
+  const tradeBellRef = useRef<HTMLAudioElement | null>(null);
+  const seenTradeBellKeysRef = useRef<Set<string>>(new Set());
+  const tradeBellPrimedRef = useRef(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, momRes, notifRes, analyticsRes, calibRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -251,6 +267,7 @@ export default function BotDashboard() {
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
         fetch("/api/bot/calibration").then((r) => r.json()),
+        fetch("/api/bot/learning").then((r) => r.json()),
       ]);
 
       if (statusRes.status === "fulfilled") setStatus(statusRes.value as BotStatus);
@@ -269,6 +286,7 @@ export default function BotDashboard() {
         setAnalyticsData(analyticsRes.value as AnalyticsData);
       }
       if (calibRes.status === "fulfilled") setCalibration(calibRes.value as any);
+      if (learningRes.status === "fulfilled") setLearning(learningRes.value as LearningState);
     } catch {}
   }, []);
 
@@ -280,6 +298,47 @@ export default function BotDashboard() {
     // Reconnect silently on error — browser retries EventSource automatically
     return () => es.close();
   }, [fetchAll]);
+
+  useEffect(() => {
+    const audio = new Audio("/sounds/winner-ding-bell.mp3");
+    audio.preload = "auto";
+    tradeBellRef.current = audio;
+    return () => {
+      tradeBellRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const executedEntries = log.filter((entry) => entry.tradeExecuted && (entry.orderId || entry.timestamp));
+    if (executedEntries.length === 0) return;
+
+    const entryKeys = executedEntries.map(
+      (entry) => entry.orderId || `${entry.timestamp}-${entry.market}`
+    );
+
+    if (!tradeBellPrimedRef.current) {
+      tradeBellPrimedRef.current = true;
+      entryKeys.forEach((key) => seenTradeBellKeysRef.current.add(key));
+      return;
+    }
+
+    const newTradeKeys = entryKeys.filter((key) => !seenTradeBellKeysRef.current.has(key));
+    if (newTradeKeys.length === 0) return;
+
+    newTradeKeys.forEach((key) => seenTradeBellKeysRef.current.add(key));
+
+    const audio = tradeBellRef.current;
+    const src = audio?.src || "/sounds/winner-ding-bell.mp3";
+    newTradeKeys.forEach((_, index) => {
+      window.setTimeout(() => {
+        const bell = new Audio(src);
+        bell.currentTime = 0;
+        void bell.play().catch(() => {
+          // Browser may block autoplay until the user has interacted with the page.
+        });
+      }, index * 250);
+    });
+  }, [log]);
 
   const handleToggleMode = async () => {
     const currentMode = status?.config.mode ?? "AGGRESSIVE";
@@ -304,6 +363,21 @@ export default function BotDashboard() {
       await fetchAll();
     } finally {
       setResetConfLoading(false);
+    }
+  };
+
+  const handleToggleLossPenalty = async () => {
+    if (!learning) return;
+    setLossPenaltySaving(true);
+    try {
+      await fetch("/api/bot/learning/loss-penalty", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !learning.adaptiveLossPenaltyEnabled }),
+      });
+      await fetchAll();
+    } finally {
+      setLossPenaltySaving(false);
     }
   };
 
@@ -902,6 +976,26 @@ export default function BotDashboard() {
                 className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide bg-zinc-700 text-zinc-400 hover:bg-zinc-600 hover:text-white transition-colors disabled:opacity-40"
               >
                 {resetConfLoading ? "…" : "Reset"}
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span>
+                Loss penalty: {learning?.adaptiveLossPenaltyEnabled === false ? "OFF" : "ON"}
+                {learning?.adaptiveConfidenceBoost ? ` | Boost +${learning.adaptiveConfidenceBoost}%` : ""}
+              </span>
+              <button
+                type="button"
+                onClick={handleToggleLossPenalty}
+                disabled={lossPenaltySaving || !learning}
+                title="Toggle raising confidence threshold by +5% after loss streaks"
+                className={cn(
+                  "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide transition-colors disabled:opacity-40",
+                  learning?.adaptiveLossPenaltyEnabled === false
+                    ? "bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
+                    : "bg-orange-500/15 text-orange-300 hover:bg-orange-500/25"
+                )}
+              >
+                {lossPenaltySaving ? "…" : learning?.adaptiveLossPenaltyEnabled === false ? "Enable +5%" : "Disable +5%"}
               </button>
             </div>
             <div>Max ${status?.config.maxBetUsdc ?? 50} | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
