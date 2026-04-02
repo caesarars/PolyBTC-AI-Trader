@@ -1,6 +1,42 @@
 {
   "lossMemory": [
     {
+      "timestamp": "2026-04-01T23:52:01.527Z",
+      "market": "Bitcoin Up or Down - April 1, 7:45PM-7:50PM ET",
+      "asset": "BTC",
+      "direction": "DOWN",
+      "confidence": 80,
+      "edge": 0.3,
+      "entryPrice": 0.505,
+      "betAmount": 3.05,
+      "pnl": -2.78,
+      "windowElapsedSeconds": 61,
+      "rsi": 28,
+      "emaCross": "BEARISH",
+      "signalScore": -2,
+      "imbalanceSignal": "NEUTRAL",
+      "reasoning": "[FAST PATH] 5/5 signals aligned DOWN | FastLoop STRONG vw=-0.484% accel=0.328% | Gemini skipped",
+      "lesson": "RSI oversold (28) on DOWN — reversal risk | Entry at coin-flip zone (51¢) — maximum binary market uncertainty | Mid-window entry at 61s — high-noise zone, FastLoop not yet stable"
+    },
+    {
+      "timestamp": "2026-04-01T23:47:01.427Z",
+      "market": "Bitcoin Up or Down - April 1, 7:40PM-7:45PM ET",
+      "asset": "BTC",
+      "direction": "DOWN",
+      "confidence": 80,
+      "edge": 0.3,
+      "entryPrice": 0.49,
+      "betAmount": 3.39,
+      "pnl": -3.32,
+      "windowElapsedSeconds": 61,
+      "rsi": 28,
+      "emaCross": "BEARISH",
+      "signalScore": -2,
+      "imbalanceSignal": "NEUTRAL",
+      "reasoning": "[FAST PATH] 5/5 signals aligned DOWN | FastLoop STRONG vw=-0.484% accel=0.328% | Gemini skipped",
+      "lesson": "RSI oversold (28) on DOWN — reversal risk | Entry at coin-flip zone (49¢) — maximum binary market uncertainty | Mid-window entry at 61s — high-noise zone, FastLoop not yet stable"
+    },
+    {
       "timestamp": "2026-04-01T17:50:45.995Z",
       "market": "Ethereum Up or Down - April 1, 1:25PM-1:30PM ET",
       "asset": "ETH",
@@ -277,37 +313,6 @@
       "imbalanceSignal": "NEUTRAL",
       "reasoning": "[FAST PATH] 4/5 signals aligned UP | FastLoop STRONG vw=1.345% accel=1.134% | Gemini skipped",
       "lesson": "EMA cross was BEARISH during UP trade"
-    },
-    {
-      "timestamp": "2026-03-31T13:14:07.732Z",
-      "market": "Solana Up or Down - March 31, 9:05AM-9:10AM ET",
-      "direction": "DOWN",
-      "confidence": 78,
-      "edge": 28,
-      "entryPrice": 0.495,
-      "betAmount": 5.07,
-      "pnl": -5.07,
-      "windowElapsedSeconds": 227,
-      "imbalanceSignal": "SELL_PRESSURE",
-      "reasoning": "Detected strong price lag divergence where BTC moved down significantly while the Polymarket price remains unchanged. This constitutes a quantifiable mispricing. Rule 14 (Highest Priority) confirms that STRONG divergence overrides alignment rules and mandates a trade with high confidence and low risk level. The window elapsed (227s) is within the optimal timeframe for a trade.",
-      "lesson": "Late entry at 227s — limited time for move"
-    },
-    {
-      "timestamp": "2026-03-31T10:57:01.808Z",
-      "market": "Bitcoin Up or Down - March 31, 6:40AM-6:45AM ET",
-      "direction": "DOWN",
-      "confidence": 70,
-      "edge": 20,
-      "entryPrice": 0.465,
-      "betAmount": 2.71,
-      "pnl": -2.71,
-      "windowElapsedSeconds": 67,
-      "rsi": 14.07,
-      "emaCross": "BEARISH",
-      "signalScore": 0,
-      "imbalanceSignal": "SELL_PRESSURE",
-      "reasoning": "The setup aligns with the successful WIN PATTERN #1: 60m bias (DOWN), 5m confirmation (DOWN), 1m trigger (DOWN), Technical signal (BEARISH), and Fast loop momentum (STRONG DOWN). 5/5 signals align perfectly. The market is oversold (RSI 14.07) but price continues to push lower with strong volume-weighted momentum and bearish EMA/MACD alignment.",
-      "lesson": "RSI oversold (14) on DOWN — reversal risk"
     }
   ],
   "winMemory": [
@@ -528,8 +533,9 @@
       "lesson": "EMA cross BEARISH aligned with DOWN direction | Strong negative signal score (-2) on DOWN trade | High confidence entry (80%) — strong conviction"
     }
   ],
-  "consecutiveLosses": 0,
-  "consecutiveWins": 2,
-  "adaptiveConfidenceBoost": 0,
-  "savedAt": "2026-04-01T18:22:02.224Z"
+  "consecutiveLosses": 2,
+  "consecutiveWins": 0,
+  "adaptiveConfidenceBoost": 5,
+  "adaptiveLossPenaltyEnabled": true,
+  "savedAt": "2026-04-01T23:52:01.528Z"
 }

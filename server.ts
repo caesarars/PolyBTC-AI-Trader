@@ -234,7 +234,6 @@ const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 65);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.10);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
-const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30);
 
 // ── Bot mode: AGGRESSIVE (default) vs CONSERVATIVE ───────────────────────────
 let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
@@ -248,7 +247,6 @@ const CONSERVATIVE_CONFIG = {
   minEdge:          0.12,
   kellyFraction:    0.20,
   maxBetUsdc:       50,
-  sessionLossLimit: 0.15,
   balanceCap:       0.10,
   entryWindowStart: 30,
   entryWindowEnd:   240,
@@ -261,7 +259,6 @@ function getActiveConfig() {
     minEdge:          aggressiveMinEdge,
     kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
-    sessionLossLimit: BOT_SESSION_LOSS_LIMIT,
     balanceCap:       0.25,
     entryWindowStart: 10,
     entryWindowEnd:   180,
@@ -392,7 +389,7 @@ let lastStrongDivergenceNotifiedAt = 0;
 
 // ── Divergence fast-path state ────────────────────────────────────────────────
 const activeBotMarketByAsset = new Map<TradingAsset, any>(); // per-asset active market
-let activeBotMarket: any = null;          // convenience alias → always activeBotMarketByAsset.get(currentDivergenceAsset)
+let activeBotMarket: any = null;          // kept for backward-compat with divergence tracker sync (line below)
 let lastKnownBalance: number | null = null; // most recent balance fetch, used by fast path
 let lastDivergenceFastTradeAt = 0;        // unix-seconds cooldown tracker
 let divergenceFastTradeRunning = false;   // mutex — prevents concurrent fast-path execution
@@ -555,18 +552,40 @@ let adaptiveLossPenaltyEnabled = true;
 
 function generateLesson(pending: PendingResult): string {
   const rules: string[] = [];
-  const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence } = pending;
+  const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence, entryPrice, imbalanceSignal } = pending;
 
-  if (direction === "UP"   && rsi !== undefined && rsi > 65) rules.push(`RSI overbought (${rsi.toFixed(0)}) on UP — reversal risk`);
-  if (direction === "DOWN" && rsi !== undefined && rsi < 35) rules.push(`RSI oversold (${rsi.toFixed(0)}) on DOWN — reversal risk`);
-  if (direction === "UP"   && emaCross === "BEARISH")         rules.push("EMA cross was BEARISH during UP trade");
-  if (direction === "DOWN" && emaCross === "BULLISH")         rules.push("EMA cross was BULLISH during DOWN trade");
-  if (direction === "UP"   && signalScore !== undefined && signalScore < 0) rules.push(`Negative signal score (${signalScore}) on UP trade`);
-  if (direction === "DOWN" && signalScore !== undefined && signalScore > 0) rules.push(`Positive signal score (+${signalScore}) on DOWN trade`);
-  if (windowElapsedSeconds > 180)  rules.push(`Late entry at ${windowElapsedSeconds}s — only ${300 - windowElapsedSeconds}s remaining, reversion risk`);
-  if (confidence < 60)             rules.push(`Low confidence entry (${confidence}%) — insufficient conviction`);
+  // ── Momentum contradictions ─────────────────────────────────────────────────
+  if (direction === "UP"   && rsi !== undefined && rsi > 65)  rules.push(`RSI overbought (${rsi.toFixed(0)}) on UP — reversal risk`);
+  if (direction === "DOWN" && rsi !== undefined && rsi < 35)  rules.push(`RSI oversold (${rsi.toFixed(0)}) on DOWN — reversal risk`);
+  if (direction === "UP"   && rsi !== undefined && rsi > 55 && rsi <= 65) rules.push(`RSI elevated (${rsi.toFixed(0)}) on UP — limited upside room`);
+  if (direction === "DOWN" && rsi !== undefined && rsi < 45 && rsi >= 35) rules.push(`RSI depressed (${rsi.toFixed(0)}) on DOWN — limited downside room`);
+  if (direction === "UP"   && emaCross === "BEARISH") rules.push("EMA cross BEARISH contradicts UP direction");
+  if (direction === "DOWN" && emaCross === "BULLISH") rules.push("EMA cross BULLISH contradicts DOWN direction");
 
-  return rules.length > 0 ? rules.join(" | ") : "No dominant pattern — low probability setup";
+  // ── Signal score alignment ─────────────────────────────────────────────────
+  if (direction === "UP"   && signalScore !== undefined && signalScore < 0) rules.push(`Signal score ${signalScore} opposes UP direction`);
+  if (direction === "DOWN" && signalScore !== undefined && signalScore > 0) rules.push(`Signal score +${signalScore} opposes DOWN direction`);
+  if (direction === "UP"   && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) — no technical edge on UP`);
+  if (direction === "DOWN" && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) — no technical edge on DOWN`);
+
+  // ── Entry price zone ────────────────────────────────────────────────────────
+  if (entryPrice >= 0.48 && entryPrice <= 0.53) rules.push(`Entry at coin-flip zone (${(entryPrice * 100).toFixed(0)}¢) — maximum binary market uncertainty`);
+  if (entryPrice > 0.60) rules.push(`High entry price (${(entryPrice * 100).toFixed(0)}¢) — limited upside, asymmetric loss risk`);
+
+  // ── Order book pressure ─────────────────────────────────────────────────────
+  if (direction === "UP"   && imbalanceSignal === "SELL_PRESSURE") rules.push("Order book SELL_PRESSURE contradicted UP entry (crowd was selling YES)");
+  if (direction === "DOWN" && imbalanceSignal === "BUY_PRESSURE")  rules.push("Order book BUY_PRESSURE contradicted DOWN entry (crowd was buying YES)");
+  if (!imbalanceSignal || imbalanceSignal === "?")                  rules.push("Order book data unavailable at entry — blind entry without crowd signal");
+
+  // ── Timing ─────────────────────────────────────────────────────────────────
+  if (windowElapsedSeconds > 180) rules.push(`Late entry at ${windowElapsedSeconds}s — only ${300 - windowElapsedSeconds}s remaining`);
+  if (windowElapsedSeconds >= 30 && windowElapsedSeconds <= 90)    rules.push(`Mid-window entry at ${windowElapsedSeconds}s — high-noise zone, FastLoop not yet stable`);
+  if (windowElapsedSeconds < 20)  rules.push(`Very early entry at ${windowElapsedSeconds}s — insufficient market data`);
+
+  // ── Confidence ─────────────────────────────────────────────────────────────
+  if (confidence < 75) rules.push(`Borderline confidence (${confidence}%) — below strong conviction threshold`);
+
+  return rules.length > 0 ? rules.join(" | ") : "Loss without clear signal contradictions — review divergence context";
 }
 
 function generateWinLesson(pending: PendingResult): string {
@@ -2014,14 +2033,6 @@ async function startServer() {
           return;
         }
 
-        // Respect session loss limit — don't trade if bot should be halted
-        if (botSessionStartBalance != null && lastKnownBalance != null) {
-          const sessionLossPct = (botSessionStartBalance - lastKnownBalance) / botSessionStartBalance;
-          if (sessionLossPct >= cfg.sessionLossLimit) {
-            botPrint("WARN", `[DIV FAST] Session loss limit hit — fast path suppressed`);
-            return;
-          }
-        }
 
         // Fetch fresh order book + implied price for the target token
         const r = await axios.get(
@@ -2319,7 +2330,7 @@ async function startServer() {
           // If ≤60s remain and the position is profitable, lock in the gain now.
           const secondsToExpiry = automation.windowEnd ? automation.windowEnd - nowSeconds : 9999;
           const isNearExpiry = secondsToExpiry > 0 && secondsToExpiry <= 60;
-          const isCriticalExpiry = secondsToExpiry > 0 && secondsToExpiry <= 30;
+          const _isCriticalExpiry = secondsToExpiry > 0 && secondsToExpiry <= 30; void _isCriticalExpiry;
 
           // Determine if a trigger condition is met
           // TP: use bestBid as the real exit price — only trigger when there's actual liquidity.
@@ -2368,7 +2379,7 @@ async function startServer() {
           }
 
           if (triggerReason) {
-            const isTakeProfit = triggerReason === "take profit";
+            void (triggerReason === "take profit"); // isTakeProfit — guard removed; all triggers execute immediately
             // Execution price: best bid preferred. Fallback to ask * 0.97 (3¢ slippage) rather
             // than waiting forever — a slightly worse price is better than no exit at all.
             const executionPrice = bestBid > 0
@@ -2716,6 +2727,7 @@ async function startServer() {
   // ── Bot cycle ──────────────────────────────────────────────────────────────
   const runBotCycle = async () => {
     if (botRunning || !botEnabled) return;
+
     botRunning = true;
     try {
       await checkPendingResults();
@@ -3155,10 +3167,11 @@ async function startServer() {
             const yesSignal = orderBooks[tokenIds[0]]?.imbalanceSignal ?? "UNKNOWN";
             const pressureOpposesDirection =
               (rec.direction === "UP"   && yesSignal === "SELL_PRESSURE") ||
-              (rec.direction === "DOWN" && yesSignal === "BUY_PRESSURE");
+              (rec.direction === "DOWN" && yesSignal === "BUY_PRESSURE") ||
+              yesSignal === "UNKNOWN"; // no order book data = blind entry (hist WR 17%)
 
             if (pressureOpposesDirection) {
-              botPrint("SKIP", `Pressure filter: direction=${rec.direction} but YES book=${yesSignal} — crowd opposes flip (hist WR 20%) | re-check next cycle`);
+              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/BUY_PRESSURE/UNKNOWN) | re-check next cycle`);
               analyzedThisWindow.delete(market.id); // re-check each cycle in case pressure shifts
               pushSSE("cycle", { ts: new Date().toISOString() });
               continue;
@@ -3212,19 +3225,6 @@ async function startServer() {
               if (currentBalance < 1) {
                 botPrint("WARN", `Insufficient balance ($${currentBalance.toFixed(2)} USDC < $1 minimum). Skipping all trades this cycle.`);
                 logEntry.reasoning += ` | Skipped: Insufficient balance ($${currentBalance.toFixed(2)}).`;
-                botLog.unshift(logEntry);
-                if (botLog.length > 100) botLog.pop();
-                break;
-              }
-
-              const sessionLossPct = botSessionStartBalance && botSessionStartBalance > 0
-                ? (botSessionStartBalance - currentBalance) / botSessionStartBalance
-                : 0;
-
-              if (sessionLossPct >= cfg.sessionLossLimit) {
-                botPrint("WARN", `━━━ SESSION LOSS LIMIT HIT: ${(sessionLossPct * 100).toFixed(1)}% drawdown ≥ ${cfg.sessionLossLimit * 100}% limit. BOT HALTED. ━━━`);
-                botEnabled = false;
-                logEntry.reasoning = `SESSION STOP: Down ${(sessionLossPct * 100).toFixed(1)}% — bot halted.`;
                 botLog.unshift(logEntry);
                 if (botLog.length > 100) botLog.pop();
                 break;
@@ -3475,7 +3475,6 @@ async function startServer() {
     botPrint("INFO", `Min edge       : ${startCfg.minEdge}¢`);
     botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
     botPrint("INFO", `Kelly fraction : ${startCfg.kellyFraction * 100}%`);
-    botPrint("INFO", `Session limit  : -${startCfg.sessionLossLimit * 100}% halt`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
     startHeartbeat();
@@ -3501,6 +3500,7 @@ async function startServer() {
     const nowUtcSeconds = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
     const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
+    const nowSec = Math.floor(Date.now() / 1000);
     res.json({
       enabled: botEnabled,
       running: botRunning,
@@ -3515,7 +3515,6 @@ async function startServer() {
         minEdge: getActiveConfig().minEdge,
         kellyFraction: getActiveConfig().kellyFraction,
         maxBetUsdc: getActiveConfig().maxBetUsdc,
-        sessionLossLimit: getActiveConfig().sessionLossLimit,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
     });
@@ -3708,7 +3707,7 @@ async function startServer() {
     }
     botMode = mode;
     const cfg = getActiveConfig();
-    botPrint("INFO", `Bot mode switched to ${botMode} — conf≥${cfg.minConfidence}% edge≥${cfg.minEdge}¢ maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% sessionLimit=${cfg.sessionLossLimit * 100}% window=${cfg.entryWindowStart}–${cfg.entryWindowEnd}s`);
+    botPrint("INFO", `Bot mode switched to ${botMode} — conf≥${cfg.minConfidence}% edge≥${cfg.minEdge}¢ maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% window=${cfg.entryWindowStart}–${cfg.entryWindowEnd}s`);
     res.json({ ok: true, mode: botMode, config: cfg });
   });
 
