@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -14,7 +14,7 @@ import { analyzeMarket } from "./src/services/gemini.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ── Persistence: data/ directory ──────────────────────────────────────────────
+// â”€â”€ Persistence: data/ directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
 const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
@@ -56,6 +56,71 @@ interface CopyTraderPosition {
   percentPnl: string;
   endDate: string | null;
   eventSlug: string | null;
+}
+
+interface PingProbeResult {
+  key: string;
+  label: string;
+  target: string;
+  latencyMs: number | null;
+  ok: boolean;
+  status: number | null;
+  error?: string;
+}
+
+const PRICE_LAG_PING_TARGETS: Array<{ key: string; label: string; target: string }> = [
+  { key: "clob", label: "Polymarket CLOB", target: "https://clob.polymarket.com/" },
+  { key: "gamma", label: "Polymarket Gamma", target: "https://gamma-api.polymarket.com/markets?limit=1" },
+  { key: "data", label: "Polymarket Data", target: "https://data-api.polymarket.com/leaderboard?limit=1" },
+  { key: "binance", label: "Binance Spot", target: "https://api.binance.com/api/v3/time" },
+  { key: "coinbase", label: "Coinbase Spot", target: "https://api.exchange.coinbase.com/time" },
+];
+
+function gradeLatency(latencyMs: number | null): "excellent" | "good" | "usable" | "slow" | "down" {
+  if (latencyMs == null) return "down";
+  if (latencyMs <= 80) return "excellent";
+  if (latencyMs <= 150) return "good";
+  if (latencyMs <= 250) return "usable";
+  return "slow";
+}
+
+async function probeHttpLatency(
+  key: string,
+  label: string,
+  target: string
+): Promise<PingProbeResult & { grade: ReturnType<typeof gradeLatency> }> {
+  const startedAt = process.hrtime.bigint();
+  try {
+    const response = await axios.get(target, {
+      timeout: 5000,
+      validateStatus: () => true,
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+      },
+    });
+    const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+    return {
+      key,
+      label,
+      target,
+      latencyMs: Math.round(latencyMs),
+      ok: response.status >= 200 && response.status < 500,
+      status: response.status,
+      grade: gradeLatency(Math.round(latencyMs)),
+    };
+  } catch (error: any) {
+    return {
+      key,
+      label,
+      target,
+      latencyMs: null,
+      ok: false,
+      status: null,
+      error: error?.message || "Ping failed",
+      grade: "down",
+    };
+  }
 }
 
 function saveTradeLog(entry: TradeLogEntry): void {
@@ -177,7 +242,7 @@ type BtcCandle = {
   volume: number;
 };
 
-// ── Multi-asset support: BTC, ETH, SOL ───────────────────────────────────────
+// â”€â”€ Multi-asset support: BTC, ETH, SOL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 type TradingAsset = "BTC" | "ETH" | "SOL";
 const ENABLED_ASSETS: TradingAsset[] = (
   (process.env.ENABLED_ASSETS || "BTC,ETH,SOL").split(",").map(s => s.trim().toUpperCase()) as TradingAsset[]
@@ -227,15 +292,20 @@ const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
 const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_000);
 const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 3_000);
+const ANALYSIS_MIN_ENTRY_WINDOW_SECONDS = 120;
+const ANALYSIS_MAX_ENTRY_WINDOW_SECONDS = 179;
+const ANALYSIS_COIN_FLIP_MIN_PRICE = 0.49;
+const ANALYSIS_COIN_FLIP_MAX_PRICE = 0.52;
 
-// ── Bot configuration ────────────────────────────────────────────────────────
+// â”€â”€ Bot configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
 const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 65);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.10);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
+const BOT_FIXED_TRADE_USDC_DEFAULT = Number(process.env.BOT_FIXED_TRADE_USDC || 2);
 
-// ── Bot mode: AGGRESSIVE (default) vs CONSERVATIVE ───────────────────────────
+// â”€â”€ Bot mode: AGGRESSIVE (default) vs CONSERVATIVE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
 
 // Runtime-overrideable thresholds for AGGRESSIVE mode (UI-adjustable)
@@ -265,13 +335,13 @@ function getActiveConfig() {
   };
 }
 
-// ── Dynamic Kelly fraction based on confidence ────────────────────────────────
+// â”€â”€ Dynamic Kelly fraction based on confidence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CONSERVATIVE mode always uses its flat fraction (already risk-managed).
 // AGGRESSIVE mode scales the fraction with conviction level:
-//   65–74% → 0.25  (borderline signal, bet small)
-//   75–84% → 0.40  (normal, use base fraction)
-//   85–89% → 0.55  (strong signal, size up)
-//   90%+   → 0.65  (very high conviction, max size)
+//   65â€“74% â†’ 0.25  (borderline signal, bet small)
+//   75â€“84% â†’ 0.40  (normal, use base fraction)
+//   85â€“89% â†’ 0.55  (strong signal, size up)
+//   90%+   â†’ 0.65  (very high conviction, max size)
 function dynamicKellyFraction(confidence: number): number {
   if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG.kellyFraction;
   if (confidence >= 90) return 0.65;
@@ -280,21 +350,24 @@ function dynamicKellyFraction(confidence: number): number {
   return 0.25;
 }
 
-// ── Bot runtime state ────────────────────────────────────────────────────────
+// â”€â”€ Bot runtime state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 let botEnabled = process.env.BOT_AUTO_START === "true";
 let botRunning = false;
 let botInterval: NodeJS.Timeout | null = null;
 let botSessionStartBalance: number | null = null;
 let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
-// Per-asset analyzed-this-window tracking (keyed by asset → Set of market IDs)
+let botFixedTradeUsdc = Number.isFinite(BOT_FIXED_TRADE_USDC_DEFAULT)
+  ? Math.max(1, Math.min(5, Math.round(BOT_FIXED_TRADE_USDC_DEFAULT)))
+  : 2;
+// Per-asset analyzed-this-window tracking (keyed by asset â†’ Set of market IDs)
 const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
   (["BTC", "ETH", "SOL"] as TradingAsset[]).map(a => [a, new Set<string>()])
 );
 // Backward-compat alias (used by BTC path until loop refactor is complete)
 const botAnalyzedThisWindow = botAnalyzedThisWindowByAsset.get("BTC")!;
 
-// ── Auto-calibrator state ─────────────────────────────────────────────────────
+// â”€â”€ Auto-calibrator state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // When enabled, runs a FastLoop backtest at the start of each new window and
 // uses win-rate to adjust FastLoop minimum strength + confidence boost for that window.
 let autoCalibrateEnabled = false;
@@ -343,19 +416,19 @@ async function runAutoCalibration(): Promise<void> {
     let confidenceDelta = 0;
     let note = "";
     if (winRate === null || signaledCount < 5) {
-      note = "Not enough signal samples — using defaults";
+      note = "Not enough signal samples â€” using defaults";
     } else if (winRate >= 65) {
       fastLoopMinStrength = "MODERATE";
       confidenceDelta = -2; // slightly easier threshold
-      note = `Win rate ${winRate}% — GOOD signal quality, -2% conf threshold`;
+      note = `Win rate ${winRate}% â€” GOOD signal quality, -2% conf threshold`;
     } else if (winRate >= 50) {
       fastLoopMinStrength = "MODERATE";
       confidenceDelta = 0;
-      note = `Win rate ${winRate}% — AVERAGE signal quality, no adjustment`;
+      note = `Win rate ${winRate}% â€” AVERAGE signal quality, no adjustment`;
     } else {
       fastLoopMinStrength = "STRONG"; // only trust STRONG signals
       confidenceDelta = +5;           // require higher confidence
-      note = `Win rate ${winRate}% — WEAK signal quality, require STRONG only +5% conf`;
+      note = `Win rate ${winRate}% â€” WEAK signal quality, require STRONG only +5% conf`;
     }
 
     calibrationState = {
@@ -368,11 +441,11 @@ async function runAutoCalibration(): Promise<void> {
       confidenceDelta,
       note,
     };
-    console.log(`[Calibrator] Win rate=${winRate ?? "?"}% (${correctCount}/${signaledCount} signals) → minStrength=${fastLoopMinStrength} confDelta=${confidenceDelta > 0 ? "+" : ""}${confidenceDelta}%`);
+    console.log(`[Calibrator] Win rate=${winRate ?? "?"}% (${correctCount}/${signaledCount} signals) â†’ minStrength=${fastLoopMinStrength} confDelta=${confidenceDelta > 0 ? "+" : ""}${confidenceDelta}%`);
   } catch { /* non-fatal */ }
 }
 
-// ── Fast loop momentum history ring buffer ────────────────────────────────────
+// â”€â”€ Fast loop momentum history ring buffer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface MomentumHistoryPoint {
   ts: number;
   direction: "UP" | "DOWN" | "NEUTRAL";
@@ -384,21 +457,21 @@ interface MomentumHistoryPoint {
 const momentumHistory: MomentumHistoryPoint[] = [];
 const MOMENTUM_HISTORY_MAX = 60;
 
-// ── Last known STRONG divergence timestamp (for notification dedup) ───────────
+// â”€â”€ Last known STRONG divergence timestamp (for notification dedup) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 let lastStrongDivergenceNotifiedAt = 0;
 
-// ── Divergence fast-path state ────────────────────────────────────────────────
+// â”€â”€ Divergence fast-path state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const activeBotMarketByAsset = new Map<TradingAsset, any>(); // per-asset active market
 let activeBotMarket: any = null;          // kept for backward-compat with divergence tracker sync (line below)
 let lastKnownBalance: number | null = null; // most recent balance fetch, used by fast path
 let lastDivergenceFastTradeAt = 0;        // unix-seconds cooldown tracker
-let divergenceFastTradeRunning = false;   // mutex — prevents concurrent fast-path execution
+let divergenceFastTradeRunning = false;   // mutex â€” prevents concurrent fast-path execution
 
 
-// ── Per-window AI result cache (reuse rec across cycles, only re-check price) ──
+// â”€â”€ Per-window AI result cache (reuse rec across cycles, only re-check price) â”€â”€
 let currentWindowAiCache: { windowStart: number; marketId: string; asset: TradingAsset; rec: any } | null = null;
 
-// ── Divergence tracker (asset price vs YES token lag detector) ───────────────
+// â”€â”€ Divergence tracker (asset price vs YES token lag detector) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface PricePoint { ts: number; price: number; }
 const btcRingBuffer: PricePoint[] = [];   // 5s samples, 10-min window (named btc for compat)
 const yesRingBuffer: PricePoint[] = [];   // YES token ask price
@@ -412,8 +485,8 @@ let currentDivergenceAsset: TradingAsset = "BTC"; // tracks which asset divergen
 interface DivergenceState {
   btcDelta30s: number;       // raw $ BTC change in last 30s
   btcDelta60s: number;       // raw $ BTC change in last 60s
-  yesDelta30s: number;       // YES token ¢ change in last 30s
-  divergence: number;        // 0.0–1.0+ normalized score
+  yesDelta30s: number;       // YES token Â¢ change in last 30s
+  divergence: number;        // 0.0â€“1.0+ normalized score
   direction: "UP" | "DOWN" | "NEUTRAL";
   strength: "STRONG" | "MODERATE" | "WEAK" | "NONE";
   currentBtcPrice: number | null;
@@ -424,7 +497,7 @@ interface DivergenceState {
 const divergenceStateByAsset = new Map<TradingAsset, DivergenceState>();
 let divergenceTrackerInterval: NodeJS.Timeout | null = null;
 
-// ── Current entry snapshot (shown in dashboard widget) ────────────────────────
+// â”€â”€ Current entry snapshot (shown in dashboard widget) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface EntrySnapshot {
   market: string;
   windowStart: number;
@@ -467,7 +540,7 @@ interface RawLogEntry {
 }
 const rawLog: RawLogEntry[] = [];
 
-// ── SSE clients for real-time push ────────────────────────────────────────────
+// â”€â”€ SSE clients for real-time push â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const sseClients = new Set<ServerResponse>();
 function pushSSE(event: string, data: unknown): void {
   if (sseClients.size === 0) return;
@@ -488,7 +561,7 @@ interface PendingResult {
   betAmount: number;
   orderId: string | null;
   windowEnd: number;
-  // Context captured at trade time — used for learning
+  // Context captured at trade time â€” used for learning
   confidence: number;
   edge: number;
   reasoning: string;
@@ -501,7 +574,7 @@ interface PendingResult {
 }
 const pendingResults = new Map<string, PendingResult>();
 
-// ── Adaptive learning state ───────────────────────────────────────────────────
+// â”€â”€ Adaptive learning state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface LossMemory {
   timestamp: string;
   market: string;
@@ -544,62 +617,62 @@ const winMemory: WinMemory[] = [];
 const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
 const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
 const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
-// Global aliases kept for persistence (sum/avg not needed — persist per entry in lossMemory)
+// Global aliases kept for persistence (sum/avg not needed â€” persist per entry in lossMemory)
 let consecutiveLosses = 0;
 let consecutiveWins   = 0;
-let adaptiveConfidenceBoost = 0; // legacy — used only for saveLearning() backward-compat
+let adaptiveConfidenceBoost = 0; // legacy â€” used only for saveLearning() backward-compat
 let adaptiveLossPenaltyEnabled = true;
 
 function generateLesson(pending: PendingResult): string {
   const rules: string[] = [];
   const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence, entryPrice, imbalanceSignal } = pending;
 
-  // ── Momentum contradictions ─────────────────────────────────────────────────
-  if (direction === "UP"   && rsi !== undefined && rsi > 65)  rules.push(`RSI overbought (${rsi.toFixed(0)}) on UP — reversal risk`);
-  if (direction === "DOWN" && rsi !== undefined && rsi < 35)  rules.push(`RSI oversold (${rsi.toFixed(0)}) on DOWN — reversal risk`);
-  if (direction === "UP"   && rsi !== undefined && rsi > 55 && rsi <= 65) rules.push(`RSI elevated (${rsi.toFixed(0)}) on UP — limited upside room`);
-  if (direction === "DOWN" && rsi !== undefined && rsi < 45 && rsi >= 35) rules.push(`RSI depressed (${rsi.toFixed(0)}) on DOWN — limited downside room`);
+  // â”€â”€ Momentum contradictions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (direction === "UP"   && rsi !== undefined && rsi > 65)  rules.push(`RSI overbought (${rsi.toFixed(0)}) on UP â€” reversal risk`);
+  if (direction === "DOWN" && rsi !== undefined && rsi < 35)  rules.push(`RSI oversold (${rsi.toFixed(0)}) on DOWN â€” reversal risk`);
+  if (direction === "UP"   && rsi !== undefined && rsi > 55 && rsi <= 65) rules.push(`RSI elevated (${rsi.toFixed(0)}) on UP â€” limited upside room`);
+  if (direction === "DOWN" && rsi !== undefined && rsi < 45 && rsi >= 35) rules.push(`RSI depressed (${rsi.toFixed(0)}) on DOWN â€” limited downside room`);
   if (direction === "UP"   && emaCross === "BEARISH") rules.push("EMA cross BEARISH contradicts UP direction");
   if (direction === "DOWN" && emaCross === "BULLISH") rules.push("EMA cross BULLISH contradicts DOWN direction");
 
-  // ── Signal score alignment ─────────────────────────────────────────────────
+  // â”€â”€ Signal score alignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (direction === "UP"   && signalScore !== undefined && signalScore < 0) rules.push(`Signal score ${signalScore} opposes UP direction`);
   if (direction === "DOWN" && signalScore !== undefined && signalScore > 0) rules.push(`Signal score +${signalScore} opposes DOWN direction`);
-  if (direction === "UP"   && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) — no technical edge on UP`);
-  if (direction === "DOWN" && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) — no technical edge on DOWN`);
+  if (direction === "UP"   && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) â€” no technical edge on UP`);
+  if (direction === "DOWN" && signalScore !== undefined && signalScore === 0) rules.push(`Signal score neutral (0) â€” no technical edge on DOWN`);
 
-  // ── Entry price zone ────────────────────────────────────────────────────────
-  if (entryPrice >= 0.48 && entryPrice <= 0.53) rules.push(`Entry at coin-flip zone (${(entryPrice * 100).toFixed(0)}¢) — maximum binary market uncertainty`);
-  if (entryPrice > 0.60) rules.push(`High entry price (${(entryPrice * 100).toFixed(0)}¢) — limited upside, asymmetric loss risk`);
+  // â”€â”€ Entry price zone â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (entryPrice >= 0.48 && entryPrice <= 0.53) rules.push(`Entry at coin-flip zone (${(entryPrice * 100).toFixed(0)}Â¢) â€” maximum binary market uncertainty`);
+  if (entryPrice > 0.60) rules.push(`High entry price (${(entryPrice * 100).toFixed(0)}Â¢) â€” limited upside, asymmetric loss risk`);
 
-  // ── Order book pressure ─────────────────────────────────────────────────────
+  // â”€â”€ Order book pressure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (direction === "UP"   && imbalanceSignal === "SELL_PRESSURE") rules.push("Order book SELL_PRESSURE contradicted UP entry (crowd was selling YES)");
   if (direction === "DOWN" && imbalanceSignal === "BUY_PRESSURE")  rules.push("Order book BUY_PRESSURE contradicted DOWN entry (crowd was buying YES)");
-  if (!imbalanceSignal || imbalanceSignal === "?")                  rules.push("Order book data unavailable at entry — blind entry without crowd signal");
+  if (!imbalanceSignal || imbalanceSignal === "?")                  rules.push("Order book data unavailable at entry â€” blind entry without crowd signal");
 
-  // ── Timing ─────────────────────────────────────────────────────────────────
-  if (windowElapsedSeconds > 180) rules.push(`Late entry at ${windowElapsedSeconds}s — only ${300 - windowElapsedSeconds}s remaining`);
-  if (windowElapsedSeconds >= 30 && windowElapsedSeconds <= 90)    rules.push(`Mid-window entry at ${windowElapsedSeconds}s — high-noise zone, FastLoop not yet stable`);
-  if (windowElapsedSeconds < 20)  rules.push(`Very early entry at ${windowElapsedSeconds}s — insufficient market data`);
+  // â”€â”€ Timing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (windowElapsedSeconds > 180) rules.push(`Late entry at ${windowElapsedSeconds}s â€” only ${300 - windowElapsedSeconds}s remaining`);
+  if (windowElapsedSeconds >= 30 && windowElapsedSeconds <= 90)    rules.push(`Mid-window entry at ${windowElapsedSeconds}s â€” high-noise zone, FastLoop not yet stable`);
+  if (windowElapsedSeconds < 20)  rules.push(`Very early entry at ${windowElapsedSeconds}s â€” insufficient market data`);
 
-  // ── Confidence ─────────────────────────────────────────────────────────────
-  if (confidence < 75) rules.push(`Borderline confidence (${confidence}%) — below strong conviction threshold`);
+  // â”€â”€ Confidence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (confidence < 75) rules.push(`Borderline confidence (${confidence}%) â€” below strong conviction threshold`);
 
-  return rules.length > 0 ? rules.join(" | ") : "Loss without clear signal contradictions — review divergence context";
+  return rules.length > 0 ? rules.join(" | ") : "Loss without clear signal contradictions â€” review divergence context";
 }
 
 function generateWinLesson(pending: PendingResult): string {
   const reasons: string[] = [];
   const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence } = pending;
 
-  if (direction === "UP"   && rsi !== undefined && rsi < 45) reasons.push(`RSI oversold (${rsi.toFixed(0)}) on UP — momentum room available`);
-  if (direction === "DOWN" && rsi !== undefined && rsi > 55) reasons.push(`RSI overbought (${rsi.toFixed(0)}) on DOWN — reversal confirmed`);
+  if (direction === "UP"   && rsi !== undefined && rsi < 45) reasons.push(`RSI oversold (${rsi.toFixed(0)}) on UP â€” momentum room available`);
+  if (direction === "DOWN" && rsi !== undefined && rsi > 55) reasons.push(`RSI overbought (${rsi.toFixed(0)}) on DOWN â€” reversal confirmed`);
   if (direction === "UP"   && emaCross === "BULLISH")         reasons.push("EMA cross BULLISH aligned with UP direction");
   if (direction === "DOWN" && emaCross === "BEARISH")         reasons.push("EMA cross BEARISH aligned with DOWN direction");
   if (direction === "UP"   && signalScore !== undefined && signalScore > 0) reasons.push(`Strong positive signal score (+${signalScore}) on UP trade`);
   if (direction === "DOWN" && signalScore !== undefined && signalScore < 0) reasons.push(`Strong negative signal score (${signalScore}) on DOWN trade`);
-  if (windowElapsedSeconds <= 150) reasons.push(`Early entry at ${windowElapsedSeconds}s — maximum time for move to develop`);
-  if (confidence >= 72)            reasons.push(`High confidence entry (${confidence}%) — strong conviction`);
+  if (windowElapsedSeconds <= 150) reasons.push(`Early entry at ${windowElapsedSeconds}s â€” maximum time for move to develop`);
+  if (confidence >= 72)            reasons.push(`High confidence entry (${confidence}%) â€” strong conviction`);
 
   return reasons.length > 0 ? reasons.join(" | ") : "Aligned signals with good timing";
 }
@@ -641,7 +714,7 @@ type PositionAutomationDocument = {
   stopLoss: string;
   trailingStop: string;
   armed: boolean;
-  windowEnd?: number;       // unix seconds — when the 5-min market resolves
+  windowEnd?: number;       // unix seconds â€” when the 5-min market resolves
   highestPrice?: string;
   trailingStopPrice?: string;
   lastPrice?: string;
@@ -1066,7 +1139,7 @@ async function fetchBtcHistoryFromCoinbase() {
   }
 }
 
-// ── Generic multi-asset fetchers (ETH, SOL via Binance/Coinbase) ─────────────
+// â”€â”€ Generic multi-asset fetchers (ETH, SOL via Binance/Coinbase) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function fetchAssetPriceFromBinance(asset: TradingAsset) {
   const cfg = ASSET_CONFIG[asset];
   const binanceHosts = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com"];
@@ -1151,6 +1224,297 @@ async function getAssetIndicators(asset: TradingAsset, forceRefresh = false) {
     assetIndicatorsCaches.set(asset, { data: indicators, expiresAt: Date.now() + BTC_INDICATORS_CACHE_MS });
     return indicators;
   } catch { return cached?.data ?? null; }
+}
+
+const dynamicAssetPriceCache = new Map<string, { data: { symbol: string; price: string; source?: string }; expiresAt: number }>();
+const lagAssetPriceBuffers = new Map<string, PricePoint[]>();
+const lagYesPriceBuffers = new Map<string, PricePoint[]>();
+const lagNoPriceBuffers = new Map<string, PricePoint[]>();
+const botTradedThisWindowMarketIds = new Set<string>();
+
+interface DynamicLagMarket {
+  market: any;
+  assetSymbol: string;
+  slug: string;
+  yesPrice: number | null;
+  noPrice: number | null;
+  yesTokenId: string | null;
+  noTokenId: string | null;
+  liquidity: number;
+  volume24hr: number;
+}
+
+interface PriceLagSignal {
+  decision: "TRADE" | "NO_TRADE";
+  direction: "UP" | "DOWN" | "NONE";
+  confidence: number;
+  estimatedEdge: number;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  reasoning: string;
+  assetMove30Pct: number;
+  assetMove60Pct: number;
+  yesDelta30Cents: number;
+  noDelta30Cents: number;
+  lagGapCents: number;
+  expectedCatchupCents: number;
+  maxEntryPrice: number;
+}
+
+function parseJsonArray(value: any): any[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parseCryptoSymbolFromSlug(slug: string | null | undefined): string | null {
+  const normalized = String(slug || "").trim().toLowerCase();
+  const match = normalized.match(/^([a-z0-9]+)-updown-5m-/);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function pushLagSample(target: Map<string, PricePoint[]>, key: string, price: number, ts: number): void {
+  if (!(price > 0)) return;
+  const buffer = target.get(key) ?? [];
+  buffer.push({ ts, price });
+  while (buffer.length > 120) buffer.shift();
+  target.set(key, buffer);
+}
+
+function findLagReference(buffer: PricePoint[] | undefined, targetTs: number): PricePoint | null {
+  if (!buffer || buffer.length === 0) return null;
+  let best: PricePoint | null = null;
+  for (const point of buffer) {
+    if (point.ts > targetTs) continue;
+    if (!best || Math.abs(point.ts - targetTs) < Math.abs(best.ts - targetTs)) best = point;
+  }
+  return best;
+}
+
+function getLagThresholds(assetPrice: number) {
+  if (assetPrice >= 10_000) return { minMove30Pct: 0.08, minMove60Pct: 0.12, minLagGapCents: 1.5, baseMaxEntryPrice: 0.64 };
+  if (assetPrice >= 1_000) return { minMove30Pct: 0.12, minMove60Pct: 0.18, minLagGapCents: 1.6, baseMaxEntryPrice: 0.64 };
+  if (assetPrice >= 100) return { minMove30Pct: 0.18, minMove60Pct: 0.27, minLagGapCents: 1.8, baseMaxEntryPrice: 0.63 };
+  if (assetPrice >= 10) return { minMove30Pct: 0.25, minMove60Pct: 0.35, minLagGapCents: 2.0, baseMaxEntryPrice: 0.62 };
+  return { minMove30Pct: 0.40, minMove60Pct: 0.55, minLagGapCents: 2.3, baseMaxEntryPrice: 0.60 };
+}
+
+function computePriceLagSignal(params: {
+  assetSymbol: string;
+  assetNow: number;
+  assetRef30: number;
+  assetRef60: number;
+  yesNow: number;
+  yesRef30: number;
+  noNow: number;
+  noRef30: number;
+}): PriceLagSignal {
+  const {
+    assetSymbol,
+    assetNow,
+    assetRef30,
+    assetRef60,
+    yesNow,
+    yesRef30,
+    noNow,
+    noRef30,
+  } = params;
+
+  if (!(assetNow > 0 && assetRef30 > 0 && assetRef60 > 0 && yesNow > 0 && yesRef30 > 0 && noNow > 0 && noRef30 > 0)) {
+    return {
+      decision: "NO_TRADE",
+      direction: "NONE",
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: "Lag buffers not ready yet",
+      assetMove30Pct: 0,
+      assetMove60Pct: 0,
+      yesDelta30Cents: 0,
+      noDelta30Cents: 0,
+      lagGapCents: 0,
+      expectedCatchupCents: 0,
+      maxEntryPrice: 0.60,
+    };
+  }
+
+  const assetMove30Pct = ((assetNow - assetRef30) / assetRef30) * 100;
+  const assetMove60Pct = ((assetNow - assetRef60) / assetRef60) * 100;
+  const yesDelta30Cents = (yesNow - yesRef30) * 100;
+  const noDelta30Cents = (noNow - noRef30) * 100;
+  const absMove30 = Math.abs(assetMove30Pct);
+  const thresholds = getLagThresholds(assetNow);
+
+  if (absMove30 < thresholds.minMove30Pct) {
+    return {
+      decision: "NO_TRADE",
+      direction: "NONE",
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: `${assetSymbol} move too small for lag scalp (${assetMove30Pct.toFixed(3)}%)`,
+      assetMove30Pct,
+      assetMove60Pct,
+      yesDelta30Cents,
+      noDelta30Cents,
+      lagGapCents: 0,
+      expectedCatchupCents: 0,
+      maxEntryPrice: thresholds.baseMaxEntryPrice,
+    };
+  }
+
+  const direction: "UP" | "DOWN" = assetMove30Pct > 0 ? "UP" : "DOWN";
+  const persistentMove = assetMove30Pct * assetMove60Pct > 0 && Math.abs(assetMove60Pct) >= thresholds.minMove60Pct * 0.6;
+  const targetTokenDelta = direction === "UP" ? Math.max(0, yesDelta30Cents) : Math.max(0, noDelta30Cents);
+  const opposingTokenDelta = direction === "UP" ? Math.max(0, noDelta30Cents) : Math.max(0, yesDelta30Cents);
+  const expectedCatchupCents = Math.min(10, Math.max(2, (absMove30 / thresholds.minMove30Pct) * 2.6));
+  const lagGapCents = expectedCatchupCents - targetTokenDelta;
+  const entryPrice = direction === "UP" ? yesNow : noNow;
+
+  if (lagGapCents < thresholds.minLagGapCents) {
+    return {
+      decision: "NO_TRADE",
+      direction,
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: `${assetSymbol} moved but ${direction} token already caught up (${targetTokenDelta.toFixed(2)}c)`,
+      assetMove30Pct,
+      assetMove60Pct,
+      yesDelta30Cents,
+      noDelta30Cents,
+      lagGapCents,
+      expectedCatchupCents,
+      maxEntryPrice: thresholds.baseMaxEntryPrice,
+    };
+  }
+
+  let confidence = 54;
+  confidence += Math.min(16, (absMove30 / thresholds.minMove30Pct) * 6);
+  confidence += Math.min(10, lagGapCents * 2.2);
+  if (persistentMove) confidence += 7;
+  if (opposingTokenDelta > targetTokenDelta + 1) confidence -= 6;
+  if (entryPrice > 0.60) confidence -= 5;
+  if (entryPrice > 0.66) confidence -= 6;
+  confidence = Math.max(55, Math.min(90, Math.round(confidence)));
+
+  const maxEntryPrice = Math.min(0.68, thresholds.baseMaxEntryPrice + Math.min(0.05, lagGapCents * 0.015) + (persistentMove ? 0.02 : 0));
+  const estimatedEdge = parseFloat(((confidence / 100) - entryPrice).toFixed(4));
+  const riskLevel: "LOW" | "MEDIUM" | "HIGH" =
+    confidence >= 78 && lagGapCents >= 3 && entryPrice <= 0.60
+      ? "LOW"
+      : confidence >= 67 && entryPrice <= 0.66
+        ? "MEDIUM"
+        : "HIGH";
+
+  return {
+    decision: estimatedEdge > 0 ? "TRADE" : "NO_TRADE",
+    direction,
+    confidence,
+    estimatedEdge,
+    riskLevel,
+    reasoning: `${assetSymbol} ${assetMove30Pct >= 0 ? "+" : ""}${assetMove30Pct.toFixed(3)}% /30s, ${assetMove60Pct >= 0 ? "+" : ""}${assetMove60Pct.toFixed(3)}% /60s | YES ${yesDelta30Cents >= 0 ? "+" : ""}${yesDelta30Cents.toFixed(2)}c | NO ${noDelta30Cents >= 0 ? "+" : ""}${noDelta30Cents.toFixed(2)}c | lag gap ${lagGapCents.toFixed(2)}c`,
+    assetMove30Pct,
+    assetMove60Pct,
+    yesDelta30Cents,
+    noDelta30Cents,
+    lagGapCents,
+    expectedCatchupCents,
+    maxEntryPrice,
+  };
+}
+
+async function fetchDynamicAssetPriceFromBinance(symbol: string) {
+  const marketSymbol = `${symbol.toUpperCase()}USDT`;
+  const binanceHosts = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com"];
+  for (const host of binanceHosts) {
+    try {
+      const response = await axios.get(`${host}/api/v3/ticker/price`, {
+        params: { symbol: marketSymbol },
+        timeout: 5000,
+      });
+      return { symbol: marketSymbol, price: String(response.data.price), source: host };
+    } catch {
+      // try next host
+    }
+  }
+  return null;
+}
+
+async function fetchDynamicAssetPriceFromCoinbase(symbol: string) {
+  try {
+    const product = `${symbol.toUpperCase()}-USD`;
+    const response = await axios.get(`https://api.coinbase.com/v2/prices/${product}/spot`, {
+      timeout: 5000,
+    });
+    return {
+      symbol: product,
+      price: String(response.data?.data?.amount),
+      source: "coinbase",
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getDynamicAssetPrice(symbol: string, forceRefresh = false): Promise<{ symbol: string; price: string; source?: string } | null> {
+  const key = symbol.toUpperCase();
+  const cached = dynamicAssetPriceCache.get(key);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.data;
+  const result = (await fetchDynamicAssetPriceFromBinance(key)) || (await fetchDynamicAssetPriceFromCoinbase(key));
+  if (result?.price) {
+    dynamicAssetPriceCache.set(key, { data: result, expiresAt: Date.now() + BTC_PRICE_CACHE_MS });
+    return result;
+  }
+  return cached?.data ?? null;
+}
+
+async function discoverActiveCryptoLagMarkets(currentWindowStart: number): Promise<DynamicLagMarket[]> {
+  const response = await axios.get("https://gamma-api.polymarket.com/markets", {
+    params: { active: true, closed: false, limit: 250 },
+    timeout: 12000,
+  });
+  const rows = Array.isArray(response.data) ? response.data : [];
+
+  return rows
+    .map((market: any) => {
+      const slug = String(market.slug || "");
+      const assetSymbol = parseCryptoSymbolFromSlug(slug);
+      const outcomePrices = parseJsonArray(market.outcomePrices);
+      const tokenIds = parseJsonArray(market.clobTokenIds);
+      return {
+        market: {
+          ...market,
+          outcomes: parseJsonArray(market.outcomes),
+          outcomePrices,
+          clobTokenIds: tokenIds,
+        },
+        assetSymbol,
+        slug,
+        yesPrice: outcomePrices[0] != null ? Number(outcomePrices[0]) : null,
+        noPrice: outcomePrices[1] != null ? Number(outcomePrices[1]) : null,
+        yesTokenId: tokenIds[0] ? String(tokenIds[0]) : null,
+        noTokenId: tokenIds[1] ? String(tokenIds[1]) : null,
+        liquidity: Number(market.liquidityNum ?? market.liquidity ?? 0),
+        volume24hr: Number(market.volume24hrClob ?? market.volume24hr ?? 0),
+      } satisfies DynamicLagMarket;
+    })
+    .filter((item) =>
+      item.assetSymbol &&
+      item.slug.includes("-updown-5m-") &&
+      item.slug.endsWith(`-${currentWindowStart}`) &&
+      item.yesTokenId &&
+      item.noTokenId &&
+      item.yesPrice != null &&
+      item.noPrice != null
+    )
+    .sort((a, b) => (b.liquidity + b.volume24hr) - (a.liquidity + a.volume24hr));
 }
 
 async function getBtcHistory(forceRefresh = false) {
@@ -1383,9 +1747,9 @@ function computeBtcIndicatorsFromHistory(history: BtcCandle[]) {
   };
 }
 
-// ── Fast Loop Momentum (Simmer SDK-inspired CEX momentum signal) ───────────
+// â”€â”€ Fast Loop Momentum (Simmer SDK-inspired CEX momentum signal) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface FastLoopMomentum {
-  raw: number;            // % price change over 5 candles (first → last)
+  raw: number;            // % price change over 5 candles (first â†’ last)
   volumeWeighted: number; // each candle change weighted by its volume share
   acceleration: number;   // recent-2 candle momentum minus older-2 candle momentum
   direction: "UP" | "DOWN" | "NEUTRAL";
@@ -1555,7 +1919,7 @@ async function getClobClient() {
   return clobClientInitPromise;
 }
 
-// ── Telegram / Discord push notifications ────────────────────────────────────
+// â”€â”€ Telegram / Discord push notifications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function sendNotification(message: string): Promise<void> {
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
   const telegramChatId = process.env.TELEGRAM_CHAT_ID;
@@ -1579,11 +1943,11 @@ async function sendNotification(message: string): Promise<void> {
   await Promise.all(tasks);
 }
 
-// ── Divergence fast-path hook — wired up inside startServer() after local fns are defined ──
+// â”€â”€ Divergence fast-path hook â€” wired up inside startServer() after local fns are defined â”€â”€
 // The tracker calls this when STRONG divergence fires; startServer() sets the implementation.
 let onStrongDivergence: ((direction: "UP" | "DOWN", snapshot: { yesAsk: number | null; noAsk: number | null; btcDelta: number }) => void) | null = null;
 
-// ── Divergence Tracker: BTC price vs YES token price lag detector ─────────────
+// â”€â”€ Divergence Tracker: BTC price vs YES token price lag detector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Runs every 5s independently. Fills ring buffers and computes divergence score.
 function startDivergenceTracker() {
   if (divergenceTrackerInterval) return;
@@ -1651,14 +2015,14 @@ function startDivergenceTracker() {
 
       const btcDelta30s = btcNow && btc30ref ? btcNow - btc30ref.price : 0;
       const btcDelta60s = btcNow && btc60ref ? btcNow - btc60ref.price : 0;
-      const yesDelta30s = yesNow && yes30ref ? (yesNow - yes30ref.price) * 100 : 0; // in ¢
+      const yesDelta30s = yesNow && yes30ref ? (yesNow - yes30ref.price) * 100 : 0; // in Â¢
 
       // 4. Classify divergence using asset-specific thresholds
       const divCfg = ASSET_CONFIG[currentDivergenceAsset];
       const BTC_STRONG = divCfg.divergenceStrong;
       const BTC_MOD    = divCfg.divergenceMod;
       const BTC_WEAK   = divCfg.divergenceWeak;
-      const YES_LAG    = 2.0; // ¢ — YES hasn't moved at least 2¢ in asset's direction
+      const YES_LAG    = 2.0; // Â¢ â€” YES hasn't moved at least 2Â¢ in asset's direction
 
       let direction: DivergenceState["direction"] = "NEUTRAL";
       let strength:  DivergenceState["strength"]  = "NONE";
@@ -1671,12 +2035,12 @@ function startDivergenceTracker() {
         const yesInBtcDir = direction === "UP" ? yesDelta30s : -yesDelta30s;
         const yesLagging  = yesInBtcDir < YES_LAG; // YES hasn't caught up
 
-        divergence = absBtc / BTC_STRONG; // normalized 0–1+
+        divergence = absBtc / BTC_STRONG; // normalized 0â€“1+
 
         if      (absBtc >= BTC_STRONG && yesLagging) strength = "STRONG";
         else if (absBtc >= BTC_MOD    && yesLagging) strength = "MODERATE";
         else if (absBtc >= BTC_WEAK   && yesLagging) strength = "WEAK";
-        else direction = "NEUTRAL"; // BTC moved but YES kept pace — no lag
+        else direction = "NEUTRAL"; // BTC moved but YES kept pace â€” no lag
       }
 
       divergenceStateByAsset.set(currentDivergenceAsset, {
@@ -1692,25 +2056,25 @@ function startDivergenceTracker() {
       if (strength === "STRONG" && now - lastStrongDivergenceNotifiedAt > 120) {
         lastStrongDivergenceNotifiedAt = now;
         void sendNotification(
-          `⚡ <b>STRONG DIVERGENCE DETECTED</b>\nBTC: ${btcDelta30s >= 0 ? "+" : ""}$${btcDelta30s.toFixed(0)} (30s)\nYES: ${yesDelta30s >= 0 ? "+" : ""}${yesDelta30s.toFixed(2)}¢\nDirection: ${direction}\nBot may force-trade ${direction}`
+          `âš¡ <b>STRONG DIVERGENCE DETECTED</b>\nBTC: ${btcDelta30s >= 0 ? "+" : ""}$${btcDelta30s.toFixed(0)} (30s)\nYES: ${yesDelta30s >= 0 ? "+" : ""}${yesDelta30s.toFixed(2)}Â¢\nDirection: ${direction}\nBot may force-trade ${direction}`
         );
       }
 
-      // ── STRONG DIVERGENCE: reset analyzed set so main cycle re-evaluates ────
+      // â”€â”€ STRONG DIVERGENCE: reset analyzed set so main cycle re-evaluates â”€â”€â”€â”€
       // If STRONG divergence fires mid-window and bot already marked the market
       // as analyzed (e.g. earlier NO_TRADE), clear the set so the next bot cycle
       // re-runs analysis with the new divergence context.
       if (strength === "STRONG" && (direction === "UP" || direction === "DOWN") && botEnabled) {
         const assetSet = botAnalyzedThisWindowByAsset.get(currentDivergenceAsset);
         if (assetSet && assetSet.size > 0) {
-          console.log(`[DIV] STRONG divergence mid-window — clearing analyzed set for ${currentDivergenceAsset} to force re-evaluation`);
+          console.log(`[DIV] STRONG divergence mid-window â€” clearing analyzed set for ${currentDivergenceAsset} to force re-evaluation`);
           assetSet.clear();
           currentWindowAiCache = null;
         }
       }
 
-      // ── FAST PATH TRIGGER ─────────────────────────────────────────────────
-      // Fire immediately on STRONG divergence — don't wait for next bot cycle.
+      // â”€â”€ FAST PATH TRIGGER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // Fire immediately on STRONG divergence â€” don't wait for next bot cycle.
       // Cooldown: 30s to prevent thrashing on the same divergence event.
       if (
         strength === "STRONG" &&
@@ -1727,7 +2091,7 @@ function startDivergenceTracker() {
 
   void tick();
   divergenceTrackerInterval = setInterval(() => void tick(), 5000);
-  console.log("[Divergence] Tracker started — 5s BTC vs YES token lag detector");
+  console.log("[Divergence] Tracker started â€” 5s BTC vs YES token lag detector");
 }
 
 async function startServer() {
@@ -1962,7 +2326,7 @@ async function startServer() {
   };
 
   const recommendAutomationLevels = (averagePrice: number) => {
-    // TP/SL scaled to absolute price zone — binaries have non-linear payoff.
+    // TP/SL scaled to absolute price zone â€” binaries have non-linear payoff.
     // TP targets are deliberately tight: 5-min binary markets mean-revert fast,
     // so we take realistic gains rather than holding for a large move that rarely lands.
     let tpTarget: number;
@@ -1970,7 +2334,7 @@ async function startServer() {
     let trailingDistance: number;
 
     if (averagePrice < 0.35) {
-      tpTarget = Math.min(0.68, averagePrice + 0.18); // was +0.30 — too ambitious
+      tpTarget = Math.min(0.68, averagePrice + 0.18); // was +0.30 â€” too ambitious
       slTarget = Math.max(0.01, averagePrice - 0.10);
       trailingDistance = 0.07;
     } else if (averagePrice < 0.50) {
@@ -1995,7 +2359,33 @@ async function startServer() {
     };
   };
 
-  // ── Divergence Fast-Path Trade implementation ─────────────────────────────
+  const recommendLagScalpLevels = (averagePrice: number) => {
+    let tpTarget: number;
+    let slTarget: number;
+    let trailingDistance: number;
+
+    if (averagePrice < 0.40) {
+      tpTarget = Math.min(0.58, averagePrice + 0.06);
+      slTarget = Math.max(0.01, averagePrice - 0.05);
+      trailingDistance = 0.03;
+    } else if (averagePrice < 0.55) {
+      tpTarget = Math.min(0.64, averagePrice + 0.05);
+      slTarget = Math.max(0.01, averagePrice - 0.045);
+      trailingDistance = 0.03;
+    } else {
+      tpTarget = Math.min(0.70, averagePrice + 0.04);
+      slTarget = Math.max(0.01, averagePrice - 0.04);
+      trailingDistance = 0.025;
+    }
+
+    return {
+      takeProfit: tpTarget.toFixed(2),
+      stopLoss: slTarget.toFixed(2),
+      trailingStop: trailingDistance.toFixed(2),
+    };
+  };
+
+  // â”€â”€ Divergence Fast-Path Trade implementation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Wired to onStrongDivergence so the tracker can call it directly without
   // waiting for the next bot cycle (saves the ~2-3s Gemini round-trip).
   onStrongDivergence = (
@@ -2029,7 +2419,7 @@ async function startServer() {
         // Gate: minimum 120s remaining in the window.
         const divRemainingSeconds = MARKET_SESSION_SECONDS - windowElapsed;
         if (divRemainingSeconds < 120) {
-          botPrint("SKIP", `[DIV FAST] Too late: only ${divRemainingSeconds}s remaining — divergence entry skipped (min 120s)`);
+          botPrint("SKIP", `[DIV FAST] Too late: only ${divRemainingSeconds}s remaining â€” divergence entry skipped (min 120s)`);
           return;
         }
 
@@ -2047,10 +2437,10 @@ async function startServer() {
         const bestAsk = (clobAsk > 0 && clobAsk < 0.97) ? clobAsk : divImpliedPrice > 0 ? divImpliedPrice : clobAsk;
         if (bestAsk <= 0) return;
 
-        // Entry price gate — STRONG divergence gets the 85¢ override (same as main cycle)
+        // Entry price gate â€” STRONG divergence gets the 85Â¢ override (same as main cycle)
         const MAX_ENTRY_PRICE = 0.85;
         if (bestAsk > MAX_ENTRY_PRICE) {
-          botPrint("SKIP", `[DIV FAST] Price too high: ${(bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ — window closed`);
+          botPrint("SKIP", `[DIV FAST] Price too high: ${(bestAsk * 100).toFixed(1)}Â¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}Â¢ â€” window closed`);
           return;
         }
 
@@ -2058,7 +2448,7 @@ async function startServer() {
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
         if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
 
-        // Kelly sizing — use last known balance (updated by bot cycle, fresh within ~30s)
+        // Kelly sizing â€” use last known balance (updated by bot cycle, fresh within ~30s)
         const balance = lastKnownBalance ?? botSessionStartBalance ?? 0;
         if (balance <= 0) return;
 
@@ -2079,9 +2469,9 @@ async function startServer() {
           return;
         }
 
-        botPrint("TRADE", `⚡ DIVERGENCE FAST PATH ⚡ STRONG BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} (30s) → ${direction} | ask=${(bestAsk * 100).toFixed(0)}¢ | $${betAmount.toFixed(2)} USDC | Gemini skipped`);
+        botPrint("TRADE", `âš¡ DIVERGENCE FAST PATH âš¡ STRONG BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} (30s) â†’ ${direction} | ask=${(bestAsk * 100).toFixed(0)}Â¢ | $${betAmount.toFixed(2)} USDC | Gemini skipped`);
 
-        // Mark handled before async execute — prevents race with bot cycle
+        // Mark handled before async execute â€” prevents race with bot cycle
         divAssetSet.add(market.id);
         lastDivergenceFastTradeAt = now;
 
@@ -2112,9 +2502,9 @@ async function startServer() {
         });
 
         botSessionTradesCount++;
-        botPrint("OK", `⚡ FAST PATH EXECUTED ✓ | ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
+        botPrint("OK", `âš¡ FAST PATH EXECUTED âœ“ | ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
         void sendNotification(
-          `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(Gemini bypassed — STRONG divergence)`
+          `âš¡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "â–² UP" : "â–¼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}Â¢\nConf: ${confidence}% | Edge: ${estimatedEdge}Â¢\n(Gemini bypassed â€” STRONG divergence)`
         );
 
         const levels = recommendAutomationLevels(bestAsk);
@@ -2148,11 +2538,11 @@ async function startServer() {
           windowElapsedSeconds: now - nowWindowStart,
           asset: currentDivergenceAsset,
         });
-        botPrint("INFO", `Result tracker armed — checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
+        botPrint("INFO", `Result tracker armed â€” checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
 
-        // ── Correlated multi-asset entry ──────────────────────────────────────
+        // â”€â”€ Correlated multi-asset entry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // BTC STRONG divergence historically pulls ETH and SOL Polymarket prices
-        // in the same direction — they often lag BTC by 1-2 cycles. Enter the same
+        // in the same direction â€” they often lag BTC by 1-2 cycles. Enter the same
         // direction at reduced Kelly (70%) since the signal is BTC-derived, not
         // the asset's own independent divergence.
         const correlatedAssets = ENABLED_ASSETS.filter(a => a !== currentDivergenceAsset);
@@ -2164,7 +2554,7 @@ async function startServer() {
 
               const corrSet = botAnalyzedThisWindowByAsset.get(corrAsset)!;
               if (corrSet.has(corrMarket.id)) {
-                botPrint("SKIP", `[CORR-${corrAsset}] Already traded this window — skipping correlated entry`);
+                botPrint("SKIP", `[CORR-${corrAsset}] Already traded this window â€” skipping correlated entry`);
                 return;
               }
 
@@ -2183,7 +2573,7 @@ async function startServer() {
               const corrBestAsk = (corrClobAsk > 0 && corrClobAsk < 0.97) ? corrClobAsk : corrImplied > 0 ? corrImplied : corrClobAsk;
               if (corrBestAsk <= 0 || corrBestAsk > MAX_ENTRY_PRICE) return;
 
-              // Slightly lower confidence than main asset — signal is BTC-derived
+              // Slightly lower confidence than main asset â€” signal is BTC-derived
               const corrConf = 72;
               const corrEdge = parseFloat((corrConf / 100 - corrBestAsk).toFixed(2));
               if (corrConf < cfg.minConfidence || corrEdge < cfg.minEdge) return;
@@ -2193,7 +2583,7 @@ async function startServer() {
               const corrKelly = (corrP * corrB - (1 - corrP)) / corrB;
               if (corrKelly <= 0) return;
 
-              // 70% of normal dynamic Kelly — correlated signal, not independent divergence
+              // 70% of normal dynamic Kelly â€” correlated signal, not independent divergence
               const corrFraction = dynamicKellyFraction(corrConf) * 0.70;
               const corrRawBet = balance * corrKelly * corrFraction;
               const corrBetAmount = parseFloat(Math.min(corrRawBet, cfg.maxBetUsdc, spendable).toFixed(2));
@@ -2202,7 +2592,7 @@ async function startServer() {
                 return;
               }
 
-              botPrint("TRADE", `⚡ CORRELATED [${corrAsset}] BTC-driven ${direction} → ask=${(corrBestAsk * 100).toFixed(0)}¢ | $${corrBetAmount.toFixed(2)} USDC | conf=${corrConf}%`);
+              botPrint("TRADE", `âš¡ CORRELATED [${corrAsset}] BTC-driven ${direction} â†’ ask=${(corrBestAsk * 100).toFixed(0)}Â¢ | $${corrBetAmount.toFixed(2)} USDC | conf=${corrConf}%`);
               corrSet.add(corrMarket.id);
 
               const corrResult = await executePolymarketTrade({
@@ -2215,7 +2605,7 @@ async function startServer() {
               });
 
               botSessionTradesCount++;
-              botPrint("OK", `⚡ CORR [${corrAsset}] EXECUTED ✓ | ID: ${corrResult.orderID} | Status: ${corrResult.status}`);
+              botPrint("OK", `âš¡ CORR [${corrAsset}] EXECUTED âœ“ | ID: ${corrResult.orderID} | Status: ${corrResult.status}`);
 
               const corrLevels = recommendAutomationLevels(corrBestAsk);
               await savePositionAutomation({
@@ -2244,7 +2634,7 @@ async function startServer() {
                 windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
                 confidence: corrConf,
                 edge: corrEdge,
-                reasoning: `[CORRELATED] BTC STRONG divergence +$${snapshot.btcDelta.toFixed(0)} → ${corrAsset} same-direction entry`,
+                reasoning: `[CORRELATED] BTC STRONG divergence +$${snapshot.btcDelta.toFixed(0)} â†’ ${corrAsset} same-direction entry`,
                 windowElapsedSeconds: now - nowWindowStart,
                 asset: corrAsset,
               });
@@ -2276,14 +2666,14 @@ async function startServer() {
       const nowSeconds = Math.floor(Date.now() / 1000);
 
       for (const automation of armedAutomations) {
-        // ── Fix 1: time-based expiry instead of position-lookup guard ──────
+        // â”€â”€ Fix 1: time-based expiry instead of position-lookup guard â”€â”€â”€â”€â”€â”€
         // If the market window expired > 6 minutes ago, the position has
-        // already resolved on-chain — no point monitoring or trying to exit.
+        // already resolved on-chain â€” no point monitoring or trying to exit.
         if (automation.windowEnd && nowSeconds > automation.windowEnd + 360) {
           await savePositionAutomation({
             assetId: automation.assetId,
             armed: false,
-            status: "Market window expired — resolved on-chain",
+            status: "Market window expired â€” resolved on-chain",
             lastPrice: automation.lastPrice,
           });
           continue;
@@ -2292,8 +2682,8 @@ async function startServer() {
         try {
           const book = await client.getOrderBook(automation.assetId);
 
-          // ── Fix 2: 3-tier price estimation ─────────────────────────────
-          // Tier 1: best bid (real exit price — prefer this always)
+          // â”€â”€ Fix 2: 3-tier price estimation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          // Tier 1: best bid (real exit price â€” prefer this always)
           // Tier 2: mid-price when both sides exist
           // Tier 3: best ask alone as conservative proxy
           const bestBid  = Number(book?.bids?.[0]?.price || "0");
@@ -2307,10 +2697,10 @@ async function startServer() {
           } else if (bestAsk > 0) {
             currentPrice = bestAsk;                        // Tier 3: ask proxy
           } else {
-            // No liquidity at all — keep armed, try next tick
+            // No liquidity at all â€” keep armed, try next tick
             await savePositionAutomation({
               assetId: automation.assetId,
-              status: "No order book liquidity — retrying",
+              status: "No order book liquidity â€” retrying",
               lastPrice: automation.lastPrice ?? "",
             });
             continue;
@@ -2324,17 +2714,17 @@ async function startServer() {
           const stopLoss   = Number(automation.stopLoss   || "0");
           const entryPrice = Number(automation.averagePrice || "0");
 
-          // ── Near-expiry forced exit ──────────────────────────────────────────
-          // Binary markets collapse fast in the last minute — prices drop 20-30¢
+          // â”€â”€ Near-expiry forced exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          // Binary markets collapse fast in the last minute â€” prices drop 20-30Â¢
           // in a single tick as market makers pull bids near resolution.
-          // If ≤60s remain and the position is profitable, lock in the gain now.
+          // If â‰¤60s remain and the position is profitable, lock in the gain now.
           const secondsToExpiry = automation.windowEnd ? automation.windowEnd - nowSeconds : 9999;
           const isNearExpiry = secondsToExpiry > 0 && secondsToExpiry <= 60;
           const _isCriticalExpiry = secondsToExpiry > 0 && secondsToExpiry <= 30; void _isCriticalExpiry;
 
           // Determine if a trigger condition is met
-          // TP: use bestBid as the real exit price — only trigger when there's actual liquidity.
-          //     If no bid, fall back to mid. Either way execute immediately — never "wait for bid".
+          // TP: use bestBid as the real exit price â€” only trigger when there's actual liquidity.
+          //     If no bid, fall back to mid. Either way execute immediately â€” never "wait for bid".
           // SL/trailing/expiry: use currentPrice (mid) for detection, then execute at best available.
           const tpCheckPrice = bestBid > 0 ? bestBid : currentPrice;
           let triggerReason: string | null = null;
@@ -2342,25 +2732,25 @@ async function startServer() {
           if (!triggerReason && stopLoss > 0 && currentPrice <= stopLoss) triggerReason = "stop loss";
           if (!triggerReason && trailingStopPrice > 0 && currentPrice <= trailingStopPrice) triggerReason = "trailing stop";
 
-          // ── Profit lock: tighten trailing stop when 70%+ of the way to TP ──────
+          // â”€â”€ Profit lock: tighten trailing stop when 70%+ of the way to TP â”€â”€â”€â”€â”€â”€
           // Prevents giving back a large gain when price is near-TP then reverses.
-          // When unrealized gain >= 70% of (TP - entry), shrink trailing stop to 3¢.
+          // When unrealized gain >= 70% of (TP - entry), shrink trailing stop to 3Â¢.
           if (!triggerReason && takeProfit > 0 && entryPrice > 0 && trailingStopDistance > 0.03) {
             const tpDistance = takeProfit - entryPrice;
             const unrealizedGain = currentPrice - entryPrice;
             if (tpDistance > 0 && unrealizedGain >= tpDistance * 0.70) {
-              // Override trailing stop distance in MongoDB to 3¢ for this position
+              // Override trailing stop distance in MongoDB to 3Â¢ for this position
               await savePositionAutomation({
                 assetId: automation.assetId,
                 trailingStop: "0.03",
-                status: `Profit lock: ${(unrealizedGain * 100).toFixed(0)}¢ gain — trailing tightened to 3¢`,
+                status: `Profit lock: ${(unrealizedGain * 100).toFixed(0)}Â¢ gain â€” trailing tightened to 3Â¢`,
               });
-              botPrint("INFO", `[TP LOCK] Position at ${(currentPrice * 100).toFixed(0)}¢ — trailing tightened to 3¢ (${(unrealizedGain * 100).toFixed(0)}¢ gain locked)`);
+              botPrint("INFO", `[TP LOCK] Position at ${(currentPrice * 100).toFixed(0)}Â¢ â€” trailing tightened to 3Â¢ (${(unrealizedGain * 100).toFixed(0)}Â¢ gain locked)`);
             }
           }
 
-          // ── Spike capture: early large move — take it before it reverses ────────
-          // If within first 90s after entry the price has spiked +8¢, exit immediately.
+          // â”€â”€ Spike capture: early large move â€” take it before it reverses â”€â”€â”€â”€â”€â”€â”€â”€
+          // If within first 90s after entry the price has spiked +8Â¢, exit immediately.
           // These early spikes almost always mean-revert in 5-min binary markets.
           const entryTimestamp = automation.lastTriggeredAt
             ? Math.floor(new Date(automation.lastTriggeredAt).getTime() / 1000)
@@ -2369,19 +2759,19 @@ async function startServer() {
           if (!triggerReason && entryPrice > 0 && secondsSinceEntry <= 90) {
             const spikeGain = currentPrice - entryPrice;
             if (spikeGain >= 0.08) {
-              triggerReason = `spike capture (+${(spikeGain * 100).toFixed(0)}¢ in ${secondsSinceEntry}s — taking early gain)`;
+              triggerReason = `spike capture (+${(spikeGain * 100).toFixed(0)}Â¢ in ${secondsSinceEntry}s â€” taking early gain)`;
             }
           }
 
           // Near-expiry: exit any profitable position (prevents late-window reversal)
           if (!triggerReason && isNearExpiry && entryPrice > 0 && currentPrice > entryPrice * 1.005) {
-            triggerReason = `near-expiry exit (${secondsToExpiry}s remaining — locking ${(((currentPrice / entryPrice) - 1) * 100).toFixed(1)}% gain)`;
+            triggerReason = `near-expiry exit (${secondsToExpiry}s remaining â€” locking ${(((currentPrice / entryPrice) - 1) * 100).toFixed(1)}% gain)`;
           }
 
           if (triggerReason) {
-            void (triggerReason === "take profit"); // isTakeProfit — guard removed; all triggers execute immediately
-            // Execution price: best bid preferred. Fallback to ask * 0.97 (3¢ slippage) rather
-            // than waiting forever — a slightly worse price is better than no exit at all.
+            void (triggerReason === "take profit"); // isTakeProfit â€” guard removed; all triggers execute immediately
+            // Execution price: best bid preferred. Fallback to ask * 0.97 (3Â¢ slippage) rather
+            // than waiting forever â€” a slightly worse price is better than no exit at all.
             const executionPrice = bestBid > 0
               ? bestBid
               : (bestAsk > 0 ? bestAsk * 0.97 : null);
@@ -2409,13 +2799,13 @@ async function startServer() {
               trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
               lastPrice: executionPrice.toFixed(4),
               lastExitOrderId: exit.orderID,
-              status: `Exit submitted by ${triggerReason} @ ${(executionPrice * 100).toFixed(0)}¢`,
+              status: `Exit submitted by ${triggerReason} @ ${(executionPrice * 100).toFixed(0)}Â¢`,
               lastTriggeredAt: new Date(),
             });
             continue;
           }
 
-          // No trigger — update tracking state and keep armed
+          // No trigger â€” update tracking state and keep armed
           const expiryLabel = secondsToExpiry < 9999
             ? ` | Expiry: ${secondsToExpiry}s`
             : "";
@@ -2424,7 +2814,7 @@ async function startServer() {
             highestPrice: highestPrice.toFixed(4),
             trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
             lastPrice: currentPrice.toFixed(4),
-            status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢${expiryLabel}`,
+            status: `Monitoring â€” ${(currentPrice * 100).toFixed(0)}Â¢ | TP: ${(takeProfit * 100).toFixed(0)}Â¢ | SL: ${(stopLoss * 100).toFixed(0)}Â¢${expiryLabel}`,
           });
         } catch (error: any) {
           await savePositionAutomation({
@@ -2448,16 +2838,16 @@ async function startServer() {
 
   startPositionAutomationMonitor();
 
-  // ── Bot logging helper ────────────────────────────────────────────────────
+  // â”€â”€ Bot logging helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
   const botPrint = (level: "INFO" | "WARN" | "TRADE" | "OK" | "SKIP" | "ERR", msg: string) => {
     const icons: Record<string, string> = {
-      INFO:  "─",
-      WARN:  "⚠",
-      TRADE: "💰",
-      OK:    "✓",
-      SKIP:  "✗",
-      ERR:   "✖",
+      INFO:  "â”€",
+      WARN:  "âš ",
+      TRADE: "ðŸ’°",
+      OK:    "âœ“",
+      SKIP:  "âœ—",
+      ERR:   "âœ–",
     };
     const entry: RawLogEntry = { ts: ts(), level, msg };
     console.log(`[${entry.ts}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
@@ -2466,7 +2856,7 @@ async function startServer() {
     pushSSE("log", entry);
   };
 
-  // ── Win / Loss result checker ─────────────────────────────────────────────
+  // â”€â”€ Win / Loss result checker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const checkPendingResults = async () => {
     if (pendingResults.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
@@ -2480,7 +2870,7 @@ async function startServer() {
       if (now < pending.windowEnd + 120) continue; // wait 2 min after close
       const giveUp = now > pending.windowEnd + 1200; // give up after 20 min
 
-      // ── Step 1: Check OUR specific token's current price via CLOB ─────────
+      // â”€â”€ Step 1: Check OUR specific token's current price via CLOB â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // tokenId is exactly the token we bought (YES for UP, NO for DOWN)
       // After resolution: worth ~$1.00 if we won, ~$0.00 if we lost
       let ourTokenPrice: number | null = null;
@@ -2495,16 +2885,16 @@ async function startServer() {
           const bestBid = bids.length > 0 ? parseFloat(bids[0].price) : null;
           const bestAsk = asks.length > 0 ? parseFloat(asks[0].price) : null;
 
-          botPrint("INFO", `Result check [CLOB] tokenId=${tokenId.slice(0, 10)}… bid=${bestBid ?? "none"} ask=${bestAsk ?? "none"}`);
+          botPrint("INFO", `Result check [CLOB] tokenId=${tokenId.slice(0, 10)}â€¦ bid=${bestBid ?? "none"} ask=${bestAsk ?? "none"}`);
 
           if (bestBid !== null && bestBid >= 0.90) {
-            ourTokenPrice = bestBid;          // token worth ~$1 → WIN
+            ourTokenPrice = bestBid;          // token worth ~$1 â†’ WIN
             resolvedSource = `CLOB bid=${bestBid.toFixed(3)}`;
           } else if (bestBid !== null && bestBid <= 0.10) {
-            ourTokenPrice = bestBid;          // token worth ~$0 → LOSS
+            ourTokenPrice = bestBid;          // token worth ~$0 â†’ LOSS
             resolvedSource = `CLOB bid=${bestBid.toFixed(3)}`;
           } else if (bestBid === null && bestAsk === null) {
-            // No order book at all — market likely settled, check prices-history
+            // No order book at all â€” market likely settled, check prices-history
             try {
               const hist = await axios.get("https://clob.polymarket.com/prices-history", {
                 params: { market: tokenId, interval: "1m", fidelity: 1 },
@@ -2523,9 +2913,9 @@ async function startServer() {
             } catch { /* non-fatal */ }
           }
         }
-      } catch { /* CLOB unavailable — fall through to gamma */ }
+      } catch { /* CLOB unavailable â€” fall through to gamma */ }
 
-      // ── Step 2: Fallback — Gamma API using correct outcome index ──────────
+      // â”€â”€ Step 2: Fallback â€” Gamma API using correct outcome index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       if (ourTokenPrice === null) {
         try {
           const eventRes = await axios.get(
@@ -2545,7 +2935,7 @@ async function startServer() {
               // Map to our token: UP bought YES (index 0), DOWN bought NO (index 1)
               ourTokenPrice = (pending.direction === "UP" ? yesWon : !yesWon) ? 1.0 : 0.0;
               resolvedSource = `gamma winner="${mkt.winner}"`;
-              botPrint("INFO", `Result check [gamma winner] ${mkt.winner} → ourToken=${ourTokenPrice}`);
+              botPrint("INFO", `Result check [gamma winner] ${mkt.winner} â†’ ourToken=${ourTokenPrice}`);
             } else {
               // Use outcomePrices at OUR outcome index, not always index 0
               const prices = parseLocal(mkt.outcomePrices);
@@ -2561,20 +2951,20 @@ async function startServer() {
         } catch { /* non-fatal */ }
       }
 
-      // ── Still can't determine — wait or give up ────────────────────────────
+      // â”€â”€ Still can't determine â€” wait or give up â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       if (ourTokenPrice === null) {
         if (giveUp) {
-          botPrint("WARN", `Result UNKNOWN after 20min for "${pending.market.slice(0, 40)}" — removing tracker`);
+          botPrint("WARN", `Result UNKNOWN after 20min for "${pending.market.slice(0, 40)}" â€” removing tracker`);
           pendingResults.delete(tokenId);
         } else {
           const waitedMin = ((now - pending.windowEnd) / 60).toFixed(1);
-          botPrint("INFO", `Result pending (${waitedMin}min elapsed) — retrying next cycle`);
+          botPrint("INFO", `Result pending (${waitedMin}min elapsed) â€” retrying next cycle`);
         }
         continue;
       }
 
-      // ── Determine WIN / LOSS ───────────────────────────────────────────────
-      // PnL: shares × $1 payout minus cost (WIN), or full bet lost (LOSS)
+      // â”€â”€ Determine WIN / LOSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // PnL: shares Ã— $1 payout minus cost (WIN), or full bet lost (LOSS)
       // won_final = pnl > 0: even $0.01 profit = WIN; no profit = LOSS
       const shares = pending.entryPrice > 0 ? pending.betAmount / pending.entryPrice : 0;
       const grossPayout = ourTokenPrice >= 0.90 ? shares * 1.0 : shares * ourTokenPrice;
@@ -2582,10 +2972,10 @@ async function startServer() {
       const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
       const won_final = pnl > 0;
 
-      botPrint("INFO", `Result resolved via [${resolvedSource}] → ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
+      botPrint("INFO", `Result resolved via [${resolvedSource}] â†’ ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
 
       if (won_final) {
-        // ── WIN: relax adaptive threshold (per-asset) ──────────────────────
+        // â”€â”€ WIN: relax adaptive threshold (per-asset) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         const pendingAsset = pending.asset ?? "BTC";
         const cWins  = (consecutiveWinsByAsset.get(pendingAsset)  ?? 0) + 1;
         const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
@@ -2596,9 +2986,9 @@ async function startServer() {
           const newBoost = Math.max(cBoost - 3, 0);
           adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
           adaptiveConfidenceBoost = newBoost;
-          botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
+          botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W â€” threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
         }
-        botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        botPrint("OK", `â”â”â” ðŸ† WIN  â”â”â” ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}Â¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         const winLesson = generateWinLesson(pending);
         winMemory.unshift({
           timestamp: new Date().toISOString(),
@@ -2642,7 +3032,7 @@ async function startServer() {
           orderId: pending.orderId,
         });
       } else {
-        // ── LOSS: record memory, tighten adaptive threshold (per-asset) ────
+        // â”€â”€ LOSS: record memory, tighten adaptive threshold (per-asset) â”€â”€â”€â”€
         const pendingAsset = pending.asset ?? "BTC";
         const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
         consecutiveLossesByAsset.set(pendingAsset, cLosses);
@@ -2674,11 +3064,11 @@ async function startServer() {
           const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
           adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
           adaptiveConfidenceBoost = newBoost;
-          botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
+          botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L â€” threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
         } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
-          botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
+          botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled â€” streak=${cLosses}L recorded, threshold unchanged`);
         }
-        botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        botPrint("WARN", `â”â”â” âœ— LOSS â”â”â” ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}Â¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         botPrint("INFO", `Lesson recorded: ${lesson}`);
         saveLearning();
         saveTradeLog({
@@ -2712,7 +3102,7 @@ async function startServer() {
         confidence: 0,
         edge: 0,
         riskLevel: "LOW",
-        reasoning: `Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
+        reasoning: `Market resolved ${won_final ? "IN YOUR FAVOR âœ“" : "AGAINST YOU âœ—"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}Â¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
         tradeExecuted: false,
         tradeAmount: pending.betAmount,
         tradePrice: pending.entryPrice,
@@ -2724,7 +3114,267 @@ async function startServer() {
     }
   };
 
-  // ── Bot cycle ──────────────────────────────────────────────────────────────
+  const runPriceLagScalperCycle = async (params: {
+    currentWindowStart: number;
+    windowElapsedSeconds: number;
+    windowRemaining: number;
+    mm: string;
+    ss: string;
+  }) => {
+    const { currentWindowStart, windowElapsedSeconds, windowRemaining, mm, ss } = params;
+    const lagMarkets = await discoverActiveCryptoLagMarkets(currentWindowStart);
+    if (lagMarkets.length === 0) {
+      botPrint("WARN", `[LAG] No active crypto 5m markets found for ${currentWindowStart}`);
+      return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const cfg = getActiveConfig();
+    botPrint("INFO", `[LAG] Strategy=PRICE_LAG_SCALPER | scanning ${lagMarkets.length} markets | ${mm}:${ss} left`);
+
+    for (const candidate of lagMarkets) {
+      const market = candidate.market;
+      const assetKey = candidate.assetSymbol as TradingAsset;
+
+      if (botTradedThisWindowMarketIds.has(market.id)) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Already traded this window: ${market.question?.slice(0, 48)}`);
+        continue;
+      }
+
+      const assetPriceData = await getDynamicAssetPrice(candidate.assetSymbol);
+      const assetNow = Number(assetPriceData?.price || "0");
+      if (!(assetNow > 0)) {
+        botPrint("WARN", `[${candidate.assetSymbol}] No external spot price available - skipping lag scan`);
+        continue;
+      }
+
+      const yesNow = Number(candidate.yesPrice || 0);
+      const noNow = Number(candidate.noPrice || 0);
+      if (!(yesNow > 0 && noNow > 0)) continue;
+
+      pushLagSample(lagAssetPriceBuffers, candidate.assetSymbol, assetNow, now);
+      pushLagSample(lagYesPriceBuffers, market.id, yesNow, now);
+      pushLagSample(lagNoPriceBuffers, market.id, noNow, now);
+
+      const asset30Ref = findLagReference(lagAssetPriceBuffers.get(candidate.assetSymbol), now - 30);
+      const asset60Ref = findLagReference(lagAssetPriceBuffers.get(candidate.assetSymbol), now - 60);
+      const yes30Ref = findLagReference(lagYesPriceBuffers.get(market.id), now - 30);
+      const no30Ref = findLagReference(lagNoPriceBuffers.get(market.id), now - 30);
+
+      if (!asset30Ref || !asset60Ref || !yes30Ref || !no30Ref) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Building lag buffers for ${market.question?.slice(0, 42)}...`);
+        continue;
+      }
+
+      const assetBoost = adaptiveConfidenceByAsset.get(assetKey) ?? 0;
+      const signal = computePriceLagSignal({
+        assetSymbol: candidate.assetSymbol,
+        assetNow,
+        assetRef30: asset30Ref.price,
+        assetRef60: asset60Ref.price,
+        yesNow,
+        yesRef30: yes30Ref.price,
+        noNow,
+        noRef30: no30Ref.price,
+      });
+
+      const effectiveMinConf = cfg.minConfidence + assetBoost;
+      currentEntrySnapshot = {
+        market: market.question || market.id,
+        windowStart: currentWindowStart,
+        yesPrice: yesNow,
+        noPrice: noNow,
+        direction: signal.decision === "TRADE" ? signal.direction : null,
+        confidence: signal.confidence,
+        edge: signal.estimatedEdge,
+        riskLevel: signal.riskLevel,
+        estimatedBet: botFixedTradeUsdc,
+        btcPrice: assetNow,
+        asset: assetKey,
+        divergence: {
+          direction: signal.direction,
+          strength: `LAG ${signal.lagGapCents.toFixed(1)}c`,
+          btcDelta30s: signal.assetMove30Pct,
+          yesDelta30s: signal.direction === "UP" ? signal.yesDelta30Cents : signal.noDelta30Cents,
+        },
+        fastLoopMomentum: null,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (signal.decision !== "TRADE") {
+        botPrint("SKIP", `[${candidate.assetSymbol}] ${signal.reasoning}`);
+        continue;
+      }
+
+      if (signal.confidence < effectiveMinConf || signal.riskLevel === "HIGH") {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Lag signal rejected | conf ${signal.confidence}% < ${effectiveMinConf}% or risk=${signal.riskLevel}`);
+        continue;
+      }
+
+      const targetOutcomeIndex = signal.direction === "UP" ? 0 : 1;
+      const targetTokenId = market.clobTokenIds?.[targetOutcomeIndex];
+      const yesTokenId = market.clobTokenIds?.[0];
+      if (!targetTokenId || !yesTokenId) continue;
+
+      const [yesBook, targetBook] = await Promise.all([
+        axios.get(`https://clob.polymarket.com/book?token_id=${yesTokenId}`, { timeout: 4000 }).then((r) => r.data).catch(() => null),
+        targetTokenId === yesTokenId
+          ? axios.get(`https://clob.polymarket.com/book?token_id=${yesTokenId}`, { timeout: 4000 }).then((r) => r.data).catch(() => null)
+          : axios.get(`https://clob.polymarket.com/book?token_id=${targetTokenId}`, { timeout: 4000 }).then((r) => r.data).catch(() => null),
+      ]);
+
+      const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
+      const yesBidSize = sumSize(yesBook?.bids || []);
+      const yesAskSize = sumSize(yesBook?.asks || []);
+      const yesTotal = yesBidSize + yesAskSize;
+      const yesSignal =
+        yesTotal <= 0
+          ? "UNKNOWN"
+          : yesBidSize / yesTotal > 0.60
+            ? "BUY_PRESSURE"
+            : yesBidSize / yesTotal < 0.40
+              ? "SELL_PRESSURE"
+              : "NEUTRAL";
+
+      const pressureOpposes =
+        (signal.direction === "UP" && yesSignal === "SELL_PRESSURE") ||
+        (signal.direction === "DOWN" && yesSignal === "BUY_PRESSURE") ||
+        yesSignal === "UNKNOWN";
+      if (pressureOpposes) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Pressure filter blocked lag trade | direction=${signal.direction} yesBook=${yesSignal}`);
+        continue;
+      }
+
+      const bestBid = Number(targetBook?.bids?.[0]?.price || "0");
+      const rawAsk = Number(targetBook?.asks?.[0]?.price || "0");
+      const impliedEntryPrice = Number(market.outcomePrices?.[targetOutcomeIndex] || "0");
+      const bestAsk = rawAsk > 0 && rawAsk < 0.97 ? rawAsk : impliedEntryPrice > 0 ? impliedEntryPrice : rawAsk;
+      if (!(bestAsk > 0)) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] No executable entry price`);
+        continue;
+      }
+
+      if (bestAsk > signal.maxEntryPrice) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Entry too expensive ${(bestAsk * 100).toFixed(1)}c > ${(signal.maxEntryPrice * 100).toFixed(1)}c`);
+        continue;
+      }
+      if (bestAsk >= ANALYSIS_COIN_FLIP_MIN_PRICE && bestAsk <= ANALYSIS_COIN_FLIP_MAX_PRICE) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Coin-flip zone ${(bestAsk * 100).toFixed(1)}c - lag scalp skipped`);
+        continue;
+      }
+
+      const logEntry: BotLogEntry = {
+        timestamp: new Date().toISOString(),
+        market: market.question || market.id,
+        decision: "TRADE",
+        direction: signal.direction,
+        confidence: signal.confidence,
+        edge: signal.estimatedEdge,
+        riskLevel: signal.riskLevel,
+        reasoning: `[PRICE_LAG] ${signal.reasoning}`,
+        tradeExecuted: false,
+      };
+
+      const client = await getClobClient();
+      if (!client) {
+        logEntry.error = "CLOB client not ready - trade skipped.";
+        botPrint("ERR", "CLOB client not initialized. Check POLYGON_PRIVATE_KEY.");
+        botLog.unshift(logEntry);
+        if (botLog.length > 100) botLog.pop();
+        continue;
+      }
+
+      if (botSessionStartBalance === null) {
+        try {
+          const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+          botSessionStartBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+          botPrint("OK", `Session initialized. Starting balance: $${botSessionStartBalance.toFixed(2)} USDC`);
+        } catch {
+          // non-fatal
+        }
+      }
+
+      let currentBalance = botSessionStartBalance ?? 0;
+      try {
+        const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+        lastKnownBalance = currentBalance;
+      } catch {
+        botPrint("WARN", `Balance fetch failed - using last known: $${currentBalance.toFixed(2)} USDC`);
+      }
+
+      const reserve = Math.min(1.0, currentBalance * 0.10);
+      const spendable = Math.max(0, currentBalance - reserve);
+      const betAmount = parseFloat(botFixedTradeUsdc.toFixed(2));
+      if (spendable < betAmount) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Insufficient spendable balance for fixed lag trade`);
+        continue;
+      }
+
+      botPrint("TRADE", `[PRICE_LAG] ${candidate.assetSymbol} ${signal.direction} | conf=${signal.confidence}% | lag=${signal.lagGapCents.toFixed(2)}c | ask=${(bestAsk * 100).toFixed(1)}c | bet=$${betAmount.toFixed(2)}`);
+
+      try {
+        const tradeResult = await executePolymarketTrade({
+          tokenID: targetTokenId,
+          amount: betAmount,
+          side: Side.BUY,
+          price: bestAsk,
+          executionMode: "AGGRESSIVE",
+          amountMode: "SPEND",
+        });
+
+        const levels = recommendLagScalpLevels(bestAsk);
+        await savePositionAutomation({
+          assetId: targetTokenId,
+          market: market.question || market.id,
+          outcome: market.outcomes?.[targetOutcomeIndex] || signal.direction,
+          averagePrice: bestAsk.toFixed(4),
+          size: tradeResult.orderSize.toFixed(6),
+          takeProfit: levels.takeProfit,
+          stopLoss: levels.stopLoss,
+          trailingStop: levels.trailingStop,
+          windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
+          armed: true,
+        });
+
+        botTradedThisWindowMarketIds.add(market.id);
+        botSessionTradesCount++;
+        logEntry.tradeExecuted = true;
+        logEntry.tradeAmount = betAmount;
+        logEntry.tradePrice = bestAsk;
+        logEntry.orderId = tradeResult.orderID;
+        botPrint("OK", `[PRICE_LAG] Executed ${candidate.assetSymbol} ${signal.direction} | ID: ${tradeResult.orderID} | TP ${levels.takeProfit} SL ${levels.stopLoss}`);
+
+        pendingResults.set(targetTokenId, {
+          eventSlug: candidate.slug,
+          marketId: market.id,
+          market: market.question || market.id,
+          tokenId: targetTokenId,
+          direction: signal.direction,
+          outcome: market.outcomes?.[targetOutcomeIndex] || signal.direction,
+          entryPrice: bestAsk,
+          betAmount,
+          orderId: tradeResult.orderID,
+          windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
+          confidence: signal.confidence,
+          edge: signal.estimatedEdge,
+          reasoning: `[PRICE_LAG] ${signal.reasoning}`,
+          windowElapsedSeconds,
+          imbalanceSignal: yesSignal,
+          asset: assetKey,
+        });
+      } catch (tradeErr: any) {
+        logEntry.error = tradeErr?.message || String(tradeErr);
+        botPrint("ERR", `[PRICE_LAG] Trade execution failed: ${logEntry.error}`);
+      }
+
+      botLog.unshift(logEntry);
+      if (botLog.length > 100) botLog.pop();
+      pushSSE("cycle", { ts: new Date().toISOString() });
+    }
+  };
+
+  // â”€â”€ Bot cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const runBotCycle = async () => {
     if (botRunning || !botEnabled) return;
 
@@ -2743,13 +3393,17 @@ async function startServer() {
         for (const s of botAnalyzedThisWindowByAsset.values()) s.clear();
         currentWindowAiCache = null;
         botLastWindowStart = currentWindowStart;
-        // Clear YES ring buffer — old window's tokens are no longer valid
+        botTradedThisWindowMarketIds.clear();
+        lagAssetPriceBuffers.clear();
+        lagYesPriceBuffers.clear();
+        lagNoPriceBuffers.clear();
+        // Clear YES ring buffer â€” old window's tokens are no longer valid
         yesRingBuffer.length = 0;
         currentWindowYesTokenId = null;
         currentWindowNoTokenId  = null;
         currentWindowYesTokenIdByAsset.clear();
         currentWindowNoTokenIdByAsset.clear();
-        botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
+        botPrint("INFO", `â”â”â”â” NEW WINDOW â”â”â”â” ${new Date(currentWindowStart * 1000).toLocaleTimeString()} â€” ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
         // Auto-calibrate FastLoop signal quality at start of each new window
         if (autoCalibrateEnabled) void runAutoCalibration();
       }
@@ -2758,12 +3412,21 @@ async function startServer() {
       const cfg = getActiveConfig();
       if (windowElapsedSeconds < cfg.entryWindowStart || windowElapsedSeconds > cfg.entryWindowEnd) {
         if (windowElapsedSeconds > cfg.entryWindowEnd) {
-          botPrint("SKIP", `Window closing (${mm}:${ss} left) — waiting for next window`);
+          botPrint("SKIP", `Window closing (${mm}:${ss} left) â€” waiting for next window`);
         } else {
-          botPrint("SKIP", `Window too early (${windowElapsedSeconds}s) — ${mm}:${ss} remaining. Waiting.`);
+          botPrint("SKIP", `Window too early (${windowElapsedSeconds}s) â€” ${mm}:${ss} remaining. Waiting.`);
         }
         return;
       }
+
+      await runPriceLagScalperCycle({
+        currentWindowStart,
+        windowElapsedSeconds,
+        windowRemaining,
+        mm,
+        ss,
+      });
+      return;
 
       const parseArr = (val: any): any[] => {
         if (Array.isArray(val)) return val;
@@ -2771,7 +3434,7 @@ async function startServer() {
         return [];
       };
 
-      // ── Outer loop: iterate over each enabled asset (BTC, ETH, SOL) ──────
+      // â”€â”€ Outer loop: iterate over each enabled asset (BTC, ETH, SOL) â”€â”€â”€â”€â”€â”€
       for (const currentAsset of ENABLED_ASSETS) {
         const assetCfg = ASSET_CONFIG[currentAsset];
         const analyzedThisWindow = botAnalyzedThisWindowByAsset.get(currentAsset)!;
@@ -2893,9 +3556,9 @@ async function startServer() {
                 const noMap = new Map(noData.map((d) => [d.t, d.p]));
                 marketHistory = yesData.map((d) => ({ t: d.t, yes: d.p, no: noMap.get(d.t) ?? 1 - d.p }));
                 const latestYes = marketHistory[marketHistory.length - 1]?.yes;
-                botPrint("OK", `Market history: ${marketHistory.length} points | Latest YES: ${latestYes !== undefined ? (latestYes * 100).toFixed(1) + "¢" : "?"}`);
+                botPrint("OK", `Market history: ${marketHistory.length} points | Latest YES: ${latestYes !== undefined ? (latestYes * 100).toFixed(1) + "Â¢" : "?"}`);
               } catch {
-                botPrint("WARN", "Market price history unavailable — velocity signal disabled");
+                botPrint("WARN", "Market price history unavailable â€” velocity signal disabled");
               }
             }
           }
@@ -2908,7 +3571,7 @@ async function startServer() {
             botPrint("INFO", `Threshold: ${effectiveMinConf}%${assetBoost > 0 ? ` (+${assetBoost}% [${currentAsset}] loss streak)` : ""}${calDelta !== 0 ? ` (${calDelta > 0 ? "+" : ""}${calDelta}% calibrator)` : ""}`);
           }
 
-          // ── Fast Loop Momentum (Simmer-style CEX signal) ──────────────
+          // â”€â”€ Fast Loop Momentum (Simmer-style CEX signal) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           const fastMom = btcHistoryResult?.history?.length
             ? computeFastLoopMomentum(btcHistoryResult.history)
             : null;
@@ -2921,7 +3584,7 @@ async function startServer() {
             if (momentumHistory.length > MOMENTUM_HISTORY_MAX) momentumHistory.shift();
           }
 
-          // ── Read divergence state for this asset (fresh within 30s) ──────
+          // â”€â”€ Read divergence state for this asset (fresh within 30s) â”€â”€â”€â”€â”€â”€
           const divNow = Math.floor(Date.now() / 1000);
           const assetDivState = divergenceStateByAsset.get(currentAsset) ?? null;
           const div = (assetDivState && divNow - assetDivState.updatedAt < 30)
@@ -2929,34 +3592,34 @@ async function startServer() {
 
           if (div && div.strength !== "NONE") {
             botPrint("INFO",
-              `Divergence: BTC ${div.btcDelta30s >= 0 ? "+" : ""}$${div.btcDelta30s.toFixed(0)} (30s) | YES ${div.yesDelta30s >= 0 ? "+" : ""}${div.yesDelta30s.toFixed(2)}¢ | direction=${div.direction} strength=${div.strength} score=${div.divergence.toFixed(2)}`
+              `Divergence: BTC ${div.btcDelta30s >= 0 ? "+" : ""}$${div.btcDelta30s.toFixed(0)} (30s) | YES ${div.yesDelta30s >= 0 ? "+" : ""}${div.yesDelta30s.toFixed(2)}Â¢ | direction=${div.direction} strength=${div.strength} score=${div.divergence.toFixed(2)}`
             );
           }
 
-          // ── Early window coin-flip guard ──────────────────────────────────
+          // â”€â”€ Early window coin-flip guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           // Block trade in first 60s if there's no divergence and BTC is flat.
           // At this point FastLoop hasn't built 5 fresh candles and any cached AI
-          // rec is from the previous window — no real edge exists.
+          // rec is from the previous window â€” no real edge exists.
           if (windowElapsedSeconds < 60) {
             const btcFlat = !div || (div.strength === "NONE" && Math.abs(div.btcDelta30s) < 5);
             const noDivergence = !div || div.strength === "NONE";
             if (noDivergence && btcFlat) {
-              botPrint("SKIP", `Early window coin-flip guard: elapsed=${windowElapsedSeconds}s, no divergence, BTC flat — waiting for signal`);
+              botPrint("SKIP", `Early window coin-flip guard: elapsed=${windowElapsedSeconds}s, no divergence, BTC flat â€” waiting for signal`);
               analyzedThisWindow.delete(market.id); // allow re-check once past 60s or when signal appears
               continue;
             }
           }
 
-          // ── FastLoop pre-filter: skip AI when no momentum and no divergence ──
+          // â”€â”€ FastLoop pre-filter: skip AI when no momentum and no divergence â”€â”€
           const calMinStrength = (autoCalibrateEnabled && calibrationState) ? calibrationState.fastLoopMinStrength : "MODERATE";
           const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK"
             || (calMinStrength === "STRONG" && fastMom.strength !== "STRONG");
           if (fastMomWeak && (!div || div.strength === "NONE")) {
-            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=${calMinStrength}${autoCalibrateEnabled ? " calibrated" : ""}) + no divergence — skipping AI`);
+            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=${calMinStrength}${autoCalibrateEnabled ? " calibrated" : ""}) + no divergence â€” skipping AI`);
             continue;
           }
 
-          // ── FAST PATH: bypass Gemini when signals are overwhelmingly clear ────
+          // â”€â”€ FAST PATH: bypass Gemini when signals are overwhelmingly clear â”€â”€â”€â”€
           // Conditions (ALL must be true):
           //   1. FastLoop STRONG and directional
           //   2. Multi-TF alignment 4/5 or 5/5 in same direction
@@ -3030,15 +3693,15 @@ async function startServer() {
               dataMode: "FULL_DATA" as const,
               reversalProbability: alignmentScore === 5 ? 20 : 30,
               oppositePressureProbability: 25,
-              reversalReasoning: "Fast path — strong multi-signal consensus",
+              reversalReasoning: "Fast path â€” strong multi-signal consensus",
             };
-            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢ | Gemini skipped`);
+            botPrint("TRADE", `âš¡ FAST PATH âš¡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}Â¢ | Gemini skipped`);
             currentWindowAiCache = { windowStart: currentWindowStart, marketId: market.id, asset: currentAsset, rec };
 
-          // ── NORMAL PATH: use cached or fresh Gemini ────────────────────────
+          // â”€â”€ NORMAL PATH: use cached or fresh Gemini â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           } else if (currentWindowAiCache?.windowStart === currentWindowStart && currentWindowAiCache?.marketId === market.id && currentWindowAiCache?.asset === currentAsset) {
             rec = currentWindowAiCache.rec;
-            botPrint("OK", `Reusing AI (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% — only checking price now`);
+            botPrint("OK", `Reusing AI (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "â–²" : "â–¼") : "â€”"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% â€” only checking price now`);
           } else {
             botPrint("INFO", "Calling Gemini AI for analysis...");
             rec = await analyzeMarket(
@@ -3060,51 +3723,51 @@ async function startServer() {
             currentWindowAiCache = { windowStart: currentWindowStart, marketId: market.id, asset: currentAsset, rec };
           }
 
-          // ── Apply divergence overrides AFTER AI decision ────────────────
+          // â”€â”€ Apply divergence overrides AFTER AI decision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
             if (div.strength === "STRONG" && rec.decision !== "TRADE") {
-              // Force trade only if enough time remains — flash moves revert quickly
+              // Force trade only if enough time remains â€” flash moves revert quickly
               if (windowRemaining < 120) {
                 botPrint("SKIP",
-                  `DIVERGENCE OVERRIDE skipped — only ${windowRemaining}s remaining (min 120s). Flash move likely to revert.`
+                  `DIVERGENCE OVERRIDE skipped â€” only ${windowRemaining}s remaining (min 120s). Flash move likely to revert.`
                 );
               } else {
-              // Force trade in divergence direction — market is clearly lagging BTC
+              // Force trade in divergence direction â€” market is clearly lagging BTC
               botPrint("TRADE",
-                `DIVERGENCE OVERRIDE ✦ BTC +$${Math.abs(div.btcDelta30s).toFixed(0)} in 30s, YES only ${div.yesDelta30s.toFixed(2)}¢ — forcing ${div.direction} trade`
+                `DIVERGENCE OVERRIDE âœ¦ BTC +$${Math.abs(div.btcDelta30s).toFixed(0)} in 30s, YES only ${div.yesDelta30s.toFixed(2)}Â¢ â€” forcing ${div.direction} trade`
               );
               rec = { ...rec, decision: "TRADE", direction: div.direction, confidence: Math.max(rec.confidence, 72), riskLevel: "MEDIUM" };
               }
             } else if (div.strength === "MODERATE" && rec.decision === "TRADE" && rec.direction === div.direction) {
-              // Same direction — boost confidence
+              // Same direction â€” boost confidence
               const boosted = Math.min(rec.confidence + 10, 95);
-              botPrint("OK", `Divergence CONFIRMS AI direction (${div.direction}) — confidence boosted ${rec.confidence}% → ${boosted}%`);
+              botPrint("OK", `Divergence CONFIRMS AI direction (${div.direction}) â€” confidence boosted ${rec.confidence}% â†’ ${boosted}%`);
               rec = { ...rec, confidence: boosted };
             } else if (div.strength === "STRONG" && rec.decision === "TRADE" && rec.direction !== div.direction) {
-              // STRONG conflict — structural divergence wins, block the AI trade
+              // STRONG conflict â€” structural divergence wins, block the AI trade
               botPrint("WARN",
-                `DIVERGENCE CONFLICT ✦ AI says ${rec.direction} but BTC divergence says ${div.direction} (STRONG) — trade blocked`
+                `DIVERGENCE CONFLICT âœ¦ AI says ${rec.direction} but BTC divergence says ${div.direction} (STRONG) â€” trade blocked`
               );
               rec = { ...rec, decision: "NO_TRADE", reasoning: rec.reasoning + ` | BLOCKED: strong divergence conflict (BTC ${div.direction} vs AI ${rec.direction})` };
             } else if (div.strength === "MODERATE" && rec.decision === "TRADE" && rec.direction !== div.direction) {
-              // MODERATE conflict — penalise confidence but don't block; data windows differ
+              // MODERATE conflict â€” penalise confidence but don't block; data windows differ
               const penalised = Math.max(rec.confidence - 15, 50);
               botPrint("WARN",
-                `DIVERGENCE FRICTION ✦ AI says ${rec.direction} but divergence says ${div.direction} (MODERATE) — confidence penalised ${rec.confidence}% → ${penalised}%`
+                `DIVERGENCE FRICTION âœ¦ AI says ${rec.direction} but divergence says ${div.direction} (MODERATE) â€” confidence penalised ${rec.confidence}% â†’ ${penalised}%`
               );
               rec = { ...rec, confidence: penalised, reasoning: rec.reasoning + ` | Confidence penalised: moderate divergence friction (BTC ${div.direction})` };
             }
           }
 
           // Log AI result
-          const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
+          const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "â–²" : "â–¼") : "â€”";
           botPrint(
             rec.decision === "TRADE" ? "INFO" : "SKIP",
-            `AI Result: ${decisionIcon} ${rec.decision} ${rec.direction} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}¢ | risk=${rec.riskLevel}`
+            `AI Result: ${decisionIcon} ${rec.decision} ${rec.direction} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}Â¢ | risk=${rec.riskLevel}`
           );
           botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
 
-          // ── Update entry snapshot for dashboard widget ──────────────────
+          // â”€â”€ Update entry snapshot for dashboard widget â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           {
             const outcomeIdx = rec.direction === "DOWN" ? 1 : 0;
             const oppIdx     = outcomeIdx === 0 ? 1 : 0;
@@ -3149,19 +3812,40 @@ async function startServer() {
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
             if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
-            if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}¢ < ${cfg.minEdge}¢`);
+            if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}Â¢ < ${cfg.minEdge}Â¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")}`);
           }
 
-          // ── Order book pressure alignment filter ──────────────────────────────
+          if (qualifies && btcIndicatorsData?.signalScore === 0) {
+            botPrint("SKIP", "Signal score filter: score=0 â€” no technical edge. Waiting for stronger setup.");
+            analyzedThisWindow.delete(market.id);
+            pushSSE("cycle", { ts: new Date().toISOString() });
+            continue;
+          }
+
+          if (
+            qualifies &&
+            (windowElapsedSeconds < ANALYSIS_MIN_ENTRY_WINDOW_SECONDS ||
+              windowElapsedSeconds > ANALYSIS_MAX_ENTRY_WINDOW_SECONDS)
+          ) {
+            botPrint(
+              "SKIP",
+              `Timing filter: elapsed=${windowElapsedSeconds}s â€” only trading in ${ANALYSIS_MIN_ENTRY_WINDOW_SECONDS}-${ANALYSIS_MAX_ENTRY_WINDOW_SECONDS}s window`
+            );
+            analyzedThisWindow.delete(market.id);
+            pushSSE("cycle", { ts: new Date().toISOString() });
+            continue;
+          }
+
+          // â”€â”€ Order book pressure alignment filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           // Data from 23 live trades shows:
-          //   BUY_PRESSURE  → 67% WR (+$8.84)   ← trade with
-          //   NEUTRAL       → 40% WR (-$1.55)   ← trade with (marginal edge)
-          //   SELL_PRESSURE → 20% WR (-$7.64)   ← BLOCK
+          //   BUY_PRESSURE  â†’ 67% WR (+$8.84)   â† trade with
+          //   NEUTRAL       â†’ 40% WR (-$1.55)   â† trade with (marginal edge)
+          //   SELL_PRESSURE â†’ 20% WR (-$7.64)   â† BLOCK
           // Rule: YES order book pressure must not oppose the trade direction.
-          //   UP   trade → block if YES book shows SELL_PRESSURE (crowd selling YES)
-          //   DOWN trade → block if YES book shows BUY_PRESSURE  (crowd buying YES)
+          //   UP   trade â†’ block if YES book shows SELL_PRESSURE (crowd selling YES)
+          //   DOWN trade â†’ block if YES book shows BUY_PRESSURE  (crowd buying YES)
           if (qualifies) {
             const tokenIds: string[] = market.clobTokenIds || [];
             const yesSignal = orderBooks[tokenIds[0]]?.imbalanceSignal ?? "UNKNOWN";
@@ -3171,12 +3855,12 @@ async function startServer() {
               yesSignal === "UNKNOWN"; // no order book data = blind entry (hist WR 17%)
 
             if (pressureOpposesDirection) {
-              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/BUY_PRESSURE/UNKNOWN) | re-check next cycle`);
+              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} â€” blocked (SELL_PRESSURE/BUY_PRESSURE/UNKNOWN) | re-check next cycle`);
               analyzedThisWindow.delete(market.id); // re-check each cycle in case pressure shifts
               pushSSE("cycle", { ts: new Date().toISOString() });
               continue;
             }
-            botPrint("INFO", `Pressure check: direction=${rec.direction} | YES book=${yesSignal} ✓`);
+            botPrint("INFO", `Pressure check: direction=${rec.direction} | YES book=${yesSignal} âœ“`);
           }
 
           const logEntry: BotLogEntry = {
@@ -3192,10 +3876,10 @@ async function startServer() {
           };
 
           if (qualifies) {
-            botPrint("TRADE", `SIGNAL QUALIFIED ✓ — preparing to execute ${rec.direction} trade`);
+            botPrint("TRADE", `SIGNAL QUALIFIED âœ“ â€” preparing to execute ${rec.direction} trade`);
             const client = await getClobClient();
             if (!client) {
-              logEntry.error = "CLOB client not ready — trade skipped.";
+              logEntry.error = "CLOB client not ready â€” trade skipped.";
               botPrint("ERR", "CLOB client not initialized. Check POLYGON_PRIVATE_KEY.");
             } else {
               // Initialise session balance on first qualifying trade
@@ -3207,7 +3891,7 @@ async function startServer() {
                 } catch { /* non-fatal */ }
               }
 
-              // ── Live balance check ─────────────────────────────────────────
+              // â”€â”€ Live balance check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               let currentBalance = botSessionStartBalance ?? 0;
               let balanceFresh = false;
               try {
@@ -3216,7 +3900,7 @@ async function startServer() {
                 lastKnownBalance = currentBalance; // keep fast path in sync
                 balanceFresh = true;
               } catch {
-                botPrint("WARN", `Balance fetch failed — using last known: $${currentBalance.toFixed(2)} USDC`);
+                botPrint("WARN", `Balance fetch failed â€” using last known: $${currentBalance.toFixed(2)} USDC`);
               }
 
               botPrint("INFO", `Balance: $${currentBalance.toFixed(2)} USDC${balanceFresh ? " (live)" : " (cached)"} | Session start: $${botSessionStartBalance?.toFixed(2) ?? "?"}`);
@@ -3230,7 +3914,7 @@ async function startServer() {
                 break;
               }
 
-              // ── Kelly sizing with balance-aware adjustment ──────────────────
+              // â”€â”€ Kelly sizing with balance-aware adjustment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               const outcomeIndex = rec.direction === "UP" ? 0 : 1;
               const tokenId: string = market.clobTokenIds?.[outcomeIndex];
               if (tokenId) {
@@ -3238,28 +3922,28 @@ async function startServer() {
                 const clobAsk = Number(ob?.asks?.[0]?.price || "0");
                 const bestBid = Number(ob?.bids?.[0]?.price || "0");
 
-                // ── Use outcomePrices (AMM implied price) as primary fill reference ──
-                // CLOB asks are almost always 99¢ in these 5m markets because nobody
-                // places limit orders at fair value — execution happens via the AMM.
+                // â”€â”€ Use outcomePrices (AMM implied price) as primary fill reference â”€â”€
+                // CLOB asks are almost always 99Â¢ in these 5m markets because nobody
+                // places limit orders at fair value â€” execution happens via the AMM.
                 // outcomePrices[outcomeIndex] reflects the real fill cost.
                 const impliedPrice = parseFloat(market.outcomePrices?.[outcomeIndex] ?? "0");
-                // Use CLOB ask only if it's realistic (between 1¢ and 97¢); else use AMM
+                // Use CLOB ask only if it's realistic (between 1Â¢ and 97Â¢); else use AMM
                 const CLOB_SPREAD_THRESHOLD = 0.97;
                 const bestAsk = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD)
                   ? clobAsk
                   : impliedPrice > 0 ? impliedPrice : clobAsk;
 
-                // ── Dynamic entry price gate ─────────────────────────────────
+                // â”€â”€ Dynamic entry price gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Break-even win rate = entry price for binary $1 payouts.
-                // So at 70% confidence, paying 70¢ is break-even — we need
+                // So at 70% confidence, paying 70Â¢ is break-even â€” we need
                 // a buffer to actually profit. Formula: max = (confidence - 10) / 100
-                //   70% conf → max 60¢  (EV = +10¢/share)
-                //   75% conf → max 65¢  (EV = +10¢/share)
-                //   80% conf → max 70¢  (EV = +10¢/share)
-                //   85%+ conf → max 75¢ (capped; divergence gets 85¢ exception)
-                // STRONG divergence is a structural edge (real price lag) → allow 85¢.
+                //   70% conf â†’ max 60Â¢  (EV = +10Â¢/share)
+                //   75% conf â†’ max 65Â¢  (EV = +10Â¢/share)
+                //   80% conf â†’ max 70Â¢  (EV = +10Â¢/share)
+                //   85%+ conf â†’ max 75Â¢ (capped; divergence gets 85Â¢ exception)
+                // STRONG divergence is a structural edge (real price lag) â†’ allow 85Â¢.
                 if (bestAsk <= 0) {
-                  botPrint("SKIP", `No price data available — skipping`);
+                  botPrint("SKIP", `No price data available â€” skipping`);
                   analyzedThisWindow.delete(market.id);
                   continue;
                 }
@@ -3270,12 +3954,25 @@ async function startServer() {
                   : Math.min(0.75, (rec.confidence - 10) / 100);
                 if (bestAsk > MAX_ENTRY_PRICE) {
                   const priceSource = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD) ? "CLOB" : "AMM";
-                  botPrint("SKIP", `Entry price too high: ${priceSource}=${( bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Monitoring for better price…`);
-                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ dynamic max (conf=${rec.confidence}%).`;
+                  botPrint("SKIP", `Entry price too high: ${priceSource}=${( bestAsk * 100).toFixed(1)}Â¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}Â¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Monitoring for better priceâ€¦`);
+                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}Â¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}Â¢ dynamic max (conf=${rec.confidence}%).`;
                   botLog.unshift(logEntry);
                   if (botLog.length > 100) botLog.pop();
                   // Remove from analyzed set so next cycle re-checks the price
                   // (signal is still valid, only price was too high this moment)
+                  analyzedThisWindow.delete(market.id);
+                  pushSSE("cycle", { ts: new Date().toISOString() });
+                  continue;
+                }
+
+                if (bestAsk >= ANALYSIS_COIN_FLIP_MIN_PRICE && bestAsk <= ANALYSIS_COIN_FLIP_MAX_PRICE) {
+                  botPrint(
+                    "SKIP",
+                    `Coin-flip price filter: ${(bestAsk * 100).toFixed(1)}Â¢ is inside ${(ANALYSIS_COIN_FLIP_MIN_PRICE * 100).toFixed(0)}-${(ANALYSIS_COIN_FLIP_MAX_PRICE * 100).toFixed(0)}Â¢ danger zone`
+                  );
+                  logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(1)}Â¢ in coin-flip zone.`;
+                  botLog.unshift(logEntry);
+                  if (botLog.length > 100) botLog.pop();
                   analyzedThisWindow.delete(market.id);
                   pushSSE("cycle", { ts: new Date().toISOString() });
                   continue;
@@ -3288,11 +3985,11 @@ async function startServer() {
                 const b = (1 - kellyFillPrice) / kellyFillPrice;
                 const kelly = (p * b - (1 - p)) / b;
 
-                // ── Volatility-adjusted Kelly ───────────────────────────────
+                // â”€â”€ Volatility-adjusted Kelly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Scale bet down when BTC is choppy (high ATR = noisy market).
                 // ATR = avg true range of last 10 1-min candles.
                 // Baseline: 0.15% of BTC price (e.g. $120 on $80K BTC).
-                // Above baseline → reduce Kelly. Below → capped at 1.0 (no reward for calm).
+                // Above baseline â†’ reduce Kelly. Below â†’ capped at 1.0 (no reward for calm).
                 let volMultiplier = 1.0;
                 const btcCandles = btcHistoryResult?.history ?? [];
                 if (btcCandles.length >= 5 && btcPriceData?.price) {
@@ -3304,7 +4001,7 @@ async function startServer() {
                     const BASELINE_ATR = 0.0015;            // 0.15% = calm/normal BTC
                     volMultiplier = Math.max(0.50, Math.min(1.0, BASELINE_ATR / normalizedAtr));
                     if (volMultiplier < 1.0) {
-                      botPrint("INFO", `Volatility gate: ATR=${atr.toFixed(0)} (${(normalizedAtr * 100).toFixed(2)}% of price) → Kelly scaled to ${(volMultiplier * 100).toFixed(0)}%`);
+                      botPrint("INFO", `Volatility gate: ATR=${atr.toFixed(0)} (${(normalizedAtr * 100).toFixed(2)}% of price) â†’ Kelly scaled to ${(volMultiplier * 100).toFixed(0)}%`);
                     }
                   }
                 }
@@ -3312,32 +4009,26 @@ async function startServer() {
                 const dynFraction = dynamicKellyFraction(rec.confidence);
                 const rawBet = kelly > 0 ? currentBalance * kelly * dynFraction * volMultiplier : 0;
 
-                // Cap to Kelly formula, max bet config, and balance cap (mode-dependent)
-                const kellyCapped = Math.min(rawBet, cfg.maxBetUsdc, currentBalance * cfg.balanceCap);
-
-                // Reserve buffer — scale with balance, min $0.20
+                // Reserve buffer â€” scale with balance, min $0.20
                 const BALANCE_RESERVE = Math.min(1.0, currentBalance * 0.10);
                 const spendable = Math.max(0, currentBalance - BALANCE_RESERVE);
 
-                // Minimum bet scales with balance: floor at $0.50 or 20% of balance, whichever smaller
-                const MIN_BET = Math.min(0.50, currentBalance * 0.20);
+                // Fixed execution size: runtime-configurable from the dashboard.
+                const betAmount = parseFloat(botFixedTradeUsdc.toFixed(2));
 
-                // Final bet: clamped to what we can actually afford
-                const betAmount = parseFloat(Math.min(kellyCapped, spendable).toFixed(2));
-
-                botPrint("INFO", `Kelly calc: conf=${rec.confidence}% → fraction=${(dynFraction * 100).toFixed(0)}% | implied=${(impliedPrice * 100).toFixed(0)}¢ raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC [${botMode}]`);
+                botPrint("INFO", `Sizing override: fixed $${botFixedTradeUsdc.toFixed(2)} per trade | Kelly raw=$${rawBet.toFixed(2)} ignored [${botMode}]`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
-                if (betAmount < MIN_BET) {
-                  botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC < $${MIN_BET.toFixed(2)} min). Balance may be too low or Kelly fraction too conservative. Skipping.`);
-                  logEntry.reasoning += ` | Skipped: Adjusted bet $${betAmount.toFixed(2)} < $${MIN_BET.toFixed(2)} minimum (balance=$${currentBalance.toFixed(2)}).`;
+                if (spendable < betAmount) {
+                  botPrint("SKIP", `Insufficient spendable balance for fixed trade size ($${spendable.toFixed(2)} available after reserve < $${betAmount.toFixed(2)} required). Skipping.`);
+                  logEntry.reasoning += ` | Skipped: spendable balance $${spendable.toFixed(2)} < fixed $${betAmount.toFixed(2)} trade size.`;
                 } else {
                   // ob, bestAsk, bestBid already fetched above for the hard gate
-                  botPrint("TRADE", `━━━ EXECUTING ORDER ━━━`);
-                  botPrint("TRADE", `Direction : ${rec.direction === "UP" ? "▲ UP (YES)" : "▼ DOWN (NO)"}`);
+                  botPrint("TRADE", `â”â”â” EXECUTING ORDER â”â”â”`);
+                  botPrint("TRADE", `Direction : ${rec.direction === "UP" ? "â–² UP (YES)" : "â–¼ DOWN (NO)"}`);
                   botPrint("TRADE", `Amount    : $${betAmount.toFixed(2)} USDC`);
-                  botPrint("TRADE", `Price     : ${(bestAsk * 100).toFixed(1)}¢ (ask) | ${(bestBid * 100).toFixed(1)}¢ (bid)`);
-                  botPrint("TRADE", `Confidence: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`);
+                  botPrint("TRADE", `Price     : ${(bestAsk * 100).toFixed(1)}Â¢ (ask) | ${(bestBid * 100).toFixed(1)}Â¢ (bid)`);
+                  botPrint("TRADE", `Confidence: ${rec.confidence}% | Edge: ${rec.estimatedEdge}Â¢ | Risk: ${rec.riskLevel}`);
                   try {
                     const tradeResult = await executePolymarketTrade({
                       tokenID: tokenId,
@@ -3370,9 +4061,9 @@ async function startServer() {
                     logEntry.orderId = tradeResult.orderID;
                     botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
                     void sendNotification(
-                      `✅ <b>TRADE EXECUTED</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${rec.direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`
+                      `âœ… <b>TRADE EXECUTED</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${rec.direction === "UP" ? "â–² UP" : "â–¼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}Â¢\nConf: ${rec.confidence}% | Edge: ${rec.estimatedEdge}Â¢ | Risk: ${rec.riskLevel}`
                     );
-                    botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}¢ distance — automation ARMED`);
+                    botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}Â¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}Â¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}Â¢ distance â€” automation ARMED`);
                     botPrint("OK", `Session trades: ${botSessionTradesCount} | Balance: ~$${currentBalance.toFixed(2)}`);
 
                     // Track this trade for win/loss resolution after window closes
@@ -3398,7 +4089,7 @@ async function startServer() {
                       imbalanceSignal: orderBooks[tokenId]?.imbalanceSignal,
                       asset: currentAsset,
                     });
-                    botPrint("INFO", `Result tracker armed — checking after ${new Date((currentWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
+                    botPrint("INFO", `Result tracker armed â€” checking after ${new Date((currentWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
                   } catch (tradeErr: any) {
                     logEntry.error = tradeErr?.message || String(tradeErr);
                     botPrint("ERR", `Trade execution failed: ${logEntry.error}`);
@@ -3407,9 +4098,9 @@ async function startServer() {
               }
             }
           } else if (rec.decision === "NO_TRADE") {
-            botPrint("SKIP", `No trade — conditions not met, will re-check next cycle`);
+            botPrint("SKIP", `No trade â€” conditions not met, will re-check next cycle`);
             // Remove from analyzed set so next cycle re-evaluates if conditions change.
-            // Keep AI cache so Gemini is not re-called — only re-check divergence/price/filters.
+            // Keep AI cache so Gemini is not re-called â€” only re-check divergence/price/filters.
             analyzedThisWindow.delete(market.id);
           }
 
@@ -3426,9 +4117,9 @@ async function startServer() {
     }
   };
 
-  // ── Polymarket heartbeat — must fire every <10s or all open orders are cancelled ──
-  // Chain: first call uses "" → server returns heartbeat_id → each subsequent call passes that ID.
-  // On 400: server returns the correct heartbeat_id in the response body — extract and use it.
+  // â”€â”€ Polymarket heartbeat â€” must fire every <10s or all open orders are cancelled â”€â”€
+  // Chain: first call uses "" â†’ server returns heartbeat_id â†’ each subsequent call passes that ID.
+  // On 400: server returns the correct heartbeat_id in the response body â€” extract and use it.
   // On other errors: reset to "" to start a fresh chain next tick.
   const startHeartbeat = () => {
     if (heartbeatInterval) return;
@@ -3440,21 +4131,21 @@ async function startServer() {
         lastHeartbeatId = resp?.heartbeat_id ?? "";
       } catch (err: any) {
         // Polymarket returns 400 with the correct heartbeat_id when we send a stale/wrong ID.
-        // The SDK throws on 400 but may attach the response body — try to extract it.
+        // The SDK throws on 400 but may attach the response body â€” try to extract it.
         const body = err?.response?.data ?? err?.data ?? null;
         const recoveredId = body?.heartbeat_id ?? body?.id ?? null;
         if (recoveredId) {
-          console.warn(`[Heartbeat] 400 — recovered correct ID from response, re-chaining`);
+          console.warn(`[Heartbeat] 400 â€” recovered correct ID from response, re-chaining`);
           lastHeartbeatId = recoveredId;
         } else {
-          console.warn("[Heartbeat] Failed:", err?.message ?? String(err), "— resetting chain");
+          console.warn("[Heartbeat] Failed:", err?.message ?? String(err), "â€” resetting chain");
           lastHeartbeatId = "";
         }
       }
     };
     void sendHeartbeat();
     heartbeatInterval = setInterval(() => void sendHeartbeat(), 5_000);
-    console.log("[Heartbeat] Started — sending every 5s to keep open orders alive");
+    console.log("[Heartbeat] Started â€” sending every 5s to keep open orders alive");
   };
 
   const stopHeartbeat = () => {
@@ -3466,14 +4157,15 @@ async function startServer() {
   const startBot = () => {
     if (botInterval) return;
     console.log("");
-    console.log("╔═══════════════════════════════════════════════════╗");
-    console.log("║          PolyBTC AI Trading Bot — STARTED         ║");
-    console.log("╚═══════════════════════════════════════════════════╝");
+    console.log("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+    console.log("â•‘          PolyBTC AI Trading Bot â€” STARTED         â•‘");
+    console.log("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
     const startCfg = getActiveConfig();
     botPrint("INFO", `Mode           : ${botMode}`);
     botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
-    botPrint("INFO", `Min edge       : ${startCfg.minEdge}¢`);
+    botPrint("INFO", `Min edge       : ${startCfg.minEdge}Â¢`);
     botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
+    botPrint("INFO", `Fixed trade    : $${botFixedTradeUsdc.toFixed(2)} USDC`);
     botPrint("INFO", `Kelly fraction : ${startCfg.kellyFraction * 100}%`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
@@ -3495,7 +4187,7 @@ async function startServer() {
 
   app.use(express.json());
 
-  // ── Bot control API ────────────────────────────────────────────────────────
+  // â”€â”€ Bot control API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/bot/status", (_req, res) => {
     const nowUtcSeconds = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
@@ -3515,8 +4207,37 @@ async function startServer() {
         minEdge: getActiveConfig().minEdge,
         kellyFraction: getActiveConfig().kellyFraction,
         maxBetUsdc: getActiveConfig().maxBetUsdc,
+        fixedTradeUsdc: botFixedTradeUsdc,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
+    });
+  });
+
+  app.get("/api/bot/ping", async (_req, res) => {
+    const testedAt = new Date().toISOString();
+    const results = await Promise.all(
+      PRICE_LAG_PING_TARGETS.map((target) => probeHttpLatency(target.key, target.label, target.target))
+    );
+    const successful = results.filter((entry) => entry.latencyMs != null);
+    const fastestMs = successful.length > 0 ? Math.min(...successful.map((entry) => entry.latencyMs as number)) : null;
+    const slowestMs = successful.length > 0 ? Math.max(...successful.map((entry) => entry.latencyMs as number)) : null;
+    const averageMs = successful.length > 0
+      ? Math.round(successful.reduce((sum, entry) => sum + (entry.latencyMs as number), 0) / successful.length)
+      : null;
+    const polymarketCritical = results.filter((entry) => entry.key === "clob" || entry.key === "gamma" || entry.key === "data");
+    const criticalReady = polymarketCritical.every((entry) => entry.latencyMs != null && entry.latencyMs <= 250);
+
+    res.json({
+      testedAt,
+      note: "Latency is measured from this bot server to upstream services. This is the number that matters for price-lag execution.",
+      summary: {
+        fastestMs,
+        slowestMs,
+        averageMs,
+        grade: gradeLatency(averageMs),
+        criticalReady,
+      },
+      upstreams: results,
     });
   });
 
@@ -3545,7 +4266,7 @@ async function startServer() {
     res.json({ log: rawLog });
   });
 
-  // ── SSE endpoint — real-time bot events ────────────────────────────────────
+  // â”€â”€ SSE endpoint â€” real-time bot events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/bot/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -3589,7 +4310,7 @@ async function startServer() {
     res.json({ history: momentumHistory });
   });
 
-  // ── Auto-calibrator toggle & status ──────────────────────────────────────────
+  // â”€â”€ Auto-calibrator toggle & status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/bot/calibration", (_req, res) => {
     res.json({ enabled: autoCalibrateEnabled, state: calibrationState });
   });
@@ -3707,25 +4428,32 @@ async function startServer() {
     }
     botMode = mode;
     const cfg = getActiveConfig();
-    botPrint("INFO", `Bot mode switched to ${botMode} — conf≥${cfg.minConfidence}% edge≥${cfg.minEdge}¢ maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% window=${cfg.entryWindowStart}–${cfg.entryWindowEnd}s`);
+    botPrint("INFO", `Bot mode switched to ${botMode} | conf>=${cfg.minConfidence}% edge>=${cfg.minEdge}c maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% window=${cfg.entryWindowStart}-${cfg.entryWindowEnd}s`);
     res.json({ ok: true, mode: botMode, config: cfg });
   });
 
   app.post("/api/bot/config", (req, res) => {
-    const { minConfidence, minEdge } = req.body || {};
+    const { minConfidence, minEdge, fixedTradeUsdc } = req.body || {};
     if (minConfidence !== undefined) {
       const val = Number(minConfidence);
-      if (isNaN(val) || val < 50 || val > 99) return res.status(400).json({ error: "minConfidence must be 50–99" });
+      if (isNaN(val) || val < 50 || val > 99) return res.status(400).json({ error: "minConfidence must be 50-99" });
       aggressiveMinConfidence = val;
     }
     if (minEdge !== undefined) {
       const val = Number(minEdge);
-      if (isNaN(val) || val < 0.01 || val > 0.50) return res.status(400).json({ error: "minEdge must be 0.01–0.50" });
+      if (isNaN(val) || val < 0.01 || val > 0.50) return res.status(400).json({ error: "minEdge must be 0.01-0.50" });
       aggressiveMinEdge = val;
     }
+    if (fixedTradeUsdc !== undefined) {
+      const val = Number(fixedTradeUsdc);
+      if (!Number.isFinite(val) || val < 1 || val > 5 || !Number.isInteger(val)) {
+        return res.status(400).json({ error: "fixedTradeUsdc must be an integer 1-5" });
+      }
+      botFixedTradeUsdc = val;
+    }
     const cfg = getActiveConfig();
-    botPrint("INFO", `Config updated (AGGRESSIVE): conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢`);
-    res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, config: cfg });
+    botPrint("INFO", `Config updated (AGGRESSIVE): conf>=${aggressiveMinConfidence}% edge>=${aggressiveMinEdge}c fixed=$${botFixedTradeUsdc.toFixed(2)}`);
+    res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, fixedTradeUsdc: botFixedTradeUsdc, config: { ...cfg, fixedTradeUsdc: botFixedTradeUsdc } });
   });
 
   app.post("/api/bot/reset-confidence", (_req, res) => {
@@ -3756,7 +4484,7 @@ async function startServer() {
     });
   });
 
-  // API Proxy for Polymarket — BTC/ETH/SOL Up/Down 5-Minute Events
+  // API Proxy for Polymarket â€” BTC/ETH/SOL Up/Down 5-Minute Events
   app.get("/api/polymarket/markets", async (req, res) => {
     try {
       const nowUtcSeconds = Math.floor(Date.now() / 1000);
@@ -3786,7 +4514,7 @@ async function startServer() {
         .map((r) => (r as PromiseFulfilledResult<any>).value.data)
         .filter(Boolean);
 
-      // Gamma API returns outcomes/outcomePrices/clobTokenIds as JSON strings — parse them
+      // Gamma API returns outcomes/outcomePrices/clobTokenIds as JSON strings â€” parse them
       const parseArr = (val: any): any[] => {
         if (Array.isArray(val)) return val;
         if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
@@ -3811,7 +4539,7 @@ async function startServer() {
         }));
       });
 
-      console.log(`Fetched ${events.length}/${slugs.length} events → ${markets.length} markets`);
+      console.log(`Fetched ${events.length}/${slugs.length} events â†’ ${markets.length} markets`);
       res.json(markets);
     } catch (error: any) {
       console.error("Polymarket Events API Error:", error.message);
@@ -4032,7 +4760,7 @@ async function startServer() {
     }
   });
 
-  // ── Helper: resolve trading address (proxy wallet or EOA) ────────────────
+  // â”€â”€ Helper: resolve trading address (proxy wallet or EOA) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/polymarket/copy-trading/trader/:address", async (req, res) => {
     try {
       const address = String(req.params.address || "").trim();
@@ -4152,7 +4880,7 @@ async function startServer() {
     eventSlug: position.eventSlug || null,
   });
 
-  // ── Current positions (open) ───────────────────────────────────────────────
+  // â”€â”€ Current positions (open) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/polymarket/positions", async (_req, res) => {
     try {
       const userAddress = await getTradingAddress();
@@ -4169,7 +4897,7 @@ async function startServer() {
     }
   });
 
-  // ── Closed positions ───────────────────────────────────────────────────────
+  // â”€â”€ Closed positions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/polymarket/closed-positions", async (_req, res) => {
     try {
       const userAddress = await getTradingAddress();
@@ -4186,7 +4914,7 @@ async function startServer() {
     }
   });
 
-  // ── Performance summary (aggregated from both APIs) ────────────────────────
+  // â”€â”€ Performance summary (aggregated from both APIs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/polymarket/performance", async (_req, res) => {
     try {
       const userAddress = await getTradingAddress();
@@ -4341,7 +5069,7 @@ async function startServer() {
       const status = error.response?.status;
       const body = error.response?.data;
       console.log(`[history] CLOB returned ${status} for token ${marketID}:`, JSON.stringify(body));
-      // Any CLOB error (400, 404, 422, 500…) — return empty array so UI doesn't break
+      // Any CLOB error (400, 404, 422, 500â€¦) â€” return empty array so UI doesn't break
       return res.json([]);
     }
   });
@@ -4372,7 +5100,7 @@ async function startServer() {
     }
   });
 
-  // Proxy for BTC Historical Data — 1m candles, last 60 (for chart + indicators)
+  // Proxy for BTC Historical Data â€” 1m candles, last 60 (for chart + indicators)
   app.get("/api/btc-history", async (req, res) => {
     try {
       const historyResult = await getBtcHistory();
@@ -4388,7 +5116,7 @@ async function startServer() {
     res.status(500).json({ error: "Failed to fetch BTC history" });
   });
 
-  // BTC Technical Indicators — RSI(14), EMA(9), EMA(21), volume spike
+  // BTC Technical Indicators â€” RSI(14), EMA(9), EMA(21), volume spike
   app.get("/api/btc-indicators", async (_req, res) => {
     try {
       const indicators = await getBtcIndicators();
@@ -4436,3 +5164,4 @@ async function startServer() {
 }
 
 startServer();
+
