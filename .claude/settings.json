@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//^async function runAutoCalibration/**)",
+      "Read(//^function generateLesson/**)",
+      "Read(//^function generateWinLesson/**)",
+      "Read(//const monitorPositionAutomation/,/**)"
+    ]
+  }
+}

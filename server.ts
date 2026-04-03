@@ -43,20 +43,6 @@ interface TradeLogEntry {
   orderId: string | null;
 }
 
-interface CopyTraderPosition {
-  assetId: string;
-  market: string;
-  outcome: string;
-  size: string;
-  averagePrice: string;
-  currentPrice: string;
-  initialValue: string;
-  currentValue: string;
-  cashPnl: string;
-  percentPnl: string;
-  endDate: string | null;
-  eventSlug: string | null;
-}
 
 function saveTradeLog(entry: TradeLogEntry): void {
   try {
@@ -82,9 +68,14 @@ function loadTradeLog(): TradeLogEntry[] {
 interface PersistedLearning {
   lossMemory: LossMemory[];
   winMemory: WinMemory[];
-  consecutiveLosses: number;
-  consecutiveWins: number;
-  adaptiveConfidenceBoost: number;
+  // Per-asset streak/boost (canonical). Legacy scalar fields kept for reading old files.
+  consecutiveLossesByAsset?: Record<string, number>;
+  consecutiveWinsByAsset?: Record<string, number>;
+  adaptiveConfidenceByAsset?: Record<string, number>;
+  // Old scalar fields — read-only for migration from pre-per-asset saves
+  consecutiveLosses?: number;
+  consecutiveWins?: number;
+  adaptiveConfidenceBoost?: number;
   adaptiveLossPenaltyEnabled?: boolean;
   savedAt: string;
 }
@@ -94,9 +85,9 @@ function saveLearning(): void {
     const payload: PersistedLearning = {
       lossMemory,
       winMemory,
-      consecutiveLosses,
-      consecutiveWins,
-      adaptiveConfidenceBoost,
+      consecutiveLossesByAsset: Object.fromEntries(consecutiveLossesByAsset),
+      consecutiveWinsByAsset:   Object.fromEntries(consecutiveWinsByAsset),
+      adaptiveConfidenceByAsset: Object.fromEntries(adaptiveConfidenceByAsset),
       adaptiveLossPenaltyEnabled,
       savedAt: new Date().toISOString(),
     };
@@ -113,11 +104,29 @@ function loadLearning(): void {
     const data: PersistedLearning = JSON.parse(raw);
     lossMemory.push(...(data.lossMemory || []));
     winMemory.push(...(data.winMemory || []));
-    consecutiveLosses       = data.consecutiveLosses       ?? 0;
-    consecutiveWins         = data.consecutiveWins         ?? 0;
-    adaptiveConfidenceBoost = data.adaptiveConfidenceBoost ?? 0;
     adaptiveLossPenaltyEnabled = data.adaptiveLossPenaltyEnabled ?? true;
-    console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss / ${winMemory.length} win patterns, streak=${consecutiveLosses}L/${consecutiveWins}W, boost=+${adaptiveConfidenceBoost}%`);
+    // Load per-asset state — fall back to old scalar if per-asset not present (migration)
+    const assets: TradingAsset[] = ["BTC", "ETH", "SOL"];
+    if (data.consecutiveLossesByAsset) {
+      for (const a of assets) consecutiveLossesByAsset.set(a, data.consecutiveLossesByAsset[a] ?? 0);
+    } else {
+      // Old single-asset save: assign legacy value to BTC only
+      consecutiveLossesByAsset.set("BTC", data.consecutiveLosses ?? 0);
+    }
+    if (data.consecutiveWinsByAsset) {
+      for (const a of assets) consecutiveWinsByAsset.set(a, data.consecutiveWinsByAsset[a] ?? 0);
+    } else {
+      consecutiveWinsByAsset.set("BTC", data.consecutiveWins ?? 0);
+    }
+    if (data.adaptiveConfidenceByAsset) {
+      for (const a of assets) adaptiveConfidenceByAsset.set(a, data.adaptiveConfidenceByAsset[a] ?? 0);
+    } else {
+      adaptiveConfidenceByAsset.set("BTC", data.adaptiveConfidenceBoost ?? 0);
+    }
+    const totalL = [...consecutiveLossesByAsset.values()].reduce((s, v) => s + v, 0);
+    const totalW = [...consecutiveWinsByAsset.values()].reduce((s, v) => s + v, 0);
+    const maxBoost = Math.max(...adaptiveConfidenceByAsset.values());
+    console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss / ${winMemory.length} win | streak=${totalL}L/${totalW}W | max boost=+${maxBoost}%`);
   } catch (e: any) {
     console.error("[Persist] Failed to load loss_memory.json:", e.message);
   }
@@ -179,8 +188,12 @@ type BtcCandle = {
 
 // ── Multi-asset support: BTC, ETH, SOL ───────────────────────────────────────
 type TradingAsset = "BTC" | "ETH" | "SOL";
-const ENABLED_ASSETS: TradingAsset[] = (
-  (process.env.ENABLED_ASSETS || "BTC,ETH,SOL").split(",").map(s => s.trim().toUpperCase()) as TradingAsset[]
+const ALL_ASSETS: TradingAsset[] = ["BTC", "ETH", "SOL"];
+// Runtime-mutable: default BTC only. Override via env ENABLED_ASSETS=BTC,ETH,SOL
+let ENABLED_ASSETS: TradingAsset[] = (
+  (process.env.ENABLED_ASSETS || "BTC").split(",")
+    .map(s => s.trim().toUpperCase())
+    .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset))
 );
 const ASSET_CONFIG: Record<TradingAsset, {
   binanceSymbol: string;
@@ -220,8 +233,8 @@ const MONGODB_PRICE_SNAPSHOTS_COLLECTION = process.env.MONGODB_PRICE_SNAPSHOTS_C
 const MONGODB_CHART_COLLECTION = process.env.MONGODB_CHART_COLLECTION || "chart";
 const MONGODB_POSITION_AUTOMATION_COLLECTION =
   process.env.MONGODB_POSITION_AUTOMATION_COLLECTION || "position_automation";
-const BTC_PRICE_CACHE_MS = 5_000;
-const BTC_HISTORY_CACHE_MS = 15_000;
+const BTC_PRICE_CACHE_MS = 2_000;
+const BTC_HISTORY_CACHE_MS = 8_000;
 const BTC_INDICATORS_CACHE_MS = 15_000;
 const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL_SECONDS || 60 * 60 * 24 * 14);
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
@@ -234,35 +247,30 @@ const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 65);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.10);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
+const BOT_FIXED_TRADE_USDC = Number(process.env.BOT_FIXED_TRADE_USDC || 1);
 
-// ── Bot mode: AGGRESSIVE (default) vs CONSERVATIVE ───────────────────────────
-let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
-
-// Runtime-overrideable thresholds for AGGRESSIVE mode (UI-adjustable)
+// Runtime-overrideable thresholds (UI-adjustable via /api/bot/config)
 let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
 let aggressiveMinEdge       = BOT_MIN_EDGE;
 
-const CONSERVATIVE_CONFIG = {
-  minConfidence:    75,
-  minEdge:          0.12,
-  kellyFraction:    0.20,
-  maxBetUsdc:       50,
-  balanceCap:       0.10,
-  entryWindowStart: 30,
-  entryWindowEnd:   240,
-} as const;
-
 function getActiveConfig() {
-  if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG;
   return {
     minConfidence:    aggressiveMinConfidence,
     minEdge:          aggressiveMinEdge,
     kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
+    fixedTradeUsdc:   BOT_FIXED_TRADE_USDC,
     balanceCap:       0.25,
     entryWindowStart: 10,
-    entryWindowEnd:   180,
+    entryWindowEnd:   220,
   };
+}
+
+function getFixedEntryBetAmount(balance: number): number {
+  if (!Number.isFinite(balance) || balance <= 0) return 0;
+  const reserve = Math.min(1.0, balance * 0.10);
+  const spendable = Math.max(0, balance - reserve);
+  return parseFloat(Math.min(BOT_FIXED_TRADE_USDC, spendable).toFixed(2));
 }
 
 // ── Dynamic Kelly fraction based on confidence ────────────────────────────────
@@ -273,7 +281,6 @@ function getActiveConfig() {
 //   85–89% → 0.55  (strong signal, size up)
 //   90%+   → 0.65  (very high conviction, max size)
 function dynamicKellyFraction(confidence: number): number {
-  if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG.kellyFraction;
   if (confidence >= 90) return 0.65;
   if (confidence >= 85) return 0.55;
   if (confidence >= 75) return 0.50;
@@ -294,83 +301,6 @@ const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
 // Backward-compat alias (used by BTC path until loop refactor is complete)
 const botAnalyzedThisWindow = botAnalyzedThisWindowByAsset.get("BTC")!;
 
-// ── Auto-calibrator state ─────────────────────────────────────────────────────
-// When enabled, runs a FastLoop backtest at the start of each new window and
-// uses win-rate to adjust FastLoop minimum strength + confidence boost for that window.
-let autoCalibrateEnabled = false;
-interface CalibrationState {
-  runAt: number;           // unix seconds
-  totalWindows: number;
-  signaledCount: number;
-  correctCount: number;
-  winRate: number | null;  // % e.g. 62.5
-  // Derived adjustments applied to the bot this window:
-  fastLoopMinStrength: "STRONG" | "MODERATE"; // min strength to count as signal
-  confidenceDelta: number;                    // +/- applied to effectiveMinConf
-  note: string;
-}
-let calibrationState: CalibrationState | null = null;
-
-async function runAutoCalibration(): Promise<void> {
-  try {
-    const historyResult = await getBtcHistory();
-    if (!historyResult?.history?.length) return;
-    const history = historyResult.history;
-    const minStart = 20;
-    const maxWindows = Math.floor((history.length - minStart - 5) / 3);
-    const actualWindows = Math.min(40, maxWindows);
-    let signaledCount = 0, correctCount = 0;
-    for (let w = 0; w < actualWindows; w++) {
-      const endIdx = minStart + w * 3;
-      if (endIdx + 5 >= history.length) break;
-      const slice = history.slice(0, endIdx + 1);
-      const future = history.slice(endIdx + 1, endIdx + 6);
-      let fastMom: FastLoopMomentum | null = null;
-      try { fastMom = computeFastLoopMomentum(slice); } catch {}
-      const entryClose = history[endIdx].close;
-      const exitClose = future.length > 0 ? future[future.length - 1].close : null;
-      const actualDir = exitClose != null ? (exitClose > entryClose ? "UP" : exitClose < entryClose ? "DOWN" : "NEUTRAL") : null;
-      const signaled = !!(fastMom && fastMom.strength !== "WEAK" && fastMom.direction !== "NEUTRAL");
-      if (signaled) {
-        signaledCount++;
-        if (actualDir !== null && fastMom!.direction === actualDir) correctCount++;
-      }
-    }
-    const winRate = signaledCount > 0 ? parseFloat(((correctCount / signaledCount) * 100).toFixed(1)) : null;
-
-    // Derive adjustments based on win rate
-    let fastLoopMinStrength: CalibrationState["fastLoopMinStrength"] = "MODERATE";
-    let confidenceDelta = 0;
-    let note = "";
-    if (winRate === null || signaledCount < 5) {
-      note = "Not enough signal samples — using defaults";
-    } else if (winRate >= 65) {
-      fastLoopMinStrength = "MODERATE";
-      confidenceDelta = -2; // slightly easier threshold
-      note = `Win rate ${winRate}% — GOOD signal quality, -2% conf threshold`;
-    } else if (winRate >= 50) {
-      fastLoopMinStrength = "MODERATE";
-      confidenceDelta = 0;
-      note = `Win rate ${winRate}% — AVERAGE signal quality, no adjustment`;
-    } else {
-      fastLoopMinStrength = "STRONG"; // only trust STRONG signals
-      confidenceDelta = +5;           // require higher confidence
-      note = `Win rate ${winRate}% — WEAK signal quality, require STRONG only +5% conf`;
-    }
-
-    calibrationState = {
-      runAt: Math.floor(Date.now() / 1000),
-      totalWindows: actualWindows,
-      signaledCount,
-      correctCount,
-      winRate,
-      fastLoopMinStrength,
-      confidenceDelta,
-      note,
-    };
-    console.log(`[Calibrator] Win rate=${winRate ?? "?"}% (${correctCount}/${signaledCount} signals) → minStrength=${fastLoopMinStrength} confDelta=${confidenceDelta > 0 ? "+" : ""}${confidenceDelta}%`);
-  } catch { /* non-fatal */ }
-}
 
 // ── Fast loop momentum history ring buffer ────────────────────────────────────
 interface MomentumHistoryPoint {
@@ -396,7 +326,8 @@ let divergenceFastTradeRunning = false;   // mutex — prevents concurrent fast-
 
 
 // ── Per-window AI result cache (reuse rec across cycles, only re-check price) ──
-let currentWindowAiCache: { windowStart: number; marketId: string; asset: TradingAsset; rec: any } | null = null;
+// Keyed by asset so BTC/ETH/SOL caches don't overwrite each other.
+const currentWindowAiCache = new Map<TradingAsset, { windowStart: number; marketId: string; rec: any }>();
 
 // ── Divergence tracker (asset price vs YES token lag detector) ───────────────
 interface PricePoint { ts: number; price: number; }
@@ -545,9 +476,6 @@ const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0],["ET
 const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
 const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
 // Global aliases kept for persistence (sum/avg not needed — persist per entry in lossMemory)
-let consecutiveLosses = 0;
-let consecutiveWins   = 0;
-let adaptiveConfidenceBoost = 0; // legacy — used only for saveLearning() backward-compat
 let adaptiveLossPenaltyEnabled = true;
 
 function generateLesson(pending: PendingResult): string {
@@ -1705,7 +1633,7 @@ function startDivergenceTracker() {
         if (assetSet && assetSet.size > 0) {
           console.log(`[DIV] STRONG divergence mid-window — clearing analyzed set for ${currentDivergenceAsset} to force re-evaluation`);
           assetSet.clear();
-          currentWindowAiCache = null;
+          currentWindowAiCache.delete(currentDivergenceAsset);
         }
       }
 
@@ -2067,12 +1995,8 @@ async function startServer() {
         const kelly = (p * b - (1 - p)) / b;
         if (kelly <= 0) return;
 
-        const dynFraction = dynamicKellyFraction(confidence);
-        const rawBet = balance * kelly * dynFraction;
-        const BALANCE_RESERVE = Math.min(1.0, balance * 0.10);
-        const spendable = Math.max(0, balance - BALANCE_RESERVE);
         const MIN_BET = Math.min(0.50, balance * 0.20);
-        const betAmount = parseFloat(Math.min(rawBet, cfg.maxBetUsdc, spendable).toFixed(2));
+        const betAmount = getFixedEntryBetAmount(balance);
 
         if (betAmount < MIN_BET) {
           botPrint("SKIP", `[DIV FAST] Bet too small: $${betAmount.toFixed(2)} < $${MIN_BET.toFixed(2)} min`);
@@ -2100,7 +2024,7 @@ async function startServer() {
           reversalReasoning: "Strong structural price lag",
         };
         // Cache so the next bot cycle doesn't call Gemini again for this window
-        currentWindowAiCache = { windowStart: nowWindowStart, marketId: market.id, asset: currentDivergenceAsset, rec: fastRec };
+        currentWindowAiCache.set(currentDivergenceAsset, { windowStart: nowWindowStart, marketId: market.id, rec: fastRec });
 
         const tradeResult = await executePolymarketTrade({
           tokenID: tokenId,
@@ -2194,9 +2118,7 @@ async function startServer() {
               if (corrKelly <= 0) return;
 
               // 70% of normal dynamic Kelly — correlated signal, not independent divergence
-              const corrFraction = dynamicKellyFraction(corrConf) * 0.70;
-              const corrRawBet = balance * corrKelly * corrFraction;
-              const corrBetAmount = parseFloat(Math.min(corrRawBet, cfg.maxBetUsdc, spendable).toFixed(2));
+              const corrBetAmount = getFixedEntryBetAmount(balance);
               if (corrBetAmount < MIN_BET) {
                 botPrint("SKIP", `[CORR-${corrAsset}] Bet too small: $${corrBetAmount.toFixed(2)}`);
                 return;
@@ -2591,11 +2513,9 @@ async function startServer() {
         const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
         consecutiveWinsByAsset.set(pendingAsset, cWins);
         consecutiveLossesByAsset.set(pendingAsset, 0);
-        consecutiveWins = cWins; consecutiveLosses = 0; // keep legacy for saveLearning
         if (cWins >= 2 && cBoost > 0) {
           const newBoost = Math.max(cBoost - 3, 0);
           adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-          adaptiveConfidenceBoost = newBoost;
           botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
         }
         botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
@@ -2647,7 +2567,6 @@ async function startServer() {
         const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
         consecutiveLossesByAsset.set(pendingAsset, cLosses);
         consecutiveWinsByAsset.set(pendingAsset, 0);
-        consecutiveLosses = cLosses; consecutiveWins = 0; // keep legacy for saveLearning
         const lesson = generateLesson(pending);
 
         lossMemory.unshift({
@@ -2673,7 +2592,6 @@ async function startServer() {
         if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
           const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
           adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-          adaptiveConfidenceBoost = newBoost;
           botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
         } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
           botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
@@ -2741,7 +2659,7 @@ async function startServer() {
       // Reset per-window state when a new 5-min window starts
       if (currentWindowStart !== botLastWindowStart) {
         for (const s of botAnalyzedThisWindowByAsset.values()) s.clear();
-        currentWindowAiCache = null;
+        currentWindowAiCache.clear();
         botLastWindowStart = currentWindowStart;
         // Clear YES ring buffer — old window's tokens are no longer valid
         yesRingBuffer.length = 0;
@@ -2750,8 +2668,6 @@ async function startServer() {
         currentWindowYesTokenIdByAsset.clear();
         currentWindowNoTokenIdByAsset.clear();
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
-        // Auto-calibrate FastLoop signal quality at start of each new window
-        if (autoCalibrateEnabled) void runAutoCalibration();
       }
 
       // Only trade in the valid entry zone
@@ -2900,12 +2816,11 @@ async function startServer() {
             }
           }
 
-          // Merge adaptive boost + calibration delta into effective threshold
-          const calDelta = (autoCalibrateEnabled && calibrationState) ? calibrationState.confidenceDelta : 0;
+          // Merge adaptive boost into effective threshold
           const assetBoost = adaptiveConfidenceByAsset.get(currentAsset) ?? 0;
-          const effectiveMinConf = cfg.minConfidence + assetBoost + calDelta;
-          if (assetBoost > 0 || calDelta !== 0) {
-            botPrint("INFO", `Threshold: ${effectiveMinConf}%${assetBoost > 0 ? ` (+${assetBoost}% [${currentAsset}] loss streak)` : ""}${calDelta !== 0 ? ` (${calDelta > 0 ? "+" : ""}${calDelta}% calibrator)` : ""}`);
+          const effectiveMinConf = cfg.minConfidence + assetBoost;
+          if (assetBoost > 0) {
+            botPrint("INFO", `Threshold: ${effectiveMinConf}% (+${assetBoost}% [${currentAsset}] loss streak)`);
           }
 
           // ── Fast Loop Momentum (Simmer-style CEX signal) ──────────────
@@ -2948,11 +2863,9 @@ async function startServer() {
           }
 
           // ── FastLoop pre-filter: skip AI when no momentum and no divergence ──
-          const calMinStrength = (autoCalibrateEnabled && calibrationState) ? calibrationState.fastLoopMinStrength : "MODERATE";
-          const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK"
-            || (calMinStrength === "STRONG" && fastMom.strength !== "STRONG");
+          const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK";
           if (fastMomWeak && (!div || div.strength === "NONE")) {
-            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=${calMinStrength}${autoCalibrateEnabled ? " calibrated" : ""}) + no divergence — skipping AI`);
+            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=MODERATE) + no divergence — skipping AI`);
             continue;
           }
 
@@ -3011,7 +2924,7 @@ async function startServer() {
             alignmentScore >= 4 &&
             divAgrees &&
             noLossConflict &&
-            !(currentWindowAiCache?.windowStart === currentWindowStart && currentWindowAiCache?.asset === currentAsset)
+            !(currentWindowAiCache.get(currentAsset)?.windowStart === currentWindowStart)
           );
 
           if (fastPathEligible && fastPathDir) {
@@ -3033,11 +2946,11 @@ async function startServer() {
               reversalReasoning: "Fast path — strong multi-signal consensus",
             };
             botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢ | Gemini skipped`);
-            currentWindowAiCache = { windowStart: currentWindowStart, marketId: market.id, asset: currentAsset, rec };
+            currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
 
           // ── NORMAL PATH: use cached or fresh Gemini ────────────────────────
-          } else if (currentWindowAiCache?.windowStart === currentWindowStart && currentWindowAiCache?.marketId === market.id && currentWindowAiCache?.asset === currentAsset) {
-            rec = currentWindowAiCache.rec;
+          } else if (currentWindowAiCache.get(currentAsset)?.windowStart === currentWindowStart && currentWindowAiCache.get(currentAsset)?.marketId === market.id) {
+            rec = currentWindowAiCache.get(currentAsset)!.rec;
             botPrint("OK", `Reusing AI (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% — only checking price now`);
           } else {
             botPrint("INFO", "Calling Gemini AI for analysis...");
@@ -3057,7 +2970,7 @@ async function startServer() {
               currentAsset
             );
             // Cache AI result for this window so price-gate retries don't re-call Gemini
-            currentWindowAiCache = { windowStart: currentWindowStart, marketId: market.id, asset: currentAsset, rec };
+            currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
           }
 
           // ── Apply divergence overrides AFTER AI decision ────────────────
@@ -3112,13 +3025,6 @@ async function startServer() {
             const yesAsk = orderBooks[tokenIds[0]]?.asks?.[0]?.price ?? market.outcomePrices?.[0] ?? null;
             const noAsk  = orderBooks[tokenIds[1]]?.asks?.[0]?.price ?? market.outcomePrices?.[1] ?? null;
             const entryAsk = orderBooks[tokenIds[outcomeIdx]]?.asks?.[0]?.price ?? market.outcomePrices?.[outcomeIdx] ?? null;
-            const impliedPrice = parseFloat(market.outcomePrices?.[outcomeIdx] ?? "0.5");
-            const p = rec.confidence / 100;
-            const b = (1 - impliedPrice) / impliedPrice;
-            const kelly = (p * b - (1 - p)) / b;
-            const rawBet = kelly > 0 && botSessionStartBalance != null
-              ? (botSessionStartBalance * kelly * cfg.kellyFraction)
-              : null;
             currentEntrySnapshot = {
               market: market.question || market.id,
               windowStart: currentWindowStart,
@@ -3128,7 +3034,7 @@ async function startServer() {
               confidence: rec.confidence,
               edge: rec.estimatedEdge,
               riskLevel: rec.riskLevel,
-              estimatedBet: rawBet !== null ? parseFloat(Math.min(rawBet, cfg.maxBetUsdc).toFixed(2)) : null,
+              estimatedBet: rec.decision === "TRADE" ? BOT_FIXED_TRADE_USDC : null,
               btcPrice: btcPriceData?.price ?? null,
               asset: currentAsset,
               divergence: div && div.strength !== "NONE"
@@ -3155,23 +3061,22 @@ async function startServer() {
           }
 
           // ── Order book pressure alignment filter ──────────────────────────────
-          // Data from 23 live trades shows:
-          //   BUY_PRESSURE  → 67% WR (+$8.84)   ← trade with
+          // Data from live trades shows:
+          //   BUY_PRESSURE  → 67% WR (+$8.84)   ← trade with (UP) or allow (DOWN)
           //   NEUTRAL       → 40% WR (-$1.55)   ← trade with (marginal edge)
-          //   SELL_PRESSURE → 20% WR (-$7.64)   ← BLOCK
-          // Rule: YES order book pressure must not oppose the trade direction.
-          //   UP   trade → block if YES book shows SELL_PRESSURE (crowd selling YES)
-          //   DOWN trade → block if YES book shows BUY_PRESSURE  (crowd buying YES)
+          //   SELL_PRESSURE → 20% WR (-$7.64)   ← BLOCK on UP trades only
+          // Rule: only block when crowd selling YES against an UP trade.
+          //   UP   trade → block if YES book shows SELL_PRESSURE
+          //   DOWN trade → BUY_PRESSURE actually wins 4/4 — do NOT block
           if (qualifies) {
             const tokenIds: string[] = market.clobTokenIds || [];
             const yesSignal = orderBooks[tokenIds[0]]?.imbalanceSignal ?? "UNKNOWN";
             const pressureOpposesDirection =
-              (rec.direction === "UP"   && yesSignal === "SELL_PRESSURE") ||
-              (rec.direction === "DOWN" && yesSignal === "BUY_PRESSURE") ||
+              (rec.direction === "UP" && yesSignal === "SELL_PRESSURE") ||
               yesSignal === "UNKNOWN"; // no order book data = blind entry (hist WR 17%)
 
             if (pressureOpposesDirection) {
-              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/BUY_PRESSURE/UNKNOWN) | re-check next cycle`);
+              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/UNKNOWN) | re-check next cycle`);
               analyzedThisWindow.delete(market.id); // re-check each cycle in case pressure shifts
               pushSSE("cycle", { ts: new Date().toISOString() });
               continue;
@@ -3309,23 +3214,13 @@ async function startServer() {
                   }
                 }
 
-                const dynFraction = dynamicKellyFraction(rec.confidence);
-                const rawBet = kelly > 0 ? currentBalance * kelly * dynFraction * volMultiplier : 0;
-
-                // Cap to Kelly formula, max bet config, and balance cap (mode-dependent)
-                const kellyCapped = Math.min(rawBet, cfg.maxBetUsdc, currentBalance * cfg.balanceCap);
-
-                // Reserve buffer — scale with balance, min $0.20
-                const BALANCE_RESERVE = Math.min(1.0, currentBalance * 0.10);
-                const spendable = Math.max(0, currentBalance - BALANCE_RESERVE);
-
                 // Minimum bet scales with balance: floor at $0.50 or 20% of balance, whichever smaller
                 const MIN_BET = Math.min(0.50, currentBalance * 0.20);
 
-                // Final bet: clamped to what we can actually afford
-                const betAmount = parseFloat(Math.min(kellyCapped, spendable).toFixed(2));
+                // Entry sizing is fixed at BOT_FIXED_TRADE_USDC for every buy order.
+                const betAmount = getFixedEntryBetAmount(currentBalance);
 
-                botPrint("INFO", `Kelly calc: conf=${rec.confidence}% → fraction=${(dynFraction * 100).toFixed(0)}% | implied=${(impliedPrice * 100).toFixed(0)}¢ raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC [${botMode}]`);
+                botPrint("INFO", `Fixed sizing: conf=${rec.confidence}% | implied=${(impliedPrice * 100).toFixed(0)}¢ | target=$${BOT_FIXED_TRADE_USDC.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < MIN_BET) {
@@ -3470,11 +3365,9 @@ async function startServer() {
     console.log("║          PolyBTC AI Trading Bot — STARTED         ║");
     console.log("╚═══════════════════════════════════════════════════╝");
     const startCfg = getActiveConfig();
-    botPrint("INFO", `Mode           : ${botMode}`);
     botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
     botPrint("INFO", `Min edge       : ${startCfg.minEdge}¢`);
-    botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
-    botPrint("INFO", `Kelly fraction : ${startCfg.kellyFraction * 100}%`);
+    botPrint("INFO", `Fixed trade    : $${startCfg.fixedTradeUsdc.toFixed(2)} USDC`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
     startHeartbeat();
@@ -3509,12 +3402,13 @@ async function startServer() {
       windowElapsedSeconds,
       analyzedThisWindow: botAnalyzedThisWindow.size,
       entrySnapshot: currentEntrySnapshot,
+      enabledAssets: ENABLED_ASSETS,
       config: {
-        mode: botMode,
         minConfidence: getActiveConfig().minConfidence,
         minEdge: getActiveConfig().minEdge,
         kellyFraction: getActiveConfig().kellyFraction,
         maxBetUsdc: getActiveConfig().maxBetUsdc,
+        fixedTradeUsdc: getActiveConfig().fixedTradeUsdc,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
     });
@@ -3560,12 +3454,13 @@ async function startServer() {
   });
 
   app.get("/api/bot/learning", (_req, res) => {
+    const maxBoost = Math.max(...adaptiveConfidenceByAsset.values(), 0);
     res.json({
-      consecutiveLosses,
-      consecutiveWins,
-      adaptiveConfidenceBoost,
+      consecutiveLossesByAsset: Object.fromEntries(consecutiveLossesByAsset),
+      consecutiveWinsByAsset: Object.fromEntries(consecutiveWinsByAsset),
+      adaptiveConfidenceByAsset: Object.fromEntries(adaptiveConfidenceByAsset),
       adaptiveLossPenaltyEnabled,
-      effectiveMinConfidence: BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost,
+      effectiveMinConfidence: BOT_MIN_CONFIDENCE + maxBoost,
       baseMinConfidence: BOT_MIN_CONFIDENCE,
       lossMemoryCount: lossMemory.length,
       winMemoryCount: winMemory.length,
@@ -3587,19 +3482,6 @@ async function startServer() {
 
   app.get("/api/bot/momentum-history", (_req, res) => {
     res.json({ history: momentumHistory });
-  });
-
-  // ── Auto-calibrator toggle & status ──────────────────────────────────────────
-  app.get("/api/bot/calibration", (_req, res) => {
-    res.json({ enabled: autoCalibrateEnabled, state: calibrationState });
-  });
-
-  app.post("/api/bot/calibration/toggle", (_req, res) => {
-    autoCalibrateEnabled = !autoCalibrateEnabled;
-    botPrint("INFO", `Auto-calibrator ${autoCalibrateEnabled ? "ENABLED" : "DISABLED"}`);
-    // Run immediately on enable so the current window benefits
-    if (autoCalibrateEnabled) void runAutoCalibration();
-    res.json({ enabled: autoCalibrateEnabled });
   });
 
   app.get("/api/notifications/status", (_req, res) => {
@@ -3700,17 +3582,6 @@ async function startServer() {
     }
   });
 
-  app.post("/api/bot/mode", (req, res) => {
-    const { mode } = req.body || {};
-    if (mode !== "AGGRESSIVE" && mode !== "CONSERVATIVE") {
-      return res.status(400).json({ error: "mode must be AGGRESSIVE or CONSERVATIVE" });
-    }
-    botMode = mode;
-    const cfg = getActiveConfig();
-    botPrint("INFO", `Bot mode switched to ${botMode} — conf≥${cfg.minConfidence}% edge≥${cfg.minEdge}¢ maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% window=${cfg.entryWindowStart}–${cfg.entryWindowEnd}s`);
-    res.json({ ok: true, mode: botMode, config: cfg });
-  });
-
   app.post("/api/bot/config", (req, res) => {
     const { minConfidence, minEdge } = req.body || {};
     if (minConfidence !== undefined) {
@@ -3728,13 +3599,36 @@ async function startServer() {
     res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, config: cfg });
   });
 
+  // ── Active market assets ──────────────────────────────────────────────────
+  app.get("/api/bot/assets", (_req, res) => {
+    res.json({ all: ALL_ASSETS, enabled: ENABLED_ASSETS });
+  });
+
+  app.post("/api/bot/assets", (req, res) => {
+    const { assets } = req.body || {};
+    if (!Array.isArray(assets) || assets.length === 0) {
+      return res.status(400).json({ error: "assets must be a non-empty array" });
+    }
+    const next = assets
+      .map((s: any) => String(s).trim().toUpperCase())
+      .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset));
+    if (next.length === 0) {
+      return res.status(400).json({ error: "No valid assets provided. Valid: BTC, ETH, SOL" });
+    }
+    ENABLED_ASSETS = next;
+    botPrint("INFO", `Active assets updated: ${ENABLED_ASSETS.join(", ")}`);
+    res.json({ ok: true, enabled: ENABLED_ASSETS });
+  });
+
   app.post("/api/bot/reset-confidence", (_req, res) => {
-    adaptiveConfidenceBoost = 0;
-    consecutiveLosses = 0;
-    consecutiveWins = 0;
+    for (const a of ["BTC", "ETH", "SOL"] as const) {
+      adaptiveConfidenceByAsset.set(a, 0);
+      consecutiveLossesByAsset.set(a, 0);
+      consecutiveWinsByAsset.set(a, 0);
+    }
     saveLearning();
-    botPrint("INFO", `Adaptive confidence reset to baseline ${BOT_MIN_CONFIDENCE}% (manual override)`);
-    res.json({ ok: true, baseMinConfidence: BOT_MIN_CONFIDENCE, adaptiveConfidenceBoost: 0 });
+    botPrint("INFO", `Adaptive confidence reset to baseline ${BOT_MIN_CONFIDENCE}% for all assets (manual override)`);
+    res.json({ ok: true, baseMinConfidence: BOT_MIN_CONFIDENCE, adaptiveConfidenceByAsset: Object.fromEntries(adaptiveConfidenceByAsset) });
   });
 
   app.get("/api/bot/trade-log", (req, res) => {
@@ -3855,121 +3749,6 @@ async function startServer() {
     }
   });
 
-  // API for Placing Trades
-  app.post("/api/polymarket/trade", async (req, res) => {
-    try {
-      const { tokenID, amount, side, price, executionMode, amountMode } = req.body;
-      if (!price && String(executionMode || "MANUAL").toUpperCase() === "MANUAL") {
-        return res.status(400).json({ error: "Limit price is required." });
-      }
-      const result = await executePolymarketTrade({
-        tokenID,
-        amount,
-        side: String(side || "BUY").toUpperCase() as Side,
-        price,
-        executionMode: String(executionMode || "MANUAL").toUpperCase() as "MANUAL" | "PASSIVE" | "AGGRESSIVE",
-        amountMode,
-      });
-      res.json(result);
-    } catch (error: any) {
-      console.error("Trade Execution Error:", error);
-      const formatted = formatTradeError(error, req.body);
-      res.status(500).json(formatted);
-    }
-  });
-
-  app.post("/api/polymarket/order/reprice", async (req, res) => {
-    try {
-      const { orderID, executionMode = "AGGRESSIVE" } = req.body || {};
-      if (!orderID) {
-        return res.status(400).json({ error: "orderID is required." });
-      }
-
-      const client = await getClobClient();
-      if (!client) {
-        return res.status(400).json({ error: "CLOB client not initialized. Check credentials." });
-      }
-
-      const order = await client.getOrder(orderID);
-      const originalSize = Number(order.original_size || "0");
-      const matchedSize = Number(order.size_matched || "0");
-      const remainingSize = Math.max(0, originalSize - matchedSize);
-      if (!(remainingSize > 0)) {
-        return res.status(400).json({ error: "No remaining size left to reprice." });
-      }
-
-      const status = String(order.status || "").toUpperCase();
-      if (status === "LIVE" || status === "OPEN") {
-        await client.cancelOrder({ orderID });
-      }
-
-      const repriced = await executePolymarketTrade({
-        tokenID: order.asset_id,
-        amount: remainingSize,
-        side: String(order.side || "BUY").toUpperCase() as Side,
-        price: Number(order.price || "0"),
-        executionMode: String(executionMode || "AGGRESSIVE").toUpperCase() as "MANUAL" | "PASSIVE" | "AGGRESSIVE",
-        amountMode: "SIZE",
-      });
-
-      res.json({
-        success: true,
-        cancelledOrderID: orderID,
-        replacement: repriced,
-        remainingSize: remainingSize.toFixed(6),
-      });
-    } catch (error: any) {
-      console.error("Order Reprice Error:", error);
-      res.status(500).json(formatTradeError(error, req.body));
-    }
-  });
-
-  app.get("/api/polymarket/order/:orderID", async (req, res) => {
-    try {
-      const { orderID } = req.params;
-      const client = await getClobClient();
-      if (!client) {
-        return res.status(400).json({ error: "CLOB client not initialized. Check credentials." });
-      }
-
-      const order = await client.getOrder(orderID);
-      const originalSize = Number(order.original_size || "0");
-      const matchedSize = Number(order.size_matched || "0");
-      const remainingSize = Math.max(0, originalSize - matchedSize);
-      const fillPercent = originalSize > 0 ? (matchedSize / originalSize) * 100 : 0;
-      const normalizedStatus = String(order.status || "UNKNOWN").toUpperCase();
-      const positionState =
-        normalizedStatus === "MATCHED" || fillPercent >= 100
-          ? "FILLED"
-          : matchedSize > 0
-            ? "PARTIALLY_FILLED"
-            : normalizedStatus === "LIVE"
-              ? "OPEN"
-              : normalizedStatus;
-
-      res.json({
-        orderID,
-        status: normalizedStatus,
-        positionState,
-        outcome: order.outcome,
-        side: order.side,
-        market: order.market,
-        assetId: order.asset_id,
-        price: order.price,
-        originalSize: order.original_size,
-        matchedSize: order.size_matched,
-        remainingSize: remainingSize.toFixed(4),
-        fillPercent: fillPercent.toFixed(2),
-        createdAt: order.created_at,
-        expiration: order.expiration,
-        raw: order,
-      });
-    } catch (error: any) {
-      console.error("Order Lookup Error:", error);
-      res.status(500).json(formatTradeError(error, { orderID: req.params.orderID }));
-    }
-  });
-
   app.get("/api/polymarket/automation", async (_req, res) => {
     try {
       const collection = await getPositionAutomationCollection();
@@ -4033,124 +3812,11 @@ async function startServer() {
   });
 
   // ── Helper: resolve trading address (proxy wallet or EOA) ────────────────
-  app.get("/api/polymarket/copy-trading/trader/:address", async (req, res) => {
-    try {
-      const address = String(req.params.address || "").trim();
-      if (!ethers.utils.isAddress(address)) {
-        return res.status(400).json({ error: "Valid Polygon wallet/profile address is required." });
-      }
-
-      const positionsRaw = await fetchOpenPositionsForUser(address);
-      const positions = positionsRaw
-        .filter((p) => Number(p.size ?? 0) > 0)
-        .sort((a, b) => Number(b.currentValue ?? b.initialValue ?? 0) - Number(a.currentValue ?? a.initialValue ?? 0))
-        .map(mapCopyTraderPosition);
-
-      const totalExposure = positions.reduce((sum, p) => sum + Number(p.currentValue || p.initialValue || 0), 0);
-      const totalCost = positions.reduce((sum, p) => sum + Number(p.initialValue || 0), 0);
-      const totalCashPnl = positions.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
-
-      res.json({
-        trader: address,
-        positions,
-        summary: {
-          openPositions: positions.length,
-          totalExposure: totalExposure.toFixed(4),
-          totalCost: totalCost.toFixed(4),
-          totalCashPnl: totalCashPnl.toFixed(4),
-        },
-      });
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch trader positions", detail: error?.message || String(error) });
-    }
-  });
-
-  app.post("/api/polymarket/copy-trading/execute", async (req, res) => {
-    try {
-      const {
-        leaderAddress,
-        assetId,
-        amount,
-        executionMode = "AGGRESSIVE",
-      } = req.body || {};
-
-      const normalizedLeaderAddress = String(leaderAddress || "").trim();
-      const normalizedAssetId = String(assetId || "").trim();
-      const spendAmount = Number(amount);
-      const normalizedExecutionMode = String(executionMode || "AGGRESSIVE").toUpperCase() as "PASSIVE" | "AGGRESSIVE";
-
-      if (!ethers.utils.isAddress(normalizedLeaderAddress)) {
-        return res.status(400).json({ error: "Valid leaderAddress is required." });
-      }
-      if (!normalizedAssetId) {
-        return res.status(400).json({ error: "assetId is required." });
-      }
-      if (!Number.isFinite(spendAmount) || spendAmount <= 0) {
-        return res.status(400).json({ error: "amount must be greater than 0." });
-      }
-      if (normalizedExecutionMode !== "PASSIVE" && normalizedExecutionMode !== "AGGRESSIVE") {
-        return res.status(400).json({ error: "executionMode must be PASSIVE or AGGRESSIVE." });
-      }
-
-      const myTradingAddress = await getTradingAddress();
-      if (myTradingAddress && myTradingAddress.toLowerCase() === normalizedLeaderAddress.toLowerCase()) {
-        return res.status(400).json({ error: "Leader address matches your configured trading address." });
-      }
-
-      const leaderPositions = await fetchOpenPositionsForUser(normalizedLeaderAddress);
-      const leaderPosition = leaderPositions.find((position) => String(position.asset || "") === normalizedAssetId);
-      if (!leaderPosition) {
-        return res.status(404).json({ error: "Selected leader position is no longer open." });
-      }
-
-      const result = await executePolymarketTrade({
-        tokenID: normalizedAssetId,
-        amount: spendAmount,
-        side: Side.BUY,
-        executionMode: normalizedExecutionMode,
-        amountMode: "SPEND",
-      });
-
-      res.json({
-        success: true,
-        trader: normalizedLeaderAddress,
-        copiedPosition: mapCopyTraderPosition(leaderPosition),
-        executionMode: normalizedExecutionMode,
-        result,
-      });
-    } catch (error: any) {
-      res.status(500).json(formatTradeError(error, req.body));
-    }
-  });
-
   const getTradingAddress = async (): Promise<string | null> => {
     if (POLYMARKET_FUNDER_ADDRESS) return POLYMARKET_FUNDER_ADDRESS;
     await getClobClient();
     return clobWallet?.address ?? null;
   };
-
-  const fetchOpenPositionsForUser = async (userAddress: string): Promise<any[]> => {
-    const response = await axios.get("https://data-api.polymarket.com/positions", {
-      params: { user: userAddress, limit: 500, sizeThreshold: 0 },
-      timeout: 10000,
-    });
-    return Array.isArray(response.data) ? response.data : [];
-  };
-
-  const mapCopyTraderPosition = (position: any): CopyTraderPosition => ({
-    assetId: String(position.asset || ""),
-    market: String(position.title || position.market || ""),
-    outcome: String(position.outcome || ""),
-    size: Number(position.size ?? 0).toFixed(4),
-    averagePrice: Number(position.avgPrice ?? 0).toFixed(4),
-    currentPrice: Number(position.curPrice ?? 0).toFixed(4),
-    initialValue: Number(position.initialValue ?? 0).toFixed(4),
-    currentValue: Number(position.currentValue ?? 0).toFixed(4),
-    cashPnl: Number(position.cashPnl ?? 0).toFixed(4),
-    percentPnl: Number(position.percentPnl ?? 0).toFixed(2),
-    endDate: position.endDate || null,
-    eventSlug: position.eventSlug || null,
-  });
 
   // ── Current positions (open) ───────────────────────────────────────────────
   app.get("/api/polymarket/positions", async (_req, res) => {

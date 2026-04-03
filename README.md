@@ -22,7 +22,7 @@
 | **Heartbeat** | Kirim heartbeat ke Polymarket setiap 5s — mencegah open orders di-cancel otomatis (docs: timeout 10s) |
 | **AMM Price Fix** | Pakai `outcomePrices` (AMM implied) sebagai harga referensi entry — bukan CLOB ask yang hampir selalu 99¢ di market illiquid |
 | **Auto-Calibrator** | Jalankan FastLoop backtest otomatis di awal tiap window — sesuaikan `minStrength` dan confidence delta berdasarkan win rate terkini |
-| **Auto Trading** | Eksekusi order otomatis ke Polymarket CLOB dengan position sizing Kelly Criterion |
+| **Auto Trading** | Eksekusi order otomatis ke Polymarket CLOB dengan fixed size `$1` per entry |
 | **Divergence Tracker** | Deteksi price lag antara CEX (BTC/ETH/SOL) dan Polymarket setiap 5 detik — threshold berbeda per aset |
 | **Window AI Cache** | Gemini hanya dipanggil sekali per window; price-gate retry hanya re-fetch order book (~0.5s) |
 | **Technical Indicators** | RSI(14), EMA(9/21), MACD, Bollinger Bands, volume spike, signal score alignment |
@@ -66,7 +66,7 @@ Bot berjalan dalam siklus 5 detik, memproses BTC → ETH → SOL secara beruruta
 5. **Early Guard** — Blok trade <60 detik jika tidak ada divergence dan BTC flat (coin-flip guard)
 6. **AI Analysis** — Kirim data ke Gemini dengan konteks FastLoop, divergence, dan learning patterns
 7. **Pressure Alignment Filter** — Tolak trade jika arah bertentangan dengan order book pressure
-8. **Gate Check** — Validasi timing, likuiditas, AMM entry price, dynamic Kelly fraction
+8. **Gate Check** — Validasi timing, likuiditas, AMM entry price, dan fixed size entry
 9. **Eksekusi** — Submit order ke Polymarket CLOB, arm TP/SL/trailing automation
 10. **Correlated Entry** — Jika BTC diverge STRONG, otomatis enter ETH+SOL di arah sama
 11. **Monitor** — TP/SL/trailing stop dicek setiap 3s; profit lock + spike capture aktif
@@ -111,18 +111,15 @@ Berdasarkan analisa 23 live trades:
 
 ---
 
-## Dynamic Kelly Fraction
+## Fixed Trade Size
 
-Kelly fraction menyesuaikan diri dengan tingkat keyakinan AI (AGGRESSIVE mode):
+Setiap entry buy bot memakai nominal tetap **$1 USDC** (`BOT_FIXED_TRADE_USDC=1`), termasuk:
 
-| Confidence | Kelly Fraction | Keterangan |
-|---|---|---|
-| 65–74% | **25%** | Borderline signal, bet kecil |
-| 75–84% | **50%** | Normal |
-| 85–89% | **55%** | Signal kuat |
-| ≥ 90% | **65%** | Sangat yakin |
+- trade hasil analisa AI
+- divergence fast path
+- correlated multi-asset entry
 
-CONSERVATIVE mode: flat 20%.
+Exit sell tetap memakai jumlah shares posisi yang sudah dimiliki.
 
 ---
 
@@ -158,7 +155,7 @@ Saat BTC STRONG divergence terpicu via Fast Path:
 1. BTC trade dieksekusi normal
 2. Bot langsung cek ETH dan SOL (parallel)
 3. Jika market tersedia dan belum traded di window ini → enter di arah yang sama
-4. Kelly fraction: 70% dari normal (signal adalah BTC-derived, bukan independent)
+4. Nominal entry tetap $1 (signal berasal dari BTC, bukan divergence independent)
 5. Confidence: 72% (sedikit lebih rendah dari BTC's 78)
 
 ---
@@ -251,8 +248,7 @@ GEMINI_API_KEY=AIza...
 ENABLED_ASSETS=BTC,ETH,SOL
 BOT_MIN_CONFIDENCE=65
 BOT_MIN_EDGE=0.10
-BOT_KELLY_FRACTION=0.40
-BOT_MAX_BET_USDC=250
+BOT_FIXED_TRADE_USDC=1
 BOT_SESSION_LOSS_LIMIT=0.30
 BOT_AUTO_START=false
 ```
@@ -309,8 +305,8 @@ MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
 |---|---|---|
 | Min Confidence | 65% | 75% |
 | Min Edge | 0.10¢ | 0.12¢ |
-| Kelly Fraction | Dynamic (25–65%) | 20% flat |
-| Max Bet | $250 | $50 |
+| Fixed Trade Size | $1 | $1 |
+| Max Bet | Not used for auto-entry | Not used for auto-entry |
 | Session Loss Limit | 30% | 15% |
 | TP/SL Monitor | 3 detik | 3 detik |
 

@@ -64,12 +64,13 @@ interface BotStatus {
   windowElapsedSeconds: number;
   analyzedThisWindow: number;
   entrySnapshot: EntrySnapshot | null;
+  enabledAssets: string[];
   config: {
-    mode: "AGGRESSIVE" | "CONSERVATIVE";
     minConfidence: number;
     minEdge: number;
     kellyFraction: number;
     maxBetUsdc: number;
+    fixedTradeUsdc?: number;
     sessionLossLimit: number;
     scanIntervalMs: number;
   };
@@ -249,6 +250,8 @@ export default function BotDashboard() {
   const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
   const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
   const [learning, setLearning] = useState<LearningState | null>(null);
+  const [enabledAssets, setEnabledAssets] = useState<string[]>(["BTC"]);
+  const [assetsLoading, setAssetsLoading] = useState(false);
   const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
   const tradeBellRef = useRef<HTMLAudioElement | null>(null);
   const seenTradeBellKeysRef = useRef<Set<string>>(new Set());
@@ -270,7 +273,11 @@ export default function BotDashboard() {
         fetch("/api/bot/learning").then((r) => r.json()),
       ]);
 
-      if (statusRes.status === "fulfilled") setStatus(statusRes.value as BotStatus);
+      if (statusRes.status === "fulfilled") {
+        const s = statusRes.value as BotStatus;
+        setStatus(s);
+        if (s.enabledAssets?.length) setEnabledAssets(s.enabledAssets);
+      }
       if (logRes.status === "fulfilled") setLog((logRes.value as any).log || []);
       if (perfRes.status === "fulfilled" && !(perfRes.value as any).error) {
         setPerformance(perfRes.value as any);
@@ -340,19 +347,22 @@ export default function BotDashboard() {
     });
   }, [log]);
 
-  const handleToggleMode = async () => {
-    const currentMode = status?.config.mode ?? "AGGRESSIVE";
-    const nextMode = currentMode === "AGGRESSIVE" ? "CONSERVATIVE" : "AGGRESSIVE";
-    setModeLoading(true);
+  const handleToggleAsset = async (asset: string) => {
+    const next = enabledAssets.includes(asset)
+      ? enabledAssets.filter(a => a !== asset)
+      : [...enabledAssets, asset];
+    if (next.length === 0) return; // must keep at least one
+    setAssetsLoading(true);
     try {
-      await fetch("/api/bot/mode", {
+      const res = await fetch("/api/bot/assets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: nextMode }),
+        body: JSON.stringify({ assets: next }),
       });
-      await fetchAll();
+      const data = await res.json();
+      if (res.ok) setEnabledAssets(data.enabled);
     } finally {
-      setModeLoading(false);
+      setAssetsLoading(false);
     }
   };
 
@@ -741,6 +751,105 @@ export default function BotDashboard() {
       {activeTab === "dashboard" && (
       <div className="space-y-6">
 
+      {/* ── Session PnL Chart ── */}
+      <div className="glass-card p-4 w-full">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+            <LineChartIcon className="w-4 h-4" />
+            Session PnL
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
+              {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
+            </span>
+          </h3>
+          {pnlHistory.length > 0 && (
+            <span className={cn(
+              "text-sm font-mono font-bold",
+              lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
+            )}>
+              {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
+            </span>
+          )}
+        </div>
+
+        {pnlHistory.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
+            <BarChart3 className="w-8 h-8 opacity-30" />
+            <p className="text-xs">No resolved trades yet — chart appears after first WIN or LOSS</p>
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <AreaChart data={pnlHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="pnlGradientUp" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor="#22c55e" stopOpacity={0.25} />
+                  <stop offset="95%" stopColor="#22c55e" stopOpacity={0.03} />
+                </linearGradient>
+                <linearGradient id="pnlGradientDown" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor="#ef4444" stopOpacity={0.03} />
+                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0.25} />
+                </linearGradient>
+              </defs>
+
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+              <ReferenceLine y={0} stroke="#52525b" strokeDasharray="4 4" strokeWidth={1} />
+
+              <XAxis
+                dataKey="time"
+                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
+                axisLine={false}
+                tickLine={false}
+                interval="preserveStartEnd"
+              />
+              <YAxis
+                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
+                axisLine={false}
+                tickLine={false}
+                tickFormatter={(v) => `$${v}`}
+                width={40}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: "#18181b",
+                  border: "1px solid #3f3f46",
+                  borderRadius: 8,
+                  fontSize: 11,
+                  color: "#e4e4e7",
+                }}
+                labelStyle={{ color: "#71717a", marginBottom: 4 }}
+                formatter={(value: any, name: string) => [
+                  `${Number(value) >= 0 ? "+" : ""}$${Number(value).toFixed(2)}`,
+                  name === "cumulative" ? "Cumulative PnL" : "This Trade",
+                ]}
+              />
+
+              <Area
+                type="monotone"
+                dataKey="cumulative"
+                stroke={lastCumulative >= 0 ? "#22c55e" : "#ef4444"}
+                strokeWidth={2}
+                fill={lastCumulative >= 0 ? "url(#pnlGradientUp)" : "url(#pnlGradientDown)"}
+                dot={(props: any) => {
+                  const { cx, cy, payload } = props;
+                  const isWin = payload.decision === "WIN";
+                  return (
+                    <circle
+                      key={`dot-${cx}-${cy}`}
+                      cx={cx}
+                      cy={cy}
+                      r={4.5}
+                      fill={isWin ? "#22c55e" : "#ef4444"}
+                      stroke="#09090b"
+                      strokeWidth={1.5}
+                    />
+                  );
+                }}
+                activeDot={{ r: 6, stroke: "#09090b", strokeWidth: 2 }}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
       {/* ── FastLoop Momentum Widget ── */}
       {(() => {
         const fm = status?.entrySnapshot?.fastLoopMomentum ?? (momentumHistory.length > 0 ? momentumHistory[momentumHistory.length - 1] : null);
@@ -998,7 +1107,7 @@ export default function BotDashboard() {
                 {lossPenaltySaving ? "…" : learning?.adaptiveLossPenaltyEnabled === false ? "Enable +5%" : "Disable +5%"}
               </button>
             </div>
-            <div>Max ${status?.config.maxBetUsdc ?? 50} | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
+            <div>Fixed ${status?.config.fixedTradeUsdc ?? 1} per trade | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
           </div>
         </div>
 
@@ -1069,70 +1178,55 @@ export default function BotDashboard() {
           </div>
         </div>
 
-        {/* ── Bot Mode Selector ── */}
+        {/* ── Active Markets ── */}
         <div className="glass-card p-4 flex flex-col gap-3">
           <div className="flex items-center gap-2 text-zinc-500 text-xs font-semibold uppercase tracking-wider">
-            <Shield className="w-3.5 h-3.5" />
-            Bot Mode
+            <Activity className="w-3.5 h-3.5" />
+            Active Markets
           </div>
           <div className="flex flex-col gap-2">
-            {[
-              {
-                mode: "AGGRESSIVE" as const,
-                label: "Aggressive",
-                icon: <Flame className="w-4 h-4" />,
-                color: "orange",
-                stats: ["Conf ≥65%", "Entry ≤55¢", "Kelly 40%", "Max $250", "10–285s"],
-              },
-              {
-                mode: "CONSERVATIVE" as const,
-                label: "Conservative",
-                icon: <Shield className="w-4 h-4" />,
-                color: "blue",
-                stats: ["Conf ≥75%", "Entry ≤65¢", "Kelly 20%", "Max $50", "30–240s"],
-              },
-            ].map(({ mode, label, icon, color, stats }) => {
-              const active = (status?.config.mode ?? "AGGRESSIVE") === mode;
+            {(["BTC", "ETH", "SOL"] as const).map((asset) => {
+              const active = enabledAssets.includes(asset);
+              const isLast = active && enabledAssets.length === 1;
+              const assetColor: Record<string, string> = { BTC: "orange", ETH: "blue", SOL: "purple" };
+              const color = assetColor[asset];
               return (
                 <button
-                  key={mode}
+                  key={asset}
                   type="button"
-                  onClick={() => !active && handleToggleMode()}
-                  disabled={modeLoading || active}
+                  title={isLast ? "At least one asset must remain active" : `${active ? "Disable" : "Enable"} ${asset}`}
+                  onClick={() => !isLast && handleToggleAsset(asset)}
+                  disabled={assetsLoading || isLast}
                   className={cn(
                     "w-full text-left rounded-lg border p-2.5 transition-all",
                     active
                       ? color === "orange"
-                        ? "bg-orange-500/15 border-orange-500/50 cursor-default"
-                        : "bg-blue-500/15 border-blue-500/50 cursor-default"
-                      : "bg-zinc-800/50 border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 cursor-pointer disabled:opacity-40"
+                        ? "bg-orange-500/15 border-orange-500/50"
+                        : color === "blue"
+                          ? "bg-blue-500/15 border-blue-500/50"
+                          : "bg-purple-500/15 border-purple-500/50"
+                      : "bg-zinc-800/50 border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 opacity-50",
+                    isLast ? "cursor-default" : "cursor-pointer disabled:opacity-40"
                   )}
                 >
                   <div className={cn(
-                    "flex items-center gap-1.5 font-bold text-xs mb-1.5",
+                    "flex items-center gap-1.5 font-bold text-xs",
                     active
-                      ? color === "orange" ? "text-orange-300" : "text-blue-300"
-                      : "text-zinc-400"
+                      ? color === "orange" ? "text-orange-300" : color === "blue" ? "text-blue-300" : "text-purple-300"
+                      : "text-zinc-500"
                   )}>
-                    {icon}
-                    {label}
-                    {active && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ACTIVE</span>}
-                  </div>
-                  <div className="flex flex-wrap gap-1">
-                    {stats.map((s) => (
-                      <span key={s} className={cn(
-                        "text-[9px] px-1 py-0.5 rounded font-mono",
-                        active
-                          ? color === "orange" ? "bg-orange-500/10 text-orange-400" : "bg-blue-500/10 text-blue-400"
-                          : "bg-zinc-700 text-zinc-500"
-                      )}>
-                        {s}
-                      </span>
-                    ))}
+                    <span className="font-mono">{asset}</span>
+                    {active
+                      ? <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ON</span>
+                      : <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-zinc-700 text-zinc-500 font-bold">OFF</span>
+                    }
                   </div>
                 </button>
               );
             })}
+          </div>
+          <div className="text-[10px] text-zinc-600">
+            {enabledAssets.length === 1 ? `Scanning ${enabledAssets[0]} only` : `Scanning ${enabledAssets.join(" + ")}`}
           </div>
         </div>
 
@@ -1302,7 +1396,7 @@ export default function BotDashboard() {
                   )}
                   {snap.estimatedBet !== null && snap.estimatedBet > 0 && (
                     <span className="px-2 py-0.5 rounded-full font-bold bg-purple-500/10 text-purple-400 border border-purple-500/30">
-                      ~${snap.estimatedBet.toFixed(2)} Kelly
+                      ${snap.estimatedBet.toFixed(2)} fixed
                     </span>
                   )}
                   {oppPrice !== null && (
@@ -1331,105 +1425,6 @@ export default function BotDashboard() {
           </div>
         );
       })()}
-
-      {/* ── Session PnL Chart ── */}
-      <div className="glass-card p-4 w-full">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
-            <LineChartIcon className="w-4 h-4" />
-            Session PnL
-            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
-              {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
-            </span>
-          </h3>
-          {pnlHistory.length > 0 && (
-            <span className={cn(
-              "text-sm font-mono font-bold",
-              lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
-            )}>
-              {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
-            </span>
-          )}
-        </div>
-
-        {pnlHistory.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
-            <BarChart3 className="w-8 h-8 opacity-30" />
-            <p className="text-xs">No resolved trades yet — chart appears after first WIN or LOSS</p>
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height={180}>
-            <AreaChart data={pnlHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-              <defs>
-                <linearGradient id="pnlGradientUp" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#22c55e" stopOpacity={0.25} />
-                  <stop offset="95%" stopColor="#22c55e" stopOpacity={0.03} />
-                </linearGradient>
-                <linearGradient id="pnlGradientDown" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#ef4444" stopOpacity={0.03} />
-                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0.25} />
-                </linearGradient>
-              </defs>
-
-              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-              <ReferenceLine y={0} stroke="#52525b" strokeDasharray="4 4" strokeWidth={1} />
-
-              <XAxis
-                dataKey="time"
-                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
-                axisLine={false}
-                tickLine={false}
-                interval="preserveStartEnd"
-              />
-              <YAxis
-                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
-                axisLine={false}
-                tickLine={false}
-                tickFormatter={(v) => `$${v}`}
-                width={40}
-              />
-              <Tooltip
-                contentStyle={{
-                  background: "#18181b",
-                  border: "1px solid #3f3f46",
-                  borderRadius: 8,
-                  fontSize: 11,
-                  color: "#e4e4e7",
-                }}
-                labelStyle={{ color: "#71717a", marginBottom: 4 }}
-                formatter={(value: any, name: string) => [
-                  `${Number(value) >= 0 ? "+" : ""}$${Number(value).toFixed(2)}`,
-                  name === "cumulative" ? "Cumulative PnL" : "This Trade",
-                ]}
-              />
-
-              <Area
-                type="monotone"
-                dataKey="cumulative"
-                stroke={lastCumulative >= 0 ? "#22c55e" : "#ef4444"}
-                strokeWidth={2}
-                fill={lastCumulative >= 0 ? "url(#pnlGradientUp)" : "url(#pnlGradientDown)"}
-                dot={(props: any) => {
-                  const { cx, cy, payload } = props;
-                  const isWin = payload.decision === "WIN";
-                  return (
-                    <circle
-                      key={`dot-${cx}-${cy}`}
-                      cx={cx}
-                      cy={cy}
-                      r={4.5}
-                      fill={isWin ? "#22c55e" : "#ef4444"}
-                      stroke="#09090b"
-                      strokeWidth={1.5}
-                    />
-                  );
-                }}
-                activeDot={{ r: 6, stroke: "#09090b", strokeWidth: 2 }}
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        )}
-      </div>
 
       {/* ── Win / Loss / PnL Row ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
