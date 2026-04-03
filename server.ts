@@ -14,6 +14,39 @@ import { analyzeMarket } from "./src/services/gemini.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function sanitizeTerminalText(value: string): string {
+  return value
+    .replace(/\uFEFF/g, "")
+    .replace(/âœ“|✓/g, "[OK]")
+    .replace(/âœ—|✗/g, "[SKIP]")
+    .replace(/âœ–|✖/g, "[ERR]")
+    .replace(/âš¡|⚡/g, "[FAST]")
+    .replace(/âš |⚠/g, "[WARN]")
+    .replace(/ðŸ’°|💰/g, "$")
+    .replace(/â–²|▲/g, "^")
+    .replace(/â–¼|▼/g, "v")
+    .replace(/â†’|→/g, "->")
+    .replace(/â†|←/g, "<-")
+    .replace(/â‰¥|≥/g, ">=")
+    .replace(/â‰¤|≤/g, "<=")
+    .replace(/â€¦|…/g, "...")
+    .replace(/Â¢|¢/g, "c")
+    .replace(/â€”|—|–/g, "-")
+    .replace(/âœ¦|♦/g, "*")
+    .replace(/â•”|â•š|â•‘|â•|╔|╚|║|═/g, "=")
+    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "")
+    .replace(/ {2,}/g, " ")
+    .trimEnd();
+}
+
+const rawConsoleLog = console.log.bind(console);
+const rawConsoleWarn = console.warn.bind(console);
+const rawConsoleError = console.error.bind(console);
+
+console.log = (...args: any[]) => rawConsoleLog(...args.map((arg) => typeof arg === "string" ? sanitizeTerminalText(arg) : arg));
+console.warn = (...args: any[]) => rawConsoleWarn(...args.map((arg) => typeof arg === "string" ? sanitizeTerminalText(arg) : arg));
+console.error = (...args: any[]) => rawConsoleError(...args.map((arg) => typeof arg === "string" ? sanitizeTerminalText(arg) : arg));
+
 // â”€â”€ Persistence: data/ directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
@@ -1251,8 +1284,11 @@ interface PriceLagSignal {
   estimatedEdge: number;
   riskLevel: "LOW" | "MEDIUM" | "HIGH";
   reasoning: string;
+  assetMove10Pct: number;
   assetMove30Pct: number;
   assetMove60Pct: number;
+  targetDelta10Cents: number;
+  opposingDelta10Cents: number;
   yesDelta30Cents: number;
   noDelta30Cents: number;
   lagGapCents: number;
@@ -1308,25 +1344,31 @@ function getLagThresholds(assetPrice: number) {
 function computePriceLagSignal(params: {
   assetSymbol: string;
   assetNow: number;
+  assetRef10: number;
   assetRef30: number;
   assetRef60: number;
   yesNow: number;
+  yesRef10: number;
   yesRef30: number;
   noNow: number;
+  noRef10: number;
   noRef30: number;
 }): PriceLagSignal {
   const {
     assetSymbol,
     assetNow,
+    assetRef10,
     assetRef30,
     assetRef60,
     yesNow,
+    yesRef10,
     yesRef30,
     noNow,
+    noRef10,
     noRef30,
   } = params;
 
-  if (!(assetNow > 0 && assetRef30 > 0 && assetRef60 > 0 && yesNow > 0 && yesRef30 > 0 && noNow > 0 && noRef30 > 0)) {
+  if (!(assetNow > 0 && assetRef10 > 0 && assetRef30 > 0 && assetRef60 > 0 && yesNow > 0 && yesRef10 > 0 && yesRef30 > 0 && noNow > 0 && noRef10 > 0 && noRef30 > 0)) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
@@ -1334,8 +1376,11 @@ function computePriceLagSignal(params: {
       estimatedEdge: 0,
       riskLevel: "HIGH",
       reasoning: "Lag buffers not ready yet",
+      assetMove10Pct: 0,
       assetMove30Pct: 0,
       assetMove60Pct: 0,
+      targetDelta10Cents: 0,
+      opposingDelta10Cents: 0,
       yesDelta30Cents: 0,
       noDelta30Cents: 0,
       lagGapCents: 0,
@@ -1344,9 +1389,12 @@ function computePriceLagSignal(params: {
     };
   }
 
+  const assetMove10Pct = ((assetNow - assetRef10) / assetRef10) * 100;
   const assetMove30Pct = ((assetNow - assetRef30) / assetRef30) * 100;
   const assetMove60Pct = ((assetNow - assetRef60) / assetRef60) * 100;
+  const yesDelta10Cents = (yesNow - yesRef10) * 100;
   const yesDelta30Cents = (yesNow - yesRef30) * 100;
+  const noDelta10Cents = (noNow - noRef10) * 100;
   const noDelta30Cents = (noNow - noRef30) * 100;
   const absMove30 = Math.abs(assetMove30Pct);
   const thresholds = getLagThresholds(assetNow);
@@ -1359,8 +1407,11 @@ function computePriceLagSignal(params: {
       estimatedEdge: 0,
       riskLevel: "HIGH",
       reasoning: `${assetSymbol} move too small for lag scalp (${assetMove30Pct.toFixed(3)}%)`,
+      assetMove10Pct,
       assetMove30Pct,
       assetMove60Pct,
+      targetDelta10Cents: 0,
+      opposingDelta10Cents: 0,
       yesDelta30Cents,
       noDelta30Cents,
       lagGapCents: 0,
@@ -1371,11 +1422,40 @@ function computePriceLagSignal(params: {
 
   const direction: "UP" | "DOWN" = assetMove30Pct > 0 ? "UP" : "DOWN";
   const persistentMove = assetMove30Pct * assetMove60Pct > 0 && Math.abs(assetMove60Pct) >= thresholds.minMove60Pct * 0.6;
+  const freshImpulse =
+    assetMove10Pct * assetMove30Pct > 0 &&
+    Math.abs(assetMove10Pct) >= thresholds.minMove30Pct * 0.18;
+  const reversalDetected =
+    assetMove10Pct * assetMove30Pct < 0 &&
+    Math.abs(assetMove10Pct) >= thresholds.minMove30Pct * 0.14;
+  const targetDelta10Cents = direction === "UP" ? Math.max(0, yesDelta10Cents) : Math.max(0, noDelta10Cents);
+  const opposingDelta10Cents = direction === "UP" ? Math.max(0, noDelta10Cents) : Math.max(0, yesDelta10Cents);
   const targetTokenDelta = direction === "UP" ? Math.max(0, yesDelta30Cents) : Math.max(0, noDelta30Cents);
   const opposingTokenDelta = direction === "UP" ? Math.max(0, noDelta30Cents) : Math.max(0, yesDelta30Cents);
   const expectedCatchupCents = Math.min(10, Math.max(2, (absMove30 / thresholds.minMove30Pct) * 2.6));
   const lagGapCents = expectedCatchupCents - targetTokenDelta;
   const entryPrice = direction === "UP" ? yesNow : noNow;
+
+  if (reversalDetected) {
+    return {
+      decision: "NO_TRADE",
+      direction,
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: `${assetSymbol} micro move already reversing against ${direction} setup`,
+      assetMove10Pct,
+      assetMove30Pct,
+      assetMove60Pct,
+      targetDelta10Cents,
+      opposingDelta10Cents,
+      yesDelta30Cents,
+      noDelta30Cents,
+      lagGapCents,
+      expectedCatchupCents,
+      maxEntryPrice: thresholds.baseMaxEntryPrice,
+    };
+  }
 
   if (lagGapCents < thresholds.minLagGapCents) {
     return {
@@ -1385,8 +1465,11 @@ function computePriceLagSignal(params: {
       estimatedEdge: 0,
       riskLevel: "HIGH",
       reasoning: `${assetSymbol} moved but ${direction} token already caught up (${targetTokenDelta.toFixed(2)}c)`,
+      assetMove10Pct,
       assetMove30Pct,
       assetMove60Pct,
+      targetDelta10Cents,
+      opposingDelta10Cents,
       yesDelta30Cents,
       noDelta30Cents,
       lagGapCents,
@@ -1395,21 +1478,76 @@ function computePriceLagSignal(params: {
     };
   }
 
-  let confidence = 54;
+  const alreadyCatchingUpFast =
+    targetDelta10Cents >= Math.max(0.9, lagGapCents * 0.65) ||
+    targetDelta10Cents >= expectedCatchupCents * 0.45;
+
+  if (alreadyCatchingUpFast) {
+    return {
+      decision: "NO_TRADE",
+      direction,
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: `${assetSymbol} lag already being filled too fast (${targetDelta10Cents.toFixed(2)}c in 10s)`,
+      assetMove10Pct,
+      assetMove30Pct,
+      assetMove60Pct,
+      targetDelta10Cents,
+      opposingDelta10Cents,
+      yesDelta30Cents,
+      noDelta30Cents,
+      lagGapCents,
+      expectedCatchupCents,
+      maxEntryPrice: thresholds.baseMaxEntryPrice,
+    };
+  }
+
+  if (!freshImpulse && !persistentMove) {
+    return {
+      decision: "NO_TRADE",
+      direction,
+      confidence: 0,
+      estimatedEdge: 0,
+      riskLevel: "HIGH",
+      reasoning: `${assetSymbol} lag exists but impulse is stale`,
+      assetMove10Pct,
+      assetMove30Pct,
+      assetMove60Pct,
+      targetDelta10Cents,
+      opposingDelta10Cents,
+      yesDelta30Cents,
+      noDelta30Cents,
+      lagGapCents,
+      expectedCatchupCents,
+      maxEntryPrice: thresholds.baseMaxEntryPrice,
+    };
+  }
+
+  let confidence = 56;
   confidence += Math.min(16, (absMove30 / thresholds.minMove30Pct) * 6);
   confidence += Math.min(10, lagGapCents * 2.2);
   if (persistentMove) confidence += 7;
+  if (freshImpulse) confidence += 6;
+  if (targetDelta10Cents <= Math.max(0.35, lagGapCents * 0.25)) confidence += 4;
   if (opposingTokenDelta > targetTokenDelta + 1) confidence -= 6;
+  if (opposingDelta10Cents > targetDelta10Cents + 0.7) confidence -= 4;
   if (entryPrice > 0.60) confidence -= 5;
   if (entryPrice > 0.66) confidence -= 6;
   confidence = Math.max(55, Math.min(90, Math.round(confidence)));
 
-  const maxEntryPrice = Math.min(0.68, thresholds.baseMaxEntryPrice + Math.min(0.05, lagGapCents * 0.015) + (persistentMove ? 0.02 : 0));
+  const maxEntryPrice = Math.min(
+    0.66,
+    thresholds.baseMaxEntryPrice +
+      Math.min(0.04, lagGapCents * 0.012) +
+      (persistentMove ? 0.01 : 0) +
+      (freshImpulse ? 0.01 : 0)
+  );
   const estimatedEdge = parseFloat(((confidence / 100) - entryPrice).toFixed(4));
   const riskLevel: "LOW" | "MEDIUM" | "HIGH" =
-    confidence >= 78 && lagGapCents >= 3 && entryPrice <= 0.60
+    confidence >= 79 && lagGapCents >= 3 && entryPrice <= 0.58
       ? "LOW"
-      : confidence >= 67 && entryPrice <= 0.66
+      : confidence >= 69 && entryPrice <= 0.64
         ? "MEDIUM"
         : "HIGH";
 
@@ -1419,9 +1557,12 @@ function computePriceLagSignal(params: {
     confidence,
     estimatedEdge,
     riskLevel,
-    reasoning: `${assetSymbol} ${assetMove30Pct >= 0 ? "+" : ""}${assetMove30Pct.toFixed(3)}% /30s, ${assetMove60Pct >= 0 ? "+" : ""}${assetMove60Pct.toFixed(3)}% /60s | YES ${yesDelta30Cents >= 0 ? "+" : ""}${yesDelta30Cents.toFixed(2)}c | NO ${noDelta30Cents >= 0 ? "+" : ""}${noDelta30Cents.toFixed(2)}c | lag gap ${lagGapCents.toFixed(2)}c`,
+    reasoning: `${assetSymbol} ${assetMove10Pct >= 0 ? "+" : ""}${assetMove10Pct.toFixed(3)}% /10s, ${assetMove30Pct >= 0 ? "+" : ""}${assetMove30Pct.toFixed(3)}% /30s, ${assetMove60Pct >= 0 ? "+" : ""}${assetMove60Pct.toFixed(3)}% /60s | YES ${yesDelta30Cents >= 0 ? "+" : ""}${yesDelta30Cents.toFixed(2)}c | NO ${noDelta30Cents >= 0 ? "+" : ""}${noDelta30Cents.toFixed(2)}c | lag gap ${lagGapCents.toFixed(2)}c | catch-up10 ${targetDelta10Cents.toFixed(2)}c`,
+    assetMove10Pct,
     assetMove30Pct,
     assetMove60Pct,
+    targetDelta10Cents,
+    opposingDelta10Cents,
     yesDelta30Cents,
     noDelta30Cents,
     lagGapCents,
@@ -1467,7 +1608,7 @@ async function getDynamicAssetPrice(symbol: string, forceRefresh = false): Promi
   const key = symbol.toUpperCase();
   const cached = dynamicAssetPriceCache.get(key);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.data;
-  const result = (await fetchDynamicAssetPriceFromBinance(key)) || (await fetchDynamicAssetPriceFromCoinbase(key));
+  const result = (await fetchDynamicAssetPriceFromCoinbase(key)) || (await fetchDynamicAssetPriceFromBinance(key));
   if (result?.price) {
     dynamicAssetPriceCache.set(key, { data: result, expiresAt: Date.now() + BTC_PRICE_CACHE_MS });
     return result;
@@ -1475,46 +1616,116 @@ async function getDynamicAssetPrice(symbol: string, forceRefresh = false): Promi
   return cached?.data ?? null;
 }
 
-async function discoverActiveCryptoLagMarkets(currentWindowStart: number): Promise<DynamicLagMarket[]> {
-  const response = await axios.get("https://gamma-api.polymarket.com/markets", {
-    params: { active: true, closed: false, limit: 250 },
-    timeout: 12000,
-  });
-  const rows = Array.isArray(response.data) ? response.data : [];
+function normalizeLagMarketRow(market: any, fallbackAsset?: string, fallbackSlug?: string): DynamicLagMarket | null {
+  const slug = String(market?.slug || fallbackSlug || "");
+  const assetSymbol = (parseCryptoSymbolFromSlug(slug) || fallbackAsset || "").toUpperCase();
+  const outcomePrices = parseJsonArray(market?.outcomePrices);
+  const tokenIds = parseJsonArray(market?.clobTokenIds);
+  if (!assetSymbol || !slug || outcomePrices.length < 2 || tokenIds.length < 2) return null;
 
-  return rows
-    .map((market: any) => {
-      const slug = String(market.slug || "");
-      const assetSymbol = parseCryptoSymbolFromSlug(slug);
-      const outcomePrices = parseJsonArray(market.outcomePrices);
-      const tokenIds = parseJsonArray(market.clobTokenIds);
-      return {
-        market: {
-          ...market,
-          outcomes: parseJsonArray(market.outcomes),
-          outcomePrices,
-          clobTokenIds: tokenIds,
-        },
-        assetSymbol,
-        slug,
-        yesPrice: outcomePrices[0] != null ? Number(outcomePrices[0]) : null,
-        noPrice: outcomePrices[1] != null ? Number(outcomePrices[1]) : null,
-        yesTokenId: tokenIds[0] ? String(tokenIds[0]) : null,
-        noTokenId: tokenIds[1] ? String(tokenIds[1]) : null,
-        liquidity: Number(market.liquidityNum ?? market.liquidity ?? 0),
-        volume24hr: Number(market.volume24hrClob ?? market.volume24hr ?? 0),
-      } satisfies DynamicLagMarket;
+  return {
+    market: {
+      ...market,
+      outcomes: parseJsonArray(market?.outcomes),
+      outcomePrices,
+      clobTokenIds: tokenIds,
+    },
+    assetSymbol,
+    slug,
+    yesPrice: outcomePrices[0] != null ? Number(outcomePrices[0]) : null,
+    noPrice: outcomePrices[1] != null ? Number(outcomePrices[1]) : null,
+    yesTokenId: tokenIds[0] ? String(tokenIds[0]) : null,
+    noTokenId: tokenIds[1] ? String(tokenIds[1]) : null,
+    liquidity: Number(market?.liquidityNum ?? market?.liquidity ?? 0),
+    volume24hr: Number(market?.volume24hrClob ?? market?.volume24hr ?? 0),
+  };
+}
+
+async function discoverActiveCryptoLagMarkets(currentWindowStart: number): Promise<DynamicLagMarket[]> {
+  const directMatches: DynamicLagMarket[] = [];
+
+  await Promise.all(
+    ENABLED_ASSETS.map(async (asset) => {
+      const slug = `${ASSET_CONFIG[asset].polySlugPrefix}-${currentWindowStart}`;
+      try {
+        const response = await axios.get(
+          `https://gamma-api.polymarket.com/events/slug/${encodeURIComponent(slug)}`,
+          { timeout: 8000 }
+        );
+        const event = response.data;
+        const markets = Array.isArray(event?.markets) ? event.markets : [];
+        for (const rawMarket of markets) {
+          const normalized = normalizeLagMarketRow(
+            {
+              ...rawMarket,
+              slug,
+              eventSlug: event?.slug || slug,
+              eventId: event?.id,
+              eventTitle: event?.title,
+              active: rawMarket?.active ?? event?.active,
+              closed: rawMarket?.closed ?? event?.closed,
+            },
+            asset,
+            slug
+          );
+          if (normalized?.yesTokenId && normalized?.noTokenId && normalized.yesPrice != null && normalized.noPrice != null) {
+            directMatches.push(normalized);
+          }
+        }
+      } catch {
+        // fallback below
+      }
     })
-    .filter((item) =>
-      item.assetSymbol &&
-      item.slug.includes("-updown-5m-") &&
-      item.slug.endsWith(`-${currentWindowStart}`) &&
-      item.yesTokenId &&
-      item.noTokenId &&
-      item.yesPrice != null &&
-      item.noPrice != null
-    )
-    .sort((a, b) => (b.liquidity + b.volume24hr) - (a.liquidity + a.volume24hr));
+  );
+
+  if (directMatches.length > 0) {
+    return directMatches.sort((a, b) => (b.liquidity + b.volume24hr) - (a.liquidity + a.volume24hr));
+  }
+
+  const wantedSlugs = new Set(ENABLED_ASSETS.map((asset) => `${ASSET_CONFIG[asset].polySlugPrefix}-${currentWindowStart}`));
+  const fallbackMatches: DynamicLagMarket[] = [];
+
+  for (let offset = 0; offset <= 300; offset += 100) {
+    try {
+      const response = await axios.get("https://gamma-api.polymarket.com/events", {
+        params: { active: true, closed: false, limit: 100, offset },
+        timeout: 12000,
+      });
+      const events = Array.isArray(response.data) ? response.data : [];
+      if (events.length === 0) break;
+
+      for (const event of events) {
+        const eventSlug = String(event?.slug || "");
+        if (!wantedSlugs.has(eventSlug)) continue;
+        const asset = ENABLED_ASSETS.find((row) => eventSlug.startsWith(ASSET_CONFIG[row].polySlugPrefix));
+        const markets = Array.isArray(event?.markets) ? event.markets : [];
+        for (const rawMarket of markets) {
+          const normalized = normalizeLagMarketRow(
+            {
+              ...rawMarket,
+              slug: rawMarket?.slug || eventSlug,
+              eventSlug,
+              eventId: event?.id,
+              eventTitle: event?.title,
+              active: rawMarket?.active ?? event?.active,
+              closed: rawMarket?.closed ?? event?.closed,
+            },
+            asset,
+            eventSlug
+          );
+          if (normalized?.yesTokenId && normalized?.noTokenId && normalized.yesPrice != null && normalized.noPrice != null) {
+            fallbackMatches.push(normalized);
+          }
+        }
+      }
+
+      if (fallbackMatches.length === wantedSlugs.size) break;
+    } catch {
+      break;
+    }
+  }
+
+  return fallbackMatches.sort((a, b) => (b.liquidity + b.volume24hr) - (a.liquidity + a.volume24hr));
 }
 
 async function getBtcHistory(forceRefresh = false) {
@@ -2359,24 +2570,24 @@ async function startServer() {
     };
   };
 
-  const recommendLagScalpLevels = (averagePrice: number) => {
-    let tpTarget: number;
-    let slTarget: number;
-    let trailingDistance: number;
+  const recommendLagScalpLevels = (
+    averagePrice: number,
+    signal: Pick<PriceLagSignal, "lagGapCents" | "confidence" | "riskLevel">
+  ) => {
+    const lagDrivenTp = Math.min(0.045, Math.max(0.022, signal.lagGapCents * 0.0075));
+    const confidenceBonus = signal.confidence >= 82 ? 0.004 : signal.confidence >= 76 ? 0.002 : 0;
+    const tpDelta = Math.min(
+      averagePrice >= 0.58 ? 0.04 : 0.05,
+      lagDrivenTp + confidenceBonus
+    );
+    const slDelta = Math.min(
+      averagePrice >= 0.58 ? 0.03 : 0.035,
+      Math.max(0.018, tpDelta * (signal.riskLevel === "LOW" ? 0.78 : 0.88))
+    );
+    const trailingDistance = Math.max(0.012, Math.min(0.022, tpDelta * 0.55));
 
-    if (averagePrice < 0.40) {
-      tpTarget = Math.min(0.58, averagePrice + 0.06);
-      slTarget = Math.max(0.01, averagePrice - 0.05);
-      trailingDistance = 0.03;
-    } else if (averagePrice < 0.55) {
-      tpTarget = Math.min(0.64, averagePrice + 0.05);
-      slTarget = Math.max(0.01, averagePrice - 0.045);
-      trailingDistance = 0.03;
-    } else {
-      tpTarget = Math.min(0.70, averagePrice + 0.04);
-      slTarget = Math.max(0.01, averagePrice - 0.04);
-      trailingDistance = 0.025;
-    }
+    const tpTarget = Math.min(averagePrice >= 0.58 ? 0.68 : 0.64, averagePrice + tpDelta);
+    const slTarget = Math.max(0.01, averagePrice - slDelta);
 
     return {
       takeProfit: tpTarget.toFixed(2),
@@ -2842,15 +3053,16 @@ async function startServer() {
   const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
   const botPrint = (level: "INFO" | "WARN" | "TRADE" | "OK" | "SKIP" | "ERR", msg: string) => {
     const icons: Record<string, string> = {
-      INFO:  "â”€",
-      WARN:  "âš ",
-      TRADE: "ðŸ’°",
-      OK:    "âœ“",
-      SKIP:  "âœ—",
-      ERR:   "âœ–",
+      INFO:  "-",
+      WARN:  "!",
+      TRADE: "$",
+      OK:    "+",
+      SKIP:  "x",
+      ERR:   "X",
     };
-    const entry: RawLogEntry = { ts: ts(), level, msg };
-    console.log(`[${entry.ts}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
+    const safeMsg = sanitizeTerminalText(msg);
+    const entry: RawLogEntry = { ts: ts(), level, msg: safeMsg };
+    console.log(`[${entry.ts}] [BOT:${level.padEnd(5)}] ${icons[level]} ${safeMsg}`);
     rawLog.unshift(entry);
     if (rawLog.length > 500) rawLog.pop();
     pushSSE("log", entry);
@@ -3156,25 +3368,31 @@ async function startServer() {
       pushLagSample(lagYesPriceBuffers, market.id, yesNow, now);
       pushLagSample(lagNoPriceBuffers, market.id, noNow, now);
 
+      const asset10Ref = findLagReference(lagAssetPriceBuffers.get(candidate.assetSymbol), now - 10);
       const asset30Ref = findLagReference(lagAssetPriceBuffers.get(candidate.assetSymbol), now - 30);
       const asset60Ref = findLagReference(lagAssetPriceBuffers.get(candidate.assetSymbol), now - 60);
+      const yes10Ref = findLagReference(lagYesPriceBuffers.get(market.id), now - 10);
       const yes30Ref = findLagReference(lagYesPriceBuffers.get(market.id), now - 30);
+      const no10Ref = findLagReference(lagNoPriceBuffers.get(market.id), now - 10);
       const no30Ref = findLagReference(lagNoPriceBuffers.get(market.id), now - 30);
 
-      if (!asset30Ref || !asset60Ref || !yes30Ref || !no30Ref) {
+      if (!asset10Ref || !asset30Ref || !asset60Ref || !yes10Ref || !yes30Ref || !no10Ref || !no30Ref) {
         botPrint("SKIP", `[${candidate.assetSymbol}] Building lag buffers for ${market.question?.slice(0, 42)}...`);
         continue;
       }
 
       const assetBoost = adaptiveConfidenceByAsset.get(assetKey) ?? 0;
-      const signal = computePriceLagSignal({
+      let signal = computePriceLagSignal({
         assetSymbol: candidate.assetSymbol,
         assetNow,
+        assetRef10: asset10Ref.price,
         assetRef30: asset30Ref.price,
         assetRef60: asset60Ref.price,
         yesNow,
+        yesRef10: yes10Ref.price,
         yesRef30: yes30Ref.price,
         noNow,
+        noRef10: no10Ref.price,
         noRef30: no30Ref.price,
       });
 
@@ -3254,8 +3472,20 @@ async function startServer() {
         continue;
       }
 
-      if (bestAsk > signal.maxEntryPrice) {
-        botPrint("SKIP", `[${candidate.assetSymbol}] Entry too expensive ${(bestAsk * 100).toFixed(1)}c > ${(signal.maxEntryPrice * 100).toFixed(1)}c`);
+      const spreadCents = rawAsk > 0 && bestBid > 0 ? (rawAsk - bestBid) * 100 : null;
+      if (spreadCents != null && spreadCents > Math.max(4, signal.lagGapCents * 0.85)) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Spread too wide for lag scalp (${spreadCents.toFixed(2)}c)`); 
+        continue;
+      }
+
+      const chaseCap = Math.min(
+        signal.maxEntryPrice,
+        impliedEntryPrice > 0
+          ? impliedEntryPrice + Math.min(0.03, Math.max(0.015, signal.lagGapCents * 0.0055))
+          : signal.maxEntryPrice
+      );
+      if (bestAsk > chaseCap) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Entry too expensive ${(bestAsk * 100).toFixed(1)}c > ${(chaseCap * 100).toFixed(1)}c lag cap`);
         continue;
       }
       if (bestAsk >= ANALYSIS_COIN_FLIP_MIN_PRICE && bestAsk <= ANALYSIS_COIN_FLIP_MAX_PRICE) {
@@ -3311,7 +3541,38 @@ async function startServer() {
         continue;
       }
 
-      botPrint("TRADE", `[PRICE_LAG] ${candidate.assetSymbol} ${signal.direction} | conf=${signal.confidence}% | lag=${signal.lagGapCents.toFixed(2)}c | ask=${(bestAsk * 100).toFixed(1)}c | bet=$${betAmount.toFixed(2)}`);
+      const refreshedAssetPriceData = await getDynamicAssetPrice(candidate.assetSymbol, true);
+      const refreshedAssetNow = Number(refreshedAssetPriceData?.price || "0");
+      if (!(refreshedAssetNow > 0)) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Spot refresh failed right before execution`);
+        continue;
+      }
+
+      signal = computePriceLagSignal({
+        assetSymbol: candidate.assetSymbol,
+        assetNow: refreshedAssetNow,
+        assetRef10: asset10Ref.price,
+        assetRef30: asset30Ref.price,
+        assetRef60: asset60Ref.price,
+        yesNow,
+        yesRef10: yes10Ref.price,
+        yesRef30: yes30Ref.price,
+        noNow,
+        noRef10: no10Ref.price,
+        noRef30: no30Ref.price,
+      });
+
+      if (
+        signal.decision !== "TRADE" ||
+        signal.direction === "NONE" ||
+        signal.confidence < effectiveMinConf ||
+        signal.riskLevel === "HIGH"
+      ) {
+        botPrint("SKIP", `[${candidate.assetSymbol}] Lag died on final recheck | ${signal.reasoning}`);
+        continue;
+      }
+
+      botPrint("TRADE", `[PRICE_LAG] ${candidate.assetSymbol} ${signal.direction} | conf=${signal.confidence}% | lag=${signal.lagGapCents.toFixed(2)}c | micro=${signal.assetMove10Pct.toFixed(3)}% | ask=${(bestAsk * 100).toFixed(1)}c | bet=$${betAmount.toFixed(2)}`);
 
       try {
         const tradeResult = await executePolymarketTrade({
@@ -3323,7 +3584,7 @@ async function startServer() {
           amountMode: "SPEND",
         });
 
-        const levels = recommendLagScalpLevels(bestAsk);
+        const levels = recommendLagScalpLevels(bestAsk, signal);
         await savePositionAutomation({
           assetId: targetTokenId,
           market: market.question || market.id,
@@ -4157,9 +4418,9 @@ async function startServer() {
   const startBot = () => {
     if (botInterval) return;
     console.log("");
-    console.log("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-    console.log("â•‘          PolyBTC AI Trading Bot â€” STARTED         â•‘");
-    console.log("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
+    console.log("====================================================");
+    console.log("          PolyBTC AI Trading Bot - STARTED          ");
+    console.log("====================================================");
     const startCfg = getActiveConfig();
     botPrint("INFO", `Mode           : ${botMode}`);
     botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
