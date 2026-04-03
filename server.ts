@@ -349,8 +349,39 @@ function getPriceLagConfig() {
     kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
     balanceCap:       0.25,
-    entryWindowStart: 10,
-    entryWindowEnd:   180,
+    earlyDeadZoneEnd: 19,
+    bestLagZoneStart: 20,
+    bestLagZoneEnd:   150,
+    lateNoTradeStart: 151,
+  };
+}
+
+type PriceLagTimingZone = "EARLY_DEAD_ZONE" | "BEST_LAG_ZONE" | "LATE_NO_TRADE_ZONE";
+
+function getPriceLagTiming(windowElapsedSeconds: number): {
+  zone: PriceLagTimingZone;
+  allowTrading: boolean;
+  reason: string;
+} {
+  const cfg = getPriceLagConfig();
+  if (windowElapsedSeconds <= cfg.earlyDeadZoneEnd) {
+    return {
+      zone: "EARLY_DEAD_ZONE",
+      allowTrading: false,
+      reason: `Early dead zone (${windowElapsedSeconds}s) - waiting for market structure and lag buffers`,
+    };
+  }
+  if (windowElapsedSeconds <= cfg.bestLagZoneEnd) {
+    return {
+      zone: "BEST_LAG_ZONE",
+      allowTrading: true,
+      reason: `Best lag zone (${cfg.bestLagZoneStart}-${cfg.bestLagZoneEnd}s)`,
+    };
+  }
+  return {
+    zone: "LATE_NO_TRADE_ZONE",
+    allowTrading: false,
+    reason: `Late no-trade zone (${windowElapsedSeconds}s) - too close to expiry for lag scalp`,
   };
 }
 
@@ -556,6 +587,7 @@ interface RawLogEntry {
   msg: string;
 }
 const rawLog: RawLogEntry[] = [];
+const cexLog: RawLogEntry[] = [];
 
 // â”€â”€ SSE clients for real-time push â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const sseClients = new Set<ServerResponse>();
@@ -2604,10 +2636,11 @@ async function startServer() {
         const divAssetSet = botAnalyzedThisWindowByAsset.get(currentDivergenceAsset)!;
         if (divAssetSet.has(market.id)) return;
 
-        // Respect entry window timing (same gates as main cycle)
+        // Respect price-lag timing gates (same zones as main cycle)
         const cfg = getPriceLagConfig();
         const windowElapsed = now - Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
-        if (windowElapsed < cfg.entryWindowStart || windowElapsed > cfg.entryWindowEnd) return;
+        const timing = getPriceLagTiming(windowElapsed);
+        if (!timing.allowTrading) return;
 
         // Divergence trades need enough time for the move to develop.
         // Flash moves (< 15s) that cause divergence often mean-revert quickly.
@@ -3052,6 +3085,15 @@ async function startServer() {
     pushSSE("log", entry);
   };
 
+  const cexPrint = (level: "INFO" | "WARN" | "OK" | "SKIP" | "ERR", msg: string) => {
+    const safeMsg = sanitizeTerminalText(msg);
+    const entry: RawLogEntry = { ts: ts(), level, msg: safeMsg };
+    console.log(`[${entry.ts}] [CEX:${level.padEnd(5)}] ${safeMsg}`);
+    cexLog.unshift(entry);
+    if (cexLog.length > 500) cexLog.pop();
+    pushSSE("cex", entry);
+  };
+
   // â”€â”€ Win / Loss result checker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const checkPendingResults = async () => {
     if (pendingResults.size === 0) return;
@@ -3326,7 +3368,8 @@ async function startServer() {
 
     const now = Math.floor(Date.now() / 1000);
     const cfg = getPriceLagConfig();
-    botPrint("INFO", `[LAG] Strategy=PRICE_LAG_SCALPER | scanning ${lagMarkets.length} markets | ${mm}:${ss} left`);
+    const timing = getPriceLagTiming(windowElapsedSeconds);
+    botPrint("INFO", `[LAG] Strategy=PRICE_LAG_SCALPER | zone=${timing.zone} | scanning ${lagMarkets.length} markets | ${mm}:${ss} left`);
 
     for (const candidate of lagMarkets) {
       const market = candidate.market;
@@ -3340,6 +3383,7 @@ async function startServer() {
       const assetPriceData = await getDynamicAssetPrice(candidate.assetSymbol);
       const assetNow = Number(assetPriceData?.price || "0");
       if (!(assetNow > 0)) {
+        cexPrint("ERR", `[${candidate.assetSymbol}] No external spot price available from Coinbase/Binance`);
         botPrint("WARN", `[${candidate.assetSymbol}] No external spot price available - skipping lag scan`);
         continue;
       }
@@ -3404,6 +3448,7 @@ async function startServer() {
       };
 
       if (signal.decision !== "TRADE") {
+        cexPrint("INFO", `[${candidate.assetSymbol}] ${assetPriceData?.source || "unknown"} spot=${assetNow.toFixed(4)} | poly yes=${(yesNow * 100).toFixed(2)}c no=${(noNow * 100).toFixed(2)}c | ${signal.reasoning}`);
         botPrint("SKIP", `[${candidate.assetSymbol}] ${signal.reasoning}`);
         continue;
       }
@@ -3443,6 +3488,7 @@ async function startServer() {
         (signal.direction === "DOWN" && yesSignal === "BUY_PRESSURE") ||
         yesSignal === "UNKNOWN";
       if (pressureOpposes) {
+        cexPrint("WARN", `[${candidate.assetSymbol}] Spot ${assetNow.toFixed(4)} | lag=${signal.lagGapCents.toFixed(2)}c rejected by orderbook pressure=${yesSignal}`);
         botPrint("SKIP", `[${candidate.assetSymbol}] Pressure filter blocked lag trade | direction=${signal.direction} yesBook=${yesSignal}`);
         continue;
       }
@@ -3469,6 +3515,7 @@ async function startServer() {
           : signal.maxEntryPrice
       );
       if (bestAsk > chaseCap) {
+        cexPrint("SKIP", `[${candidate.assetSymbol}] ${assetPriceData?.source || "unknown"} spot=${assetNow.toFixed(4)} | poly ask=${(bestAsk * 100).toFixed(2)}c too expensive vs lag cap ${(chaseCap * 100).toFixed(2)}c`);
         botPrint("SKIP", `[${candidate.assetSymbol}] Entry too expensive ${(bestAsk * 100).toFixed(1)}c > ${(chaseCap * 100).toFixed(1)}c lag cap`);
         continue;
       }
@@ -3528,6 +3575,7 @@ async function startServer() {
       const refreshedAssetPriceData = await getDynamicAssetPrice(candidate.assetSymbol, true);
       const refreshedAssetNow = Number(refreshedAssetPriceData?.price || "0");
       if (!(refreshedAssetNow > 0)) {
+        cexPrint("ERR", `[${candidate.assetSymbol}] Final spot refresh failed before execution`);
         botPrint("SKIP", `[${candidate.assetSymbol}] Spot refresh failed right before execution`);
         continue;
       }
@@ -3552,9 +3600,15 @@ async function startServer() {
         signal.confidence < effectiveMinConf ||
         signal.riskLevel === "HIGH"
       ) {
+        cexPrint("SKIP", `[${candidate.assetSymbol}] Final recheck invalidated setup | source=${refreshedAssetPriceData?.source || assetPriceData?.source || "unknown"} spot=${refreshedAssetNow.toFixed(4)} | ${signal.reasoning}`);
         botPrint("SKIP", `[${candidate.assetSymbol}] Lag died on final recheck | ${signal.reasoning}`);
         continue;
       }
+
+      cexPrint(
+        "OK",
+        `[${candidate.assetSymbol}] source=${refreshedAssetPriceData?.source || assetPriceData?.source || "unknown"} spot=${refreshedAssetNow.toFixed(4)} | poly yes=${(yesNow * 100).toFixed(2)}c no=${(noNow * 100).toFixed(2)}c | dir=${signal.direction} lag=${signal.lagGapCents.toFixed(2)}c conf=${signal.confidence}% ask=${(bestAsk * 100).toFixed(2)}c`
+      );
 
       botPrint("TRADE", `[PRICE_LAG] ${candidate.assetSymbol} ${signal.direction} | conf=${signal.confidence}% | lag=${signal.lagGapCents.toFixed(2)}c | micro=${signal.assetMove10Pct.toFixed(3)}% | ask=${(bestAsk * 100).toFixed(1)}c | bet=$${betAmount.toFixed(2)}`);
 
@@ -3653,13 +3707,12 @@ async function startServer() {
         if (autoCalibrateEnabled) void runAutoCalibration();
       }
 
-      // Only trade in the valid entry zone
-      const cfg = getPriceLagConfig();
-      if (windowElapsedSeconds < cfg.entryWindowStart || windowElapsedSeconds > cfg.entryWindowEnd) {
-        if (windowElapsedSeconds > cfg.entryWindowEnd) {
-          botPrint("SKIP", `Window closing (${mm}:${ss} left) â€” waiting for next window`);
+      const timing = getPriceLagTiming(windowElapsedSeconds);
+      if (!timing.allowTrading) {
+        if (timing.zone === "EARLY_DEAD_ZONE") {
+          botPrint("SKIP", `${timing.reason} | ${mm}:${ss} left`);
         } else {
-          botPrint("SKIP", `Window too early (${windowElapsedSeconds}s) â€” ${mm}:${ss} remaining. Waiting.`);
+          botPrint("SKIP", `${timing.reason} | ${mm}:${ss} left`);
         }
         return;
       }
@@ -3808,6 +3861,7 @@ async function startServer() {
             }
           }
 
+          const cfg = getPriceLagConfig();
           // Merge adaptive boost + calibration delta into effective threshold
           const calDelta = (autoCalibrateEnabled && calibrationState) ? calibrationState.confidenceDelta : 0;
           const assetBoost = adaptiveConfidenceByAsset.get(currentAsset) ?? 0;
@@ -4412,6 +4466,7 @@ async function startServer() {
     botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
     botPrint("INFO", `Fixed trade    : $${botFixedTradeUsdc.toFixed(2)} USDC`);
     botPrint("INFO", `Kelly fraction : ${startCfg.kellyFraction * 100}%`);
+    botPrint("INFO", `Timing zones   : dead 0-${startCfg.earlyDeadZoneEnd}s | best ${startCfg.bestLagZoneStart}-${startCfg.bestLagZoneEnd}s | late ${startCfg.lateNoTradeStart}-300s`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
     startHeartbeat();
@@ -4437,13 +4492,14 @@ async function startServer() {
     const nowUtcSeconds = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
     const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
-    const nowSec = Math.floor(Date.now() / 1000);
+    const timing = getPriceLagTiming(windowElapsedSeconds);
     res.json({
       enabled: botEnabled,
       running: botRunning,
       sessionStartBalance: botSessionStartBalance,
       sessionTradesCount: botSessionTradesCount,
       windowElapsedSeconds,
+      timing,
       analyzedThisWindow: botAnalyzedThisWindow.size,
       entrySnapshot: currentEntrySnapshot,
       config: {
@@ -4452,6 +4508,10 @@ async function startServer() {
         minEdge: getPriceLagConfig().minEdge,
         kellyFraction: getPriceLagConfig().kellyFraction,
         maxBetUsdc: getPriceLagConfig().maxBetUsdc,
+        earlyDeadZoneEnd: getPriceLagConfig().earlyDeadZoneEnd,
+        bestLagZoneStart: getPriceLagConfig().bestLagZoneStart,
+        bestLagZoneEnd: getPriceLagConfig().bestLagZoneEnd,
+        lateNoTradeStart: getPriceLagConfig().lateNoTradeStart,
         fixedTradeUsdc: botFixedTradeUsdc,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
@@ -4511,6 +4571,10 @@ async function startServer() {
     res.json({ log: rawLog });
   });
 
+  app.get("/api/bot/cex-log", (_req, res) => {
+    res.json({ log: cexLog });
+  });
+
   // â”€â”€ SSE endpoint â€” real-time bot events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   app.get("/api/bot/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
@@ -4519,7 +4583,7 @@ async function startServer() {
     res.flushHeaders();
 
     // Send current log snapshot so the client is immediately up-to-date
-    res.write(`event: snapshot\ndata: ${JSON.stringify({ log: rawLog.slice(0, 200) })}\n\n`);
+    res.write(`event: snapshot\ndata: ${JSON.stringify({ log: rawLog.slice(0, 200), cexLog: cexLog.slice(0, 200) })}\n\n`);
 
     sseClients.add(res as unknown as ServerResponse);
     req.on("close", () => sseClients.delete(res as unknown as ServerResponse));

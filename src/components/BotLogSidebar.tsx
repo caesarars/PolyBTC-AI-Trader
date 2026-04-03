@@ -49,6 +49,11 @@ interface BotStatus {
   running: boolean;
   sessionTradesCount: number;
   windowElapsedSeconds: number;
+  timing?: {
+    zone: "EARLY_DEAD_ZONE" | "BEST_LAG_ZONE" | "LATE_NO_TRADE_ZONE";
+    allowTrading: boolean;
+    reason: string;
+  };
 }
 
 interface LearningState {
@@ -60,13 +65,14 @@ interface LearningState {
   lossMemoryCount: number;
 }
 
-type Tab = "trades" | "live";
+type Tab = "trades" | "live" | "cex";
 
 export default function BotLogSidebar() {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<Tab>("live");
   const [log, setLog] = useState<BotLogEntry[]>([]);
   const [rawLog, setRawLog] = useState<RawLogEntry[]>([]);
+  const [cexLog, setCexLog] = useState<RawLogEntry[]>([]);
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [learning, setLearning] = useState<LearningState | null>(null);
   const [unread, setUnread] = useState(0);
@@ -99,15 +105,28 @@ export default function BotLogSidebar() {
     }
   }, [open]);
 
+  const fetchCexLog = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/cex-log");
+      const data = await res.json();
+      setCexLog((data?.log || []) as RawLogEntry[]);
+    } catch {
+      // keep last known state
+    }
+  }, []);
+
   useEffect(() => {
     fetchMeta(); // initial load for trades / status / learning
+    fetchCexLog();
 
     const es = new EventSource("/api/bot/events");
 
     es.addEventListener("snapshot", (e: MessageEvent) => {
       const data = JSON.parse(e.data);
       const entries: RawLogEntry[] = data.log || [];
+      const cexEntries: RawLogEntry[] = data.cexLog || [];
       setRawLog(entries);
+      setCexLog(cexEntries);
       prevRawLen.current = entries.length;
       setConnected(true);
     });
@@ -119,21 +138,28 @@ export default function BotLogSidebar() {
       prevRawLen.current += 1;
     });
 
+    es.addEventListener("cex", (e: MessageEvent) => {
+      const entry: RawLogEntry = JSON.parse(e.data);
+      setCexLog((prev) => [entry, ...prev].slice(0, 500));
+      if (!open) setUnread((u) => u + 1);
+    });
+
     es.addEventListener("cycle", () => {
       fetchMeta();
+      fetchCexLog();
     });
 
     es.onerror = () => setConnected(false);
 
     return () => es.close();
-  }, [fetchMeta, open]);
+  }, [fetchMeta, fetchCexLog, open]);
 
   // Auto-scroll to top when new entries arrive (newest is at top)
   useEffect(() => {
     if (open) {
       setTimeout(() => topRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
     }
-  }, [log.length, rawLog.length, open]);
+  }, [log.length, rawLog.length, cexLog.length, open]);
 
   const handleOpen = () => {
     setOpen(true);
@@ -141,9 +167,7 @@ export default function BotLogSidebar() {
   };
 
   const windowRemaining = status ? 300 - status.windowElapsedSeconds : 0;
-  const entryZone = status
-    ? status.windowElapsedSeconds >= 10 && status.windowElapsedSeconds <= 285
-    : false;
+  const entryZone = Boolean(status?.timing?.allowTrading);
 
   return (
     <>
@@ -218,7 +242,7 @@ export default function BotLogSidebar() {
                   <div>
                     <p className="text-sm font-bold text-white leading-none">Bot Log</p>
                     <p className="text-[10px] text-zinc-500 mt-0.5">
-                      {status?.enabled ? (status.running ? "Running..." : "Idle") : "Stopped"} · {tab === "trades" ? log.length : rawLog.length} entries
+                      {status?.enabled ? (status.running ? "Running..." : "Idle") : "Stopped"} · {tab === "trades" ? log.length : tab === "cex" ? cexLog.length : rawLog.length} entries
                     </p>
                   </div>
                 </div>
@@ -235,7 +259,7 @@ export default function BotLogSidebar() {
                       "text-[10px] font-mono font-bold px-2 py-0.5 rounded-full",
                       entryZone
                         ? "bg-green-500/20 text-green-400"
-                        : windowRemaining <= 30
+                        : status?.timing?.zone === "LATE_NO_TRADE_ZONE"
                           ? "bg-red-500/20 text-red-400"
                           : "bg-zinc-800 text-zinc-500"
                     )}>
@@ -327,6 +351,18 @@ export default function BotLogSidebar() {
                     </span>
                   )}
                 </button>
+                <button
+                  onClick={() => setTab("cex")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium border-b-2 transition-colors",
+                    tab === "cex"
+                      ? "border-blue-500 text-blue-400"
+                      : "border-transparent text-zinc-500 hover:text-zinc-300"
+                  )}
+                >
+                  <TrendingUp className="w-3.5 h-3.5" />
+                  CEX Log
+                </button>
               </div>
 
               {/* ── Log content ── */}
@@ -343,6 +379,22 @@ export default function BotLogSidebar() {
                         <div ref={topRef} />
                         {[...rawLog].map((entry, i) => (
                           <RawLogLine key={i} entry={entry} />
+                        ))}
+                      </>
+                    )}
+                  </div>
+                ) : tab === "cex" ? (
+                  <div className="px-2 py-2 space-y-0.5 font-mono">
+                    {cexLog.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center h-48 gap-3 text-zinc-600">
+                        <TrendingUp className="w-8 h-8 opacity-20" />
+                        <p className="text-xs">No CEX comparison activity yet.</p>
+                      </div>
+                    ) : (
+                      <>
+                        <div ref={topRef} />
+                        {[...cexLog].map((entry, i) => (
+                          <RawLogLine key={`cex-${i}`} entry={entry} />
                         ))}
                       </>
                     )}
