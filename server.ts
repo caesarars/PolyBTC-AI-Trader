@@ -338,28 +338,14 @@ const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_FIXED_TRADE_USDC_DEFAULT = Number(process.env.BOT_FIXED_TRADE_USDC || 2);
 
-// â”€â”€ Bot mode: AGGRESSIVE (default) vs CONSERVATIVE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-let botMode: "AGGRESSIVE" | "CONSERVATIVE" = "AGGRESSIVE";
+// Runtime-overrideable thresholds for the active price-lag mispricing strategy
+let priceLagMinConfidence = BOT_MIN_CONFIDENCE;
+let priceLagMinEdge       = BOT_MIN_EDGE;
 
-// Runtime-overrideable thresholds for AGGRESSIVE mode (UI-adjustable)
-let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
-let aggressiveMinEdge       = BOT_MIN_EDGE;
-
-const CONSERVATIVE_CONFIG = {
-  minConfidence:    75,
-  minEdge:          0.12,
-  kellyFraction:    0.20,
-  maxBetUsdc:       50,
-  balanceCap:       0.10,
-  entryWindowStart: 30,
-  entryWindowEnd:   240,
-} as const;
-
-function getActiveConfig() {
-  if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG;
+function getPriceLagConfig() {
   return {
-    minConfidence:    aggressiveMinConfidence,
-    minEdge:          aggressiveMinEdge,
+    minConfidence:    priceLagMinConfidence,
+    minEdge:          priceLagMinEdge,
     kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
     balanceCap:       0.25,
@@ -369,14 +355,12 @@ function getActiveConfig() {
 }
 
 // â”€â”€ Dynamic Kelly fraction based on confidence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// CONSERVATIVE mode always uses its flat fraction (already risk-managed).
-// AGGRESSIVE mode scales the fraction with conviction level:
+// Price-lag mispricing strategy scales the fraction with conviction level:
 //   65â€“74% â†’ 0.25  (borderline signal, bet small)
-//   75â€“84% â†’ 0.40  (normal, use base fraction)
+//   75â€“84% â†’ 0.50  (normal, use base fraction)
 //   85â€“89% â†’ 0.55  (strong signal, size up)
 //   90%+   â†’ 0.65  (very high conviction, max size)
 function dynamicKellyFraction(confidence: number): number {
-  if (botMode === "CONSERVATIVE") return CONSERVATIVE_CONFIG.kellyFraction;
   if (confidence >= 90) return 0.65;
   if (confidence >= 85) return 0.55;
   if (confidence >= 75) return 0.50;
@@ -2621,7 +2605,7 @@ async function startServer() {
         if (divAssetSet.has(market.id)) return;
 
         // Respect entry window timing (same gates as main cycle)
-        const cfg = getActiveConfig();
+        const cfg = getPriceLagConfig();
         const windowElapsed = now - Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
         if (windowElapsed < cfg.entryWindowStart || windowElapsed > cfg.entryWindowEnd) return;
 
@@ -3341,7 +3325,7 @@ async function startServer() {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const cfg = getActiveConfig();
+    const cfg = getPriceLagConfig();
     botPrint("INFO", `[LAG] Strategy=PRICE_LAG_SCALPER | scanning ${lagMarkets.length} markets | ${mm}:${ss} left`);
 
     for (const candidate of lagMarkets) {
@@ -3670,7 +3654,7 @@ async function startServer() {
       }
 
       // Only trade in the valid entry zone
-      const cfg = getActiveConfig();
+      const cfg = getPriceLagConfig();
       if (windowElapsedSeconds < cfg.entryWindowStart || windowElapsedSeconds > cfg.entryWindowEnd) {
         if (windowElapsedSeconds > cfg.entryWindowEnd) {
           botPrint("SKIP", `Window closing (${mm}:${ss} left) â€” waiting for next window`);
@@ -4277,7 +4261,7 @@ async function startServer() {
                 // Fixed execution size: runtime-configurable from the dashboard.
                 const betAmount = parseFloat(botFixedTradeUsdc.toFixed(2));
 
-                botPrint("INFO", `Sizing override: fixed $${botFixedTradeUsdc.toFixed(2)} per trade | Kelly raw=$${rawBet.toFixed(2)} ignored [${botMode}]`);
+                botPrint("INFO", `Sizing override: fixed $${botFixedTradeUsdc.toFixed(2)} per trade | Kelly raw=$${rawBet.toFixed(2)} ignored [PRICE_LAG]`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (spendable < betAmount) {
@@ -4421,8 +4405,8 @@ async function startServer() {
     console.log("====================================================");
     console.log("          PolyBTC AI Trading Bot - STARTED          ");
     console.log("====================================================");
-    const startCfg = getActiveConfig();
-    botPrint("INFO", `Mode           : ${botMode}`);
+    const startCfg = getPriceLagConfig();
+    botPrint("INFO", "Strategy       : PRICE_LAG_MISPRICING");
     botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
     botPrint("INFO", `Min edge       : ${startCfg.minEdge}Â¢`);
     botPrint("INFO", `Max bet        : $${startCfg.maxBetUsdc} USDC`);
@@ -4463,11 +4447,11 @@ async function startServer() {
       analyzedThisWindow: botAnalyzedThisWindow.size,
       entrySnapshot: currentEntrySnapshot,
       config: {
-        mode: botMode,
-        minConfidence: getActiveConfig().minConfidence,
-        minEdge: getActiveConfig().minEdge,
-        kellyFraction: getActiveConfig().kellyFraction,
-        maxBetUsdc: getActiveConfig().maxBetUsdc,
+        strategy: "PRICE_LAG_MISPRICING",
+        minConfidence: getPriceLagConfig().minConfidence,
+        minEdge: getPriceLagConfig().minEdge,
+        kellyFraction: getPriceLagConfig().kellyFraction,
+        maxBetUsdc: getPriceLagConfig().maxBetUsdc,
         fixedTradeUsdc: botFixedTradeUsdc,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
@@ -4682,28 +4666,17 @@ async function startServer() {
     }
   });
 
-  app.post("/api/bot/mode", (req, res) => {
-    const { mode } = req.body || {};
-    if (mode !== "AGGRESSIVE" && mode !== "CONSERVATIVE") {
-      return res.status(400).json({ error: "mode must be AGGRESSIVE or CONSERVATIVE" });
-    }
-    botMode = mode;
-    const cfg = getActiveConfig();
-    botPrint("INFO", `Bot mode switched to ${botMode} | conf>=${cfg.minConfidence}% edge>=${cfg.minEdge}c maxBet=$${cfg.maxBetUsdc} kelly=${cfg.kellyFraction * 100}% window=${cfg.entryWindowStart}-${cfg.entryWindowEnd}s`);
-    res.json({ ok: true, mode: botMode, config: cfg });
-  });
-
   app.post("/api/bot/config", (req, res) => {
     const { minConfidence, minEdge, fixedTradeUsdc } = req.body || {};
     if (minConfidence !== undefined) {
       const val = Number(minConfidence);
       if (isNaN(val) || val < 50 || val > 99) return res.status(400).json({ error: "minConfidence must be 50-99" });
-      aggressiveMinConfidence = val;
+      priceLagMinConfidence = val;
     }
     if (minEdge !== undefined) {
       const val = Number(minEdge);
       if (isNaN(val) || val < 0.01 || val > 0.50) return res.status(400).json({ error: "minEdge must be 0.01-0.50" });
-      aggressiveMinEdge = val;
+      priceLagMinEdge = val;
     }
     if (fixedTradeUsdc !== undefined) {
       const val = Number(fixedTradeUsdc);
@@ -4712,9 +4685,15 @@ async function startServer() {
       }
       botFixedTradeUsdc = val;
     }
-    const cfg = getActiveConfig();
-    botPrint("INFO", `Config updated (AGGRESSIVE): conf>=${aggressiveMinConfidence}% edge>=${aggressiveMinEdge}c fixed=$${botFixedTradeUsdc.toFixed(2)}`);
-    res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, fixedTradeUsdc: botFixedTradeUsdc, config: { ...cfg, fixedTradeUsdc: botFixedTradeUsdc } });
+    const cfg = getPriceLagConfig();
+    botPrint("INFO", `Config updated (PRICE_LAG): conf>=${priceLagMinConfidence}% edge>=${priceLagMinEdge}c fixed=$${botFixedTradeUsdc.toFixed(2)}`);
+    res.json({
+      ok: true,
+      priceLagMinConfidence,
+      priceLagMinEdge,
+      fixedTradeUsdc: botFixedTradeUsdc,
+      config: { ...cfg, strategy: "PRICE_LAG_MISPRICING", fixedTradeUsdc: botFixedTradeUsdc },
+    });
   });
 
   app.post("/api/bot/reset-confidence", (_req, res) => {
