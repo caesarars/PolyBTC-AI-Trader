@@ -1660,7 +1660,7 @@ function startDivergenceTracker() {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = 3444;
 
   loadLearning();
   void ensureMongoCollections();
