@@ -2750,42 +2750,41 @@ async function startServer() {
         return [];
       };
 
-      // ── Outer loop: iterate over each enabled asset (BTC, ETH, SOL) ──────
-      for (const currentAsset of ENABLED_ASSETS) {
-        const assetCfg = ASSET_CONFIG[currentAsset];
-        const analyzedThisWindow = botAnalyzedThisWindowByAsset.get(currentAsset)!;
-
-        // Fetch current market for this asset
-        const slug = `${assetCfg.polySlugPrefix}-${currentWindowStart}`;
-
-        botPrint("INFO", `[${currentAsset}] Scanning window ${mm}:${ss} remaining | elapsed=${windowElapsedSeconds}s | slug=${slug}`);
-
-        let markets: any[] = [];
-        {
-          try {
-            const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
-            const event = eventRes.data;
-            markets = (event?.markets || []).map((m: any) => ({
-              ...m,
-              outcomes: parseArr(m.outcomes),
-              outcomePrices: parseArr(m.outcomePrices),
-              clobTokenIds: parseArr(m.clobTokenIds),
-              eventSlug: event.slug,
-              eventTitle: event.title,
-              eventId: event.id,
-              startDate: event.startDate,
-              endDate: event.endDate,
-            }));
-            if (markets.length === 0) {
-              botPrint("WARN", `[${currentAsset}] No markets found for slug: ${slug}`);
-              continue;
-            }
-            botPrint("INFO", `[${currentAsset}] Found ${markets.length} market(s) for window`);
-          } catch {
-            botPrint("ERR", `[${currentAsset}] Failed to fetch market for slug: ${slug}`);
-            continue;
+      // ── Fetch all asset markets in parallel, then process sequentially ──────
+      const marketsByAsset = new Map<TradingAsset, any[]>();
+      await Promise.allSettled(ENABLED_ASSETS.map(async (asset) => {
+        const slug = `${ASSET_CONFIG[asset].polySlugPrefix}-${currentWindowStart}`;
+        botPrint("INFO", `[${asset}] Scanning window ${mm}:${ss} remaining | elapsed=${windowElapsedSeconds}s | slug=${slug}`);
+        try {
+          const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
+          const event = eventRes.data;
+          const markets = (event?.markets || []).map((m: any) => ({
+            ...m,
+            outcomes: parseArr(m.outcomes),
+            outcomePrices: parseArr(m.outcomePrices),
+            clobTokenIds: parseArr(m.clobTokenIds),
+            eventSlug: event.slug,
+            eventTitle: event.title,
+            eventId: event.id,
+            startDate: event.startDate,
+            endDate: event.endDate,
+          }));
+          if (markets.length === 0) {
+            botPrint("WARN", `[${asset}] No markets found for slug: ${slug}`);
+          } else {
+            botPrint("INFO", `[${asset}] Found ${markets.length} market(s) for window`);
+            marketsByAsset.set(asset, markets);
           }
+        } catch {
+          botPrint("ERR", `[${asset}] Failed to fetch market for slug: ${slug}`);
         }
+      }));
+
+      // ── Process each asset sequentially (analysis is stateful per-asset) ──
+      for (const currentAsset of ENABLED_ASSETS) {
+        const analyzedThisWindow = botAnalyzedThisWindowByAsset.get(currentAsset)!;
+        const markets = marketsByAsset.get(currentAsset);
+        if (!markets) continue;
 
       for (const market of markets) {
         // Expose to divergence fast path so it can execute without waiting for this cycle
@@ -3391,7 +3390,7 @@ async function startServer() {
 
                     // Track this trade for win/loss resolution after window closes
                     pendingResults.set(tokenId, {
-                      eventSlug: slug,
+                      eventSlug: market.eventSlug,
                       marketId: market.id,
                       market: market.question || market.id,
                       tokenId,
