@@ -301,6 +301,14 @@ const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
 // Backward-compat alias (used by BTC path until loop refactor is complete)
 const botAnalyzedThisWindow = botAnalyzedThisWindowByAsset.get("BTC")!;
 
+// ── Traded-this-window guard (never cleared by divergence) ───────────────────
+// Tracks market IDs where a trade was actually EXECUTED this window.
+// Unlike analyzedThisWindow, this set is only cleared when a new window starts.
+// Prevents double execution when STRONG divergence clears the analyzed set.
+const botTradedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
+  (["BTC", "ETH", "SOL"] as TradingAsset[]).map(a => [a, new Set<string>()])
+);;
+
 
 // ── Fast loop momentum history ring buffer ────────────────────────────────────
 interface MomentumHistoryPoint {
@@ -2659,6 +2667,7 @@ async function startServer() {
       // Reset per-window state when a new 5-min window starts
       if (currentWindowStart !== botLastWindowStart) {
         for (const s of botAnalyzedThisWindowByAsset.values()) s.clear();
+        for (const s of botTradedThisWindowByAsset.values()) s.clear();
         currentWindowAiCache.clear();
         botLastWindowStart = currentWindowStart;
         // Clear YES ring buffer — old window's tokens are no longer valid
@@ -2732,6 +2741,14 @@ async function startServer() {
         // Sync YES/NO token IDs to divergence tracker for this asset
         currentWindowYesTokenId = currentWindowYesTokenIdByAsset.get(currentAsset) ?? null;
         currentWindowNoTokenId  = currentWindowNoTokenIdByAsset.get(currentAsset) ?? null;
+
+        // Hard guard: never re-execute a market that was already traded this window,
+        // even if STRONG divergence cleared the analyzed set mid-window.
+        const tradedThisWindow = botTradedThisWindowByAsset.get(currentAsset)!;
+        if (tradedThisWindow.has(market.id)) {
+          botPrint("SKIP", `[${currentAsset}] Already TRADED this window — skipping: ${market.question?.slice(0, 50)}`);
+          continue;
+        }
 
         if (analyzedThisWindow.has(market.id)) {
           botPrint("SKIP", `[${currentAsset}] Already analyzed this window: ${market.question?.slice(0, 50)}`);
@@ -3263,6 +3280,10 @@ async function startServer() {
                     logEntry.tradeAmount = betAmount;
                     logEntry.tradePrice = bestAsk;
                     logEntry.orderId = tradeResult.orderID;
+                    // Lock this market for the rest of the window — prevents double execution
+                    // even if STRONG divergence clears analyzedThisWindow mid-window.
+                    tradedThisWindow.add(market.id);
+                    analyzedThisWindow.add(market.id);
                     botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
                     void sendNotification(
                       `✅ <b>TRADE EXECUTED</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${rec.direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`
