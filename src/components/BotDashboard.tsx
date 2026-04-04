@@ -23,6 +23,7 @@ import {
   Bell,
   FlaskConical,
   BarChart2,
+  Wifi,
 } from "lucide-react";
 import {
   AreaChart,
@@ -226,6 +227,31 @@ interface AnalyticsData {
   byDirection: Array<{ label: string; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
 }
 
+interface PingProbe {
+  key: string;
+  label: string;
+  target: string;
+  latencyMs: number | null;
+  ok: boolean;
+  status: number | null;
+  error?: string;
+  grade: "excellent" | "good" | "usable" | "slow" | "down";
+}
+
+interface PingState {
+  testedAt: string;
+  note: string;
+  summary: {
+    fastestMs: number | null;
+    slowestMs: number | null;
+    averageMs: number | null;
+    grade: "excellent" | "good" | "usable" | "slow" | "down";
+    criticalReady: boolean;
+  };
+  upstreams: PingProbe[];
+  browserRttMs?: number;
+}
+
 export default function BotDashboard() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [log, setLog] = useState<BotLogEntry[]>([]);
@@ -253,6 +279,8 @@ export default function BotDashboard() {
   const [enabledAssets, setEnabledAssets] = useState<string[]>(["BTC"]);
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
+  const [ping, setPing] = useState<PingState | null>(null);
+  const [pinging, setPinging] = useState(false);
   const tradeBellRef = useRef<HTMLAudioElement | null>(null);
   const seenTradeBellKeysRef = useRef<Set<string>>(new Set());
   const tradeBellPrimedRef = useRef(false);
@@ -455,6 +483,19 @@ export default function BotDashboard() {
     setCalibTogglingLoading(false);
   };
 
+  const handlePingTest = async () => {
+    setPinging(true);
+    try {
+      const startedAt = performance.now();
+      const res = await fetch("/api/bot/ping");
+      const data = await res.json() as PingState;
+      const browserRttMs = Math.round(performance.now() - startedAt);
+      setPing({ ...data, browserRttMs });
+    } finally {
+      setPinging(false);
+    }
+  };
+
   const pnl = performance ? parseFloat(performance.summary.realizedPnl) : 0;
   const pnlPositive = pnl > 0;
   const winCount = performance?.summary.winCount ?? 0;
@@ -514,13 +555,28 @@ export default function BotDashboard() {
           </h2>
           <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC · ETH · SOL market trading engine</p>
         </div>
-        <button
-          onClick={handleRefresh}
-          className="glass-card p-2 text-zinc-400 hover:text-white transition-colors"
-          title="Refresh"
-        >
-          <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handlePingTest}
+            disabled={pinging}
+            title="Test latency to Polymarket, Binance, Coinbase"
+            className={cn(
+              "glass-card flex items-center gap-1.5 px-3 py-2 text-xs font-bold transition-all",
+              pinging ? "text-cyan-400" : "text-zinc-400 hover:text-white"
+            )}
+          >
+            <Wifi className={cn("w-4 h-4", pinging && "animate-pulse")} />
+            {pinging ? "Testing…" : "Test Ping"}
+          </button>
+          <button
+            onClick={handleRefresh}
+            className="glass-card p-2 text-zinc-400 hover:text-white transition-colors"
+            title="Refresh"
+          >
+            <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
+          </button>
+        </div>
       </div>
 
       {/* ── Tab Navigation ── */}
@@ -847,6 +903,137 @@ export default function BotDashboard() {
               />
             </AreaChart>
           </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* ── Ping Dashboard ── */}
+      <div className="glass-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+              <Wifi className="w-4 h-4 text-cyan-400" />
+              Latency — Polymarket &amp; CEX
+            </h3>
+            {ping ? (
+              <p className="text-[10px] text-zinc-600 mt-0.5">
+                Tested {new Date(ping.testedAt).toLocaleTimeString()} · {ping.note}
+              </p>
+            ) : (
+              <p className="text-[10px] text-zinc-600 mt-0.5">
+                Ukur latency bot-server ke Polymarket CLOB, Gamma API, Binance, dan Coinbase.
+              </p>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {ping && (
+              <span className={cn(
+                "px-2.5 py-1 rounded-full text-[10px] font-bold border",
+                ping.summary.criticalReady
+                  ? "bg-green-500/10 text-green-400 border-green-500/30"
+                  : "bg-red-500/10 text-red-400 border-red-500/30"
+              )}>
+                {ping.summary.criticalReady ? "✓ Polymarket Ready" : "⚠ Latency High"}
+              </span>
+            )}
+            {ping && (
+              <span className={cn(
+                "px-2.5 py-1 rounded-full text-[10px] font-bold border uppercase",
+                ping.summary.grade === "excellent" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" :
+                ping.summary.grade === "good"      ? "bg-sky-500/10 text-sky-400 border-sky-500/30" :
+                ping.summary.grade === "usable"    ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
+                ping.summary.grade === "slow"      ? "bg-orange-500/10 text-orange-400 border-orange-500/30" :
+                                                     "bg-red-500/10 text-red-400 border-red-500/30"
+              )}>
+                {ping.summary.grade}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handlePingTest}
+              disabled={pinging}
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all",
+                pinging
+                  ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/30 cursor-default"
+                  : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:border-zinc-500 hover:text-white"
+              )}
+            >
+              <Wifi className={cn("w-3.5 h-3.5", pinging && "animate-pulse")} />
+              {pinging ? "Testing…" : "Test Ping"}
+            </button>
+          </div>
+        </div>
+
+        {!ping ? (
+          <div className="flex flex-col items-center justify-center h-20 gap-2 text-zinc-700">
+            <Wifi className="w-7 h-7 opacity-25" />
+            <p className="text-xs">Klik "Test Ping" untuk cek latency ke semua upstream.</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {/* Summary stats */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {[
+                { label: "Fastest", value: ping.summary.fastestMs != null ? `${ping.summary.fastestMs} ms` : "—" },
+                { label: "Average", value: ping.summary.averageMs != null ? `${ping.summary.averageMs} ms` : "—" },
+                { label: "Slowest", value: ping.summary.slowestMs != null ? `${ping.summary.slowestMs} ms` : "—" },
+                { label: "Browser RTT", value: ping.browserRttMs != null ? `${ping.browserRttMs} ms` : "—" },
+              ].map(({ label, value }) => (
+                <div key={label} className="bg-zinc-800/50 rounded-lg p-2.5 border border-zinc-700/50">
+                  <div className="text-[9px] text-zinc-500 uppercase tracking-wider mb-1">{label}</div>
+                  <div className="text-lg font-mono font-bold text-white">{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Per-upstream latency cards */}
+            <div className="grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-5">
+              {ping.upstreams.map((u) => {
+                const tone =
+                  !u.ok || u.grade === "down" ? { card: "border-red-500/30 bg-red-500/10", text: "text-red-300", sub: "text-red-400/60" } :
+                  u.grade === "excellent"      ? { card: "border-emerald-500/30 bg-emerald-500/10", text: "text-emerald-300", sub: "text-emerald-400/60" } :
+                  u.grade === "good"           ? { card: "border-sky-500/30 bg-sky-500/10", text: "text-sky-300", sub: "text-sky-400/60" } :
+                  u.grade === "usable"         ? { card: "border-amber-500/30 bg-amber-500/10", text: "text-amber-300", sub: "text-amber-400/60" } :
+                                                 { card: "border-orange-500/30 bg-orange-500/10", text: "text-orange-300", sub: "text-orange-400/60" };
+                return (
+                  <div key={u.key} className={cn("rounded-xl border px-4 py-3", tone.card)}>
+                    <div className={cn("text-[10px] uppercase tracking-wider font-semibold mb-1", tone.sub)}>
+                      {u.label}
+                    </div>
+                    <div className={cn("text-2xl font-mono font-bold", tone.text)}>
+                      {u.latencyMs != null ? `${u.latencyMs}` : "DOWN"}
+                      {u.latencyMs != null && <span className="text-sm font-normal ml-0.5 opacity-70">ms</span>}
+                    </div>
+                    <div className={cn("text-[9px] font-bold uppercase mt-0.5", tone.sub)}>
+                      {u.grade}
+                    </div>
+                    <div className="text-[9px] opacity-50 mt-0.5 truncate">
+                      {u.status != null ? `HTTP ${u.status}` : u.error || "No response"}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Grade legend */}
+            <div className="flex flex-wrap gap-2 text-[9px]">
+              {[
+                { grade: "excellent", label: "≤80ms", color: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" },
+                { grade: "good",      label: "≤150ms", color: "bg-sky-500/10 text-sky-400 border-sky-500/30" },
+                { grade: "usable",    label: "≤250ms", color: "bg-amber-500/10 text-amber-400 border-amber-500/30" },
+                { grade: "slow",      label: ">250ms", color: "bg-orange-500/10 text-orange-400 border-orange-500/30" },
+                { grade: "down",      label: "failed", color: "bg-red-500/10 text-red-400 border-red-500/30" },
+              ].map(({ grade, label, color }) => (
+                <span key={grade} className={cn("px-2 py-0.5 rounded-full border font-bold uppercase", color)}>
+                  {grade} <span className="font-normal opacity-70">{label}</span>
+                </span>
+              ))}
+              <span className="text-zinc-600 self-center ml-1">
+                Strategy-critical: Polymarket CLOB &amp; Gamma ≤150ms
+              </span>
+            </div>
+          </div>
         )}
       </div>
 
