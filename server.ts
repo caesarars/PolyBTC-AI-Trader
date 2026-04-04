@@ -45,11 +45,19 @@ interface TradeLogEntry {
 
 
 function saveTradeLog(entry: TradeLogEntry): void {
+  // 1. Local file (fast, always)
   try {
     fs.appendFileSync(TRADE_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
   } catch (e: any) {
     console.error("[Persist] Failed to write trade_log.jsonl:", e.message);
   }
+  // 2. MongoDB (SSOT — async, non-blocking)
+  getTradesCollection().then((col) => {
+    if (!col) return;
+    col.insertOne({ ...entry }).catch((e: any) =>
+      console.error("[Persist] Failed to save trade to MongoDB:", e.message)
+    );
+  });
 }
 
 function loadTradeLog(): TradeLogEntry[] {
@@ -62,6 +70,42 @@ function loadTradeLog(): TradeLogEntry[] {
   } catch (e: any) {
     console.error("[Persist] Failed to read trade_log.jsonl:", e.message);
     return [];
+  }
+}
+
+// Load last 100 resolved trades from MongoDB into botLog on startup.
+// This makes PnL chart persist across restarts (SSOT = MongoDB).
+async function loadBotLogFromDb(): Promise<void> {
+  try {
+    const col = await getTradesCollection();
+    if (!col) return;
+    const docs = await col.find({}).sort({ ts: -1 }).limit(100).toArray();
+    if (docs.length === 0) return;
+    // Map TradeLogEntry → BotLogEntry and prepend to botLog (oldest first)
+    const historical: BotLogEntry[] = docs.reverse().map((d) => ({
+      timestamp: d.ts,
+      market: d.market,
+      decision: d.result,          // "WIN" | "LOSS"
+      direction: d.direction,
+      confidence: d.confidence,
+      edge: d.edge,
+      riskLevel: "MEDIUM",
+      reasoning: `Loaded from DB — ${d.result} | PnL: ${d.pnl >= 0 ? "+" : ""}$${d.pnl.toFixed(2)}`,
+      tradeExecuted: true,
+      tradeAmount: d.betAmount,
+      tradePrice: d.entryPrice,
+      orderId: d.orderId ?? null,
+    }));
+    // Only add entries not already in botLog (avoid dupes on hot reload)
+    const existingTs = new Set(botLog.map((e) => e.timestamp));
+    const fresh = historical.filter((e) => !existingTs.has(e.timestamp));
+    botLog.push(...fresh);
+    // Keep newest at index 0 (botLog is newest-first)
+    botLog.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    if (botLog.length > 100) botLog.length = 100;
+    console.log(`[Persist] Loaded ${fresh.length} historical trades from MongoDB into botLog`);
+  } catch (e: any) {
+    console.error("[Persist] Failed to load botLog from MongoDB:", e.message);
   }
 }
 
@@ -233,6 +277,7 @@ const MONGODB_PRICE_SNAPSHOTS_COLLECTION = process.env.MONGODB_PRICE_SNAPSHOTS_C
 const MONGODB_CHART_COLLECTION = process.env.MONGODB_CHART_COLLECTION || "chart";
 const MONGODB_POSITION_AUTOMATION_COLLECTION =
   process.env.MONGODB_POSITION_AUTOMATION_COLLECTION || "position_automation";
+const MONGODB_TRADES_COLLECTION = process.env.MONGODB_TRADES_COLLECTION || "trades";
 const BTC_PRICE_CACHE_MS = 2_000;
 const BTC_HISTORY_CACHE_MS = 8_000;
 const BTC_INDICATORS_CACHE_MS = 15_000;
@@ -627,6 +672,11 @@ async function getCandlesCollection() {
 async function getPositionAutomationCollection() {
   const db = await getMongoDb();
   return db?.collection<PositionAutomationDocument>(MONGODB_POSITION_AUTOMATION_COLLECTION) || null;
+}
+
+async function getTradesCollection() {
+  const db = await getMongoDb();
+  return db?.collection<TradeLogEntry & { _id?: any }>(MONGODB_TRADES_COLLECTION) || null;
 }
 
 async function ensureMongoCollections() {
@@ -1672,6 +1722,7 @@ async function startServer() {
 
   loadLearning();
   void ensureMongoCollections();
+  void loadBotLogFromDb();
   startBtcBackgroundSync();
   startDivergenceTracker();
 
