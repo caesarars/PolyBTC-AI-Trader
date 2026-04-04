@@ -486,10 +486,10 @@ export default function BotDashboard() {
   const handlePingTest = async () => {
     setPinging(true);
     try {
-      const startedAt = performance.now();
+      const startedAt = Date.now();
       const res = await fetch("/api/bot/ping");
       const data = await res.json() as PingState;
-      const browserRttMs = Math.round(performance.now() - startedAt);
+      const browserRttMs = Date.now() - startedAt;
       setPing({ ...data, browserRttMs });
     } finally {
       setPinging(false);

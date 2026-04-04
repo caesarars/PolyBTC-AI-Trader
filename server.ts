@@ -3439,6 +3439,53 @@ async function startServer() {
     res.json({ log: rawLog });
   });
 
+  // ── Ping / latency probe endpoint ──────────────────────────────────────────
+  app.get("/api/bot/ping", async (_req, res) => {
+    const targets = [
+      { key: "clob",    label: "Polymarket CLOB",    url: "https://clob.polymarket.com/markets?limit=1" },
+      { key: "gamma",   label: "Polymarket Gamma",   url: "https://gamma-api.polymarket.com/markets?limit=1" },
+      { key: "data",    label: "Polymarket Data",    url: "https://data-api.polymarket.com/activity?limit=1" },
+      { key: "binance", label: "Binance",            url: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT" },
+      { key: "coinbase", label: "Coinbase",          url: "https://api.coinbase.com/v2/prices/BTC-USD/spot" },
+    ];
+
+    function gradeLatency(ms: number | null): "excellent" | "good" | "usable" | "slow" | "down" {
+      if (ms == null) return "down";
+      if (ms <= 80)  return "excellent";
+      if (ms <= 150) return "good";
+      if (ms <= 250) return "usable";
+      return "slow";
+    }
+
+    const results = await Promise.all(targets.map(async (t) => {
+      const start = Date.now();
+      try {
+        const r = await axios.get(t.url, { timeout: 6000, validateStatus: () => true });
+        const latencyMs = Date.now() - start;
+        const grade = gradeLatency(latencyMs);
+        return { key: t.key, label: t.label, target: t.url, latencyMs, ok: r.status < 400, status: r.status, grade };
+      } catch (err: any) {
+        return { key: t.key, label: t.label, target: t.url, latencyMs: null, ok: false, status: null, error: err?.message ?? "timeout", grade: "down" as const };
+      }
+    }));
+
+    const up = results.filter(r => r.latencyMs != null).map(r => r.latencyMs as number);
+    const fastestMs  = up.length ? Math.min(...up) : null;
+    const slowestMs  = up.length ? Math.max(...up) : null;
+    const averageMs  = up.length ? Math.round(up.reduce((a, b) => a + b, 0) / up.length) : null;
+    const overallGrade = gradeLatency(averageMs);
+    const clob  = results.find(r => r.key === "clob");
+    const gamma = results.find(r => r.key === "gamma");
+    const criticalReady = (clob?.latencyMs ?? 9999) <= 150 && (gamma?.latencyMs ?? 9999) <= 150;
+
+    res.json({
+      testedAt: new Date().toISOString(),
+      note: `${up.length}/${results.length} upstreams reachable`,
+      summary: { fastestMs, slowestMs, averageMs, grade: overallGrade, criticalReady },
+      upstreams: results,
+    });
+  });
+
   // ── SSE endpoint — real-time bot events ────────────────────────────────────
   app.get("/api/bot/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
