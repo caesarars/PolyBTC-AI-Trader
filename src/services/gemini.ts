@@ -353,8 +353,8 @@ export async function analyzeMarket(
 
   // Order book imbalance is passed to the prompt — AI evaluates it per trade rules (>60/40 to count as signal)
 
-  // Pre-AI gate: require at least 2 of 5 signals aligned (aggressive mode allows thinner setups)
-  if (hasBtcHistory && alignment.bullish < 2 && alignment.bearish < 2) {
+  // Pre-AI gate: require at least 3 of 5 signals aligned (raised from 2 — fewer false signals)
+  if (hasBtcHistory && alignment.bullish < 3 && alignment.bearish < 3) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
@@ -527,9 +527,9 @@ Fewer high-conviction trades beat many marginal trades. When in doubt, output NO
    Exception: if PRICE LAG DIVERGENCE is STRONG or MODERATE, 2/5 alignment is sufficient.
    Output NO_TRADE if fewer than 3 signals align AND no strong divergence is present.
 
-2. MINIMUM CONFIDENCE: Output TRADE only if confidence >= 65%.
-   Below 65% you cannot clearly beat the 50% base rate — output NO_TRADE.
-   Do NOT output confidence 65%+ unless at least 3 signals are genuinely aligned.
+2. MINIMUM CONFIDENCE: Output TRADE only if confidence >= 75%.
+   Below 75% you cannot clearly beat the 50% base rate — output NO_TRADE.
+   Do NOT output confidence 75%+ unless at least 3 signals are genuinely aligned.
 
 3. REAL EDGE: Edge = your estimated probability minus the 50% base rate.
    A 70% estimate = +20% edge over coin flip. A 60% estimate = +10% = not tradeable.
@@ -590,7 +590,7 @@ Respond with JSON only:
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite-preview",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: { responseMimeType: "application/json" },
     });

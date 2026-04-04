@@ -246,8 +246,8 @@ GEMINI_API_KEY=AIza...
 
 ```env
 ENABLED_ASSETS=BTC,ETH,SOL
-BOT_MIN_CONFIDENCE=65
-BOT_MIN_EDGE=0.10
+BOT_MIN_CONFIDENCE=75
+BOT_MIN_EDGE=0.15
 BOT_FIXED_TRADE_USDC=1
 BOT_SESSION_LOSS_LIMIT=0.30
 BOT_AUTO_START=false
@@ -303,8 +303,8 @@ MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
 
 | Parameter | AGGRESSIVE | CONSERVATIVE |
 |---|---|---|
-| Min Confidence | 65% | 75% |
-| Min Edge | 0.10¢ | 0.12¢ |
+| Min Confidence | 75% | 75% |
+| Min Edge | 0.15¢ | 0.15¢ |
 | Fixed Trade Size | $1 | $1 |
 | Max Bet | Not used for auto-entry | Not used for auto-entry |
 | Session Loss Limit | 30% | 15% |

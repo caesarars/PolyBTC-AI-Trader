@@ -249,9 +249,9 @@ const ASSET_CONFIG: Record<TradingAsset, {
   divergenceWeak: number;
   label: string;
 }> = {
-  BTC: { binanceSymbol: "BTCUSDT", coinbaseProduct: "BTC-USD", coinGeckoId: "bitcoin",  krakenPair: "XBTUSD",  polySlugPrefix: "btc-updown-5m", divergenceStrong: 100, divergenceMod: 60,  divergenceWeak: 30,  label: "Bitcoin" },
-  ETH: { binanceSymbol: "ETHUSDT", coinbaseProduct: "ETH-USD", coinGeckoId: "ethereum", krakenPair: "ETHUSD",  polySlugPrefix: "eth-updown-5m", divergenceStrong: 6,   divergenceMod: 3.5, divergenceWeak: 1.5, label: "Ethereum" },
-  SOL: { binanceSymbol: "SOLUSDT", coinbaseProduct: "SOL-USD", coinGeckoId: "solana",   krakenPair: "SOLUSD",  polySlugPrefix: "sol-updown-5m", divergenceStrong: 2,   divergenceMod: 1,   divergenceWeak: 0.4, label: "Solana" },
+  BTC: { binanceSymbol: "BTCUSDT", coinbaseProduct: "BTC-USD", coinGeckoId: "bitcoin",  krakenPair: "XBTUSD",  polySlugPrefix: "btc-updown-5m", divergenceStrong: 200, divergenceMod: 120, divergenceWeak: 60,  label: "Bitcoin" },
+  ETH: { binanceSymbol: "ETHUSDT", coinbaseProduct: "ETH-USD", coinGeckoId: "ethereum", krakenPair: "ETHUSD",  polySlugPrefix: "eth-updown-5m", divergenceStrong: 12,  divergenceMod: 7,   divergenceWeak: 3,   label: "Ethereum" },
+  SOL: { binanceSymbol: "SOLUSDT", coinbaseProduct: "SOL-USD", coinGeckoId: "solana",   krakenPair: "SOLUSD",  polySlugPrefix: "sol-updown-5m", divergenceStrong: 4,   divergenceMod: 2,   divergenceWeak: 0.8, label: "Solana" },
 };
 
 // Per-asset in-memory caches (BTC uses legacy single vars below for backward compat)
@@ -287,8 +287,8 @@ const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
-const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 65);
-const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.10);
+const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 75);
+const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.15);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_FIXED_TRADE_USDC = Number(process.env.BOT_FIXED_TRADE_USDC || 1);
@@ -2137,12 +2137,11 @@ async function startServer() {
         botPrint("INFO", `Result tracker armed — checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
 
         // ── Correlated multi-asset entry ──────────────────────────────────────
-        // BTC STRONG divergence historically pulls ETH and SOL Polymarket prices
-        // in the same direction — they often lag BTC by 1-2 cycles. Enter the same
-        // direction at reduced Kelly (70%) since the signal is BTC-derived, not
-        // the asset's own independent divergence.
+        // DISABLED: correlated entries amplify risk without independent signal.
+        // Re-enable only after proving BTC divergence has sustained >55% win rate.
+        const ENABLE_CORRELATED_ENTRY = false;
         const correlatedAssets = ENABLED_ASSETS.filter(a => a !== currentDivergenceAsset);
-        if (correlatedAssets.length > 0) {
+        if (ENABLE_CORRELATED_ENTRY && correlatedAssets.length > 0) {
           await Promise.allSettled(correlatedAssets.map(async (corrAsset) => {
             try {
               const corrMarket = activeBotMarketByAsset.get(corrAsset);
@@ -2344,15 +2343,15 @@ async function startServer() {
           }
 
           // ── Spike capture: early large move — take it before it reverses ────────
-          // If within first 90s after entry the price has spiked +8¢, exit immediately.
-          // These early spikes almost always mean-revert in 5-min binary markets.
+          // If within first 120s after entry the price has spiked +12¢, exit immediately.
+          // Raised from +8¢/90s — early spikes at +8¢ often continue, cutting profit short.
           const entryTimestamp = automation.lastTriggeredAt
             ? Math.floor(new Date(automation.lastTriggeredAt).getTime() / 1000)
             : 0;
           const secondsSinceEntry = entryTimestamp > 0 ? nowSeconds - entryTimestamp : 9999;
-          if (!triggerReason && entryPrice > 0 && secondsSinceEntry <= 90) {
+          if (!triggerReason && entryPrice > 0 && secondsSinceEntry <= 120) {
             const spikeGain = currentPrice - entryPrice;
-            if (spikeGain >= 0.08) {
+            if (spikeGain >= 0.12) {
               triggerReason = `spike capture (+${(spikeGain * 100).toFixed(0)}¢ in ${secondsSinceEntry}s — taking early gain)`;
             }
           }
@@ -3179,15 +3178,16 @@ async function startServer() {
           //   BUY_PRESSURE  → 67% WR (+$8.84)   ← trade with (UP) or allow (DOWN)
           //   NEUTRAL       → 40% WR (-$1.55)   ← trade with (marginal edge)
           //   SELL_PRESSURE → 20% WR (-$7.64)   ← BLOCK on UP trades only
-          // Rule: only block when crowd selling YES against an UP trade.
-          //   UP   trade → block if YES book shows SELL_PRESSURE
-          //   DOWN trade → BUY_PRESSURE actually wins 4/4 — do NOT block
+          // Rule: block when order book pressure opposes trade direction.
+          //   UP   trade → block if YES book shows SELL_PRESSURE (crowd selling YES against us)
+          //   DOWN trade → block if YES book shows BUY_PRESSURE (crowd buying YES against us)
+          //   UNKNOWN → block (no data = blind entry, hist WR ~17%)
           if (qualifies) {
             const tokenIds: string[] = market.clobTokenIds || [];
             const yesSignal = orderBooks[tokenIds[0]]?.imbalanceSignal ?? "UNKNOWN";
             const pressureOpposesDirection =
-              (rec.direction === "UP" && yesSignal === "SELL_PRESSURE") ||
-              yesSignal === "UNKNOWN"; // no order book data = blind entry (hist WR 17%)
+              (rec.direction === "UP" && (yesSignal === "SELL_PRESSURE" || yesSignal === "UNKNOWN")) ||
+              (rec.direction === "DOWN" && (yesSignal === "BUY_PRESSURE" || yesSignal === "UNKNOWN"));
 
             if (pressureOpposesDirection) {
               botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/UNKNOWN) | re-check next cycle`);
@@ -3269,14 +3269,12 @@ async function startServer() {
                   : impliedPrice > 0 ? impliedPrice : clobAsk;
 
                 // ── Dynamic entry price gate ─────────────────────────────────
-                // Break-even win rate = entry price for binary $1 payouts.
-                // So at 70% confidence, paying 70¢ is break-even — we need
-                // a buffer to actually profit. Formula: max = (confidence - 10) / 100
-                //   70% conf → max 60¢  (EV = +10¢/share)
-                //   75% conf → max 65¢  (EV = +10¢/share)
-                //   80% conf → max 70¢  (EV = +10¢/share)
-                //   85%+ conf → max 75¢ (capped; divergence gets 85¢ exception)
-                // STRONG divergence is a structural edge (real price lag) → allow 85¢.
+                // Raised buffer from 10¢ to 15¢ for better EV per trade.
+                //   75% conf → max 60¢  (EV = +15¢/share)
+                //   80% conf → max 65¢  (EV = +15¢/share)
+                //   85% conf → max 70¢  (EV = +15¢/share)
+                //   90%+ conf → max 75¢ (capped; divergence gets 80¢ exception)
+                // STRONG divergence is a structural edge (real price lag) → allow 80¢.
                 if (bestAsk <= 0) {
                   botPrint("SKIP", `No price data available — skipping`);
                   analyzedThisWindow.delete(market.id);
@@ -3285,8 +3283,8 @@ async function startServer() {
 
                 const isDivergenceStrong = div?.strength === "STRONG";
                 const MAX_ENTRY_PRICE = isDivergenceStrong
-                  ? 0.85
-                  : Math.min(0.75, (rec.confidence - 10) / 100);
+                  ? 0.80
+                  : Math.min(0.75, (rec.confidence - 15) / 100);
                 if (bestAsk > MAX_ENTRY_PRICE) {
                   const priceSource = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD) ? "CLOB" : "AMM";
                   botPrint("SKIP", `Entry price too high: ${priceSource}=${( bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Monitoring for better price…`);
