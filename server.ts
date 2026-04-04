@@ -9,7 +9,6 @@ import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 import { MongoClient, Db, Collection } from "mongodb";
-import { analyzeMarket } from "./src/services/gemini.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -384,8 +383,8 @@ const currentWindowAiCache = new Map<TradingAsset, { windowStart: number; market
 
 // ── Divergence tracker (asset price vs YES token lag detector) ───────────────
 interface PricePoint { ts: number; price: number; }
-const btcRingBuffer: PricePoint[] = [];   // 5s samples, 10-min window (named btc for compat)
-const yesRingBuffer: PricePoint[] = [];   // YES token ask price
+const priceRingBufferByAsset = new Map<TradingAsset, PricePoint[]>([["BTC",[]], ["ETH",[]], ["SOL",[]]]);
+const yesRingBufferByAsset   = new Map<TradingAsset, PricePoint[]>([["BTC",[]], ["ETH",[]], ["SOL",[]]]);
 const currentWindowYesTokenIdByAsset = new Map<TradingAsset, string | null>();
 const currentWindowNoTokenIdByAsset  = new Map<TradingAsset, string | null>();
 // Convenience accessors used by divergence tracker (always reflects currentDivergenceAsset)
@@ -1578,12 +1577,16 @@ function startDivergenceTracker() {
     try {
       const now = Math.floor(Date.now() / 1000);
 
-      // 1. Asset price sample (uses whichever asset the bot is currently tracking)
-      const btcData = await getAssetPrice(currentDivergenceAsset);
+      // 1. Asset price sample — stored per-asset to avoid cross-asset contamination
+      const _asset = currentDivergenceAsset;
+      const priceRingBuf = priceRingBufferByAsset.get(_asset)!;
+      const yesRingBuf   = yesRingBufferByAsset.get(_asset)!;
+
+      const btcData = await getAssetPrice(_asset);
       const btcPrice = btcData?.price ? parseFloat(btcData.price as any) : null;
       if (btcPrice && btcPrice > 0) {
-        btcRingBuffer.push({ ts: now, price: btcPrice });
-        if (btcRingBuffer.length > 120) btcRingBuffer.shift(); // 10-min cap
+        priceRingBuf.push({ ts: now, price: btcPrice });
+        if (priceRingBuf.length > 120) priceRingBuf.shift(); // 10-min cap
       }
 
       // 2. YES / NO token ask price sample (current window)
@@ -1601,8 +1604,8 @@ function startDivergenceTracker() {
           yesAsk = asks.length > 0 ? parseFloat(asks[0].price)
                  : bids.length > 0 ? parseFloat(bids[0].price) : null;
           if (yesAsk && yesAsk > 0) {
-            yesRingBuffer.push({ ts: now, price: yesAsk });
-            if (yesRingBuffer.length > 120) yesRingBuffer.shift();
+            yesRingBuf.push({ ts: now, price: yesAsk });
+            if (yesRingBuf.length > 120) yesRingBuf.shift();
           }
         } catch { /* non-fatal */ }
       }
@@ -1620,9 +1623,9 @@ function startDivergenceTracker() {
         } catch { /* non-fatal */ }
       }
 
-      // 3. Compute 30s and 60s deltas from ring buffers
-      const btcNow = btcRingBuffer.length > 0 ? btcRingBuffer[btcRingBuffer.length - 1].price : null;
-      const yesNow = yesRingBuffer.length > 0 ? yesRingBuffer[yesRingBuffer.length - 1].price : null;
+      // 3. Compute 30s and 60s deltas from per-asset ring buffers
+      const btcNow = priceRingBuf.length > 0 ? priceRingBuf[priceRingBuf.length - 1].price : null;
+      const yesNow = yesRingBuf.length > 0 ? yesRingBuf[yesRingBuf.length - 1].price : null;
 
       const findNearest = (buf: PricePoint[], targetTs: number) =>
         buf.reduce<PricePoint | null>((best, p) => {
@@ -1631,9 +1634,9 @@ function startDivergenceTracker() {
           return best;
         }, null);
 
-      const btc30ref = findNearest(btcRingBuffer, now - 30);
-      const btc60ref = findNearest(btcRingBuffer, now - 60);
-      const yes30ref = findNearest(yesRingBuffer, now - 30);
+      const btc30ref = findNearest(priceRingBuf, now - 30);
+      const btc60ref = findNearest(priceRingBuf, now - 60);
+      const yes30ref = findNearest(yesRingBuf, now - 30);
 
       const btcDelta30s = btcNow && btc30ref ? btcNow - btc30ref.price : 0;
       const btcDelta60s = btcNow && btc60ref ? btcNow - btc60ref.price : 0;
@@ -2721,8 +2724,8 @@ async function startServer() {
         for (const s of botTradedThisWindowByAsset.values()) s.clear();
         currentWindowAiCache.clear();
         botLastWindowStart = currentWindowStart;
-        // Clear YES ring buffer — old window's tokens are no longer valid
-        yesRingBuffer.length = 0;
+        // Clear all per-asset YES ring buffers — old window's tokens are no longer valid
+        for (const buf of yesRingBufferByAsset.values()) buf.length = 0;
         currentWindowYesTokenId = null;
         currentWindowNoTokenId  = null;
         currentWindowYesTokenIdByAsset.clear();
@@ -2830,6 +2833,18 @@ async function startServer() {
                 .then((r) => r.data.data[0]).catch(() => null),
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+
+            // ── Strike price vs current price analysis ──────────────────────
+            // Parse strike from question e.g. "Will BTC be above $95,500 at 12:05?"
+            const _strikeMatch = (market.question ?? "").match(/\$([0-9,]+(?:\.[0-9]+)?)/);
+            const _strikePx = _strikeMatch ? parseFloat(_strikeMatch[1].replace(/,/g, "")) : null;
+            const _currentPx = btcPriceData?.price ? parseFloat(btcPriceData.price) : null;
+            if (_strikePx && _currentPx) {
+              const _gapDollar = _strikePx - _currentPx;
+              const _gapPct    = (_gapDollar / _currentPx) * 100;
+              const _proximity = Math.abs(_gapPct) < 0.05 ? "AT STRIKE" : Math.abs(_gapPct) < 0.15 ? "NEAR" : Math.abs(_gapPct) < 0.40 ? "FAR" : "VERY FAR";
+              botPrint("INFO", `Strike analysis: current=$${_currentPx.toLocaleString("en-US", { maximumFractionDigits: 0 })} | strike=$${_strikePx.toLocaleString("en-US")} | gap=${_gapDollar >= 0 ? "+" : ""}$${_gapDollar.toFixed(0)} (${_gapPct >= 0 ? "+" : ""}${_gapPct.toFixed(3)}%) | ${_proximity}`);
+            }
 
             // Fetch order books with computed imbalance + liquidity
             botPrint("INFO", "Fetching order books...");
@@ -2983,7 +2998,6 @@ async function startServer() {
           const alignmentScore = fastPathDir === "UP" ? localAlignment.bullish : fastPathDir === "DOWN" ? localAlignment.bearish : 0;
           const divAgrees = !div || div.strength === "NONE" || div.direction === "NEUTRAL" || div.direction === fastPathDir;
           const assetLossMemory = lossMemory.filter(l => !l.asset || l.asset === currentAsset);
-          const assetWinMemory  = winMemory.filter(w => !w.asset || w.asset === currentAsset);
           const noLossConflict = assetLossMemory.slice(0, 3).every(
             (l) => !(l.direction === fastPathDir && Math.abs((l.signalScore ?? 0)) >= 2)
           );
@@ -3016,28 +3030,61 @@ async function startServer() {
             botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢ | Gemini skipped`);
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
 
-          // ── NORMAL PATH: use cached or fresh Gemini ────────────────────────
+          // ── NORMAL PATH: price-lag signal synthesizer (Gemini removed) ───────
           } else if (currentWindowAiCache.get(currentAsset)?.windowStart === currentWindowStart && currentWindowAiCache.get(currentAsset)?.marketId === market.id) {
             rec = currentWindowAiCache.get(currentAsset)!.rec;
-            botPrint("OK", `Reusing AI (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% — only checking price now`);
+            botPrint("OK", `Reusing signal (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}%`);
           } else {
-            botPrint("INFO", "Calling Gemini AI for analysis...");
-            rec = await analyzeMarket(
-              market,
-              btcPriceData?.price ?? null,
-              btcHistoryResult?.history ?? [],
-              sentimentData,
-              btcIndicatorsData,
-              orderBooks,
-              marketHistory,
-              windowElapsedSeconds,
-              assetLossMemory.slice(0, 5),
-              div,
-              assetWinMemory.slice(0, 3),
-              fastMom,
-              currentAsset
-            );
-            // Cache AI result for this window so price-gate retries don't re-call Gemini
+            // Synthesize rec from FastLoop + divergence + alignment — no external AI call.
+            const synthDir: "UP" | "DOWN" | "NONE" =
+              fastMom && fastMom.direction !== "NEUTRAL" ? fastMom.direction
+              : div && div.strength !== "NONE" && div.direction !== "NEUTRAL" ? div.direction as "UP" | "DOWN"
+              : "NONE";
+
+            if (synthDir === "NONE") {
+              rec = {
+                decision: "NO_TRADE", direction: "NONE", confidence: 0, estimatedEdge: 0,
+                riskLevel: "HIGH", reasoning: "No directional signal from FastLoop or divergence",
+                candlePatterns: [], dataMode: "FULL_DATA",
+                reversalProbability: 50, oppositePressureProbability: 50,
+                reversalReasoning: "No signal",
+              };
+            } else {
+              const alignScore = synthDir === "UP" ? localAlignment.bullish : localAlignment.bearish;
+              const divBoost   = div && div.strength === "STRONG" ? 10 : div && div.strength === "MODERATE" ? 5 : 0;
+              const momBoost   = fastMom?.strength === "STRONG" ? 8 : fastMom?.strength === "MODERATE" ? 4 : 0;
+              const techBoost  = btcIndicatorsData?.signalScore != null ? Math.min(6, Math.abs(btcIndicatorsData.signalScore) * 2) : 0;
+              const lossStreak = assetLossMemory.filter(l => l.direction === synthDir).length;
+              const streakPenalty = lossStreak >= 2 ? lossStreak * 3 : 0;
+
+              let synthConf = 55 + alignScore * 4 + divBoost + momBoost + techBoost - streakPenalty;
+              synthConf = Math.max(55, Math.min(88, Math.round(synthConf)));
+
+              const riskLevel: "LOW" | "MEDIUM" | "HIGH" =
+                synthConf >= 75 && alignScore >= 3 ? "LOW"
+                : synthConf >= 65 ? "MEDIUM"
+                : "HIGH";
+
+              const entryRef  = synthDir === "UP"
+                ? (parseFloat(market.outcomePrices?.[0] ?? "0.5"))
+                : (parseFloat(market.outcomePrices?.[1] ?? "0.5"));
+              const synthEdge = parseFloat(((synthConf / 100) - entryRef).toFixed(4));
+
+              rec = {
+                decision: synthEdge > 0 ? "TRADE" : "NO_TRADE",
+                direction: synthDir,
+                confidence: synthConf,
+                estimatedEdge: synthEdge,
+                riskLevel,
+                reasoning: `[SYNTH] ${synthDir} | align=${alignScore}/5 | FastLoop=${fastMom?.strength ?? "N/A"} vw=${fastMom?.volumeWeighted?.toFixed(3) ?? "0"}% | div=${div?.strength ?? "NONE"} | tech=${btcIndicatorsData?.signalScore ?? 0} | streak-${synthDir}=${lossStreak}L`,
+                candlePatterns: [],
+                dataMode: "FULL_DATA" as const,
+                reversalProbability: Math.max(15, 50 - alignScore * 7),
+                oppositePressureProbability: 30,
+                reversalReasoning: "Synthesized from local signals",
+              };
+              botPrint("INFO", `[SYNTH] ${synthDir} conf=${synthConf}% edge=${synthEdge}¢ align=${alignScore}/5 div=${div?.strength ?? "NONE"} mom=${fastMom?.strength ?? "N/A"}`);
+            }
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
           }
 
