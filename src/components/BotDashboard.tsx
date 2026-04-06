@@ -265,6 +265,7 @@ export default function BotDashboard() {
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
+  const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configSaved, setConfigSaved] = useState(false);
   const [momentumHistory, setMomentumHistory] = useState<MomentumPoint[]>([]);
@@ -422,8 +423,10 @@ export default function BotDashboard() {
   const handleSaveConfig = async () => {
     const conf = confInput !== "" ? Number(confInput) : null;
     const edge = edgeInput !== "" ? Number(edgeInput) : null;
+    const fixedTradeUsdc = fixedTradeInput;
     if (conf !== null && (isNaN(conf) || conf < 50 || conf > 99)) return;
     if (edge !== null && (isNaN(edge) || edge < 0.01 || edge > 0.50)) return;
+    if (fixedTradeUsdc !== null && (!Number.isInteger(fixedTradeUsdc) || fixedTradeUsdc < 1 || fixedTradeUsdc > 5)) return;
     setConfigSaving(true);
     try {
       await fetch("/api/bot/config", {
@@ -432,8 +435,10 @@ export default function BotDashboard() {
         body: JSON.stringify({
           ...(conf !== null && { minConfidence: conf }),
           ...(edge !== null && { minEdge: edge }),
+          ...(fixedTradeUsdc !== null && { fixedTradeUsdc }),
         }),
       });
+      setFixedTradeInput(null);
       setConfigSaved(true);
       setTimeout(() => setConfigSaved(false), 2000);
       await fetchAll();
@@ -1343,6 +1348,38 @@ export default function BotDashboard() {
                 <span>0.01</span><span>0.10</span><span>0.20</span><span>0.30</span>
               </div>
             </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-zinc-400">Fixed Trade Size</span>
+                <span className="font-mono text-amber-400">
+                  ${(fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1).toFixed(2)}
+                  {fixedTradeInput !== null ? " (dipilih)" : " (aktif)"}
+                </span>
+              </div>
+              <div className="grid grid-cols-5 gap-1.5">
+                {[1, 2, 3, 4, 5].map((amount) => {
+                  const selected = (fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1) === amount;
+                  return (
+                    <button
+                      key={amount}
+                      type="button"
+                      onClick={() => setFixedTradeInput(amount)}
+                      className={cn(
+                        "py-1.5 rounded-lg text-xs font-bold border transition-all",
+                        selected
+                          ? "bg-amber-500/20 text-amber-300 border-amber-500/50"
+                          : "bg-zinc-800 text-zinc-400 border-zinc-700 hover:bg-zinc-700 hover:text-white"
+                      )}
+                    >
+                      ${amount}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="text-[9px] text-zinc-600">
+                Nominal buy per trade. Default awal tetap diambil dari `.env`, tapi pilihan ini override runtime.
+              </div>
+            </div>
             {/* EV preview */}
             {confInput !== "" && edgeInput !== "" && (() => {
               const conf = Number(confInput) / 100;
@@ -1357,7 +1394,7 @@ export default function BotDashboard() {
             <button
               type="button"
               onClick={handleSaveConfig}
-              disabled={configSaving || (confInput === "" && edgeInput === "")}
+              disabled={configSaving || (confInput === "" && edgeInput === "" && fixedTradeInput === null)}
               className="w-full py-1.5 rounded-lg text-xs font-bold transition-all bg-zinc-700 text-zinc-300 hover:bg-emerald-600 hover:text-white disabled:opacity-40 disabled:cursor-default"
             >
               {configSaving ? "Saving…" : configSaved ? "✓ Saved" : "Apply"}
