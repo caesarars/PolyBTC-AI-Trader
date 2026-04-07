@@ -51,10 +51,81 @@ interface EntrySnapshot {
   riskLevel: string | null;
   estimatedBet: number | null;
   btcPrice: number | null;
-  asset?: string; // "BTC" | "ETH" | "SOL"
+  asset?: string; // "BTC"
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
   updatedAt: string;
+}
+
+interface ExecutionQuote {
+  tokenId: string;
+  side: "BUY" | "SELL";
+  amount: number;
+  amountMode: "SPEND" | "SIZE";
+  referencePrice: number | null;
+  averagePrice: number | null;
+  limitPrice: number | null;
+  worstPrice: number | null;
+  estimatedCost: number;
+  filledSize: number;
+  fullyFilled: boolean;
+  levelsConsumed: number;
+  slippageAbs: number | null;
+  slippageBps: number | null;
+  source: "depth" | "fallback" | "unavailable";
+  updatedAt: string;
+}
+
+interface StreamTradeSnapshot {
+  tokenId: string;
+  price: number;
+  size: number;
+  side: "BUY" | "SELL" | "UNKNOWN";
+  timestamp: number;
+}
+
+interface MarketDiscoverySummary {
+  asset: string;
+  currentSlug: string;
+  nextSlug: string;
+  currentMarketCount: number;
+  nextMarketCount: number;
+  activeMarketId: string | null;
+  fetchedAt: string | null;
+  ageMs: number | null;
+  trackedTokenIds: string[];
+  prewarmedTokenIds: string[];
+}
+
+interface BotInfraStatus {
+  marketDiscovery: Record<string, MarketDiscoverySummary>;
+  stream: {
+    mode: "websocket" | "disabled";
+    packageAvailable: boolean;
+    connected: boolean;
+    watchedTokenIds: string[];
+    lastBookAt: string | null;
+    lastTradeAt: string | null;
+    reconnectCount: number;
+    lastError: string | null;
+    books: Record<string, {
+      tokenId: string;
+      bestBid: number | null;
+      bestAsk: number | null;
+      spread: number | null;
+      imbalanceSignal: string;
+      updatedAt: string;
+      source: "rest" | "ws";
+    }>;
+    recentTrades: Record<string, StreamTradeSnapshot[]>;
+  };
+  prewarm: {
+    readyTokenIds: string[];
+    totalReady: number;
+    totalTracked: number;
+    lastError: string | null;
+  };
+  executionQuote: ExecutionQuote | null;
 }
 
 interface BotStatus {
@@ -65,6 +136,7 @@ interface BotStatus {
   windowElapsedSeconds: number;
   analyzedThisWindow: number;
   entrySnapshot: EntrySnapshot | null;
+  infra?: BotInfraStatus;
   enabledAssets: string[];
   config: {
     minConfidence: number;
@@ -227,6 +299,105 @@ interface AnalyticsData {
   byDirection: Array<{ label: string; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
 }
 
+interface TradeLogReplayData {
+  generatedAt: string;
+  scope: {
+    asset: string;
+    totalTrades: number;
+    assumptions: string[];
+  };
+  config: {
+    minConfidence: number;
+    minEdge: number;
+  };
+  baseline: {
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    totalPnl: number;
+  };
+  replay: {
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    totalPnl: number;
+    blockedTrades: number;
+    blockedPnl: number;
+    pnlDelta: number;
+  };
+  blockedByReason: Array<{
+    reason: string;
+    trades: number;
+    wins: number;
+    losses: number;
+    totalPnl: number;
+  }>;
+  entries: Array<{
+    ts: string;
+    market: string;
+    direction: "UP" | "DOWN";
+    confidence: number;
+    edge: number;
+    entryPrice: number;
+    pnl: number;
+    result: "WIN" | "LOSS";
+    replayAllowed: boolean;
+    replayReasons: string[];
+  }>;
+}
+
+interface BtcCutoffData {
+  generatedAt: string;
+  total: {
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    totalPnl: number;
+  };
+  byDirection: Array<{ label: string; trades: number; wins: number; losses: number; winRate: number | null; pnl: number }>;
+  byConfidence: Array<{ label: string; trades: number; wins: number; losses: number; winRate: number | null; pnl: number }>;
+  byEntryPrice: Array<{ label: string; trades: number; wins: number; losses: number; winRate: number | null; pnl: number }>;
+  matrix: Array<{
+    label: string;
+    direction: string;
+    confidenceBucket: string;
+    entryPriceBucket: string;
+    edgeBucket: string;
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    pnl: number;
+  }>;
+  bestBuckets: Array<{
+    label: string;
+    direction: string;
+    confidenceBucket: string;
+    entryPriceBucket: string;
+    edgeBucket: string;
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    pnl: number;
+  }>;
+  worstBuckets: Array<{
+    label: string;
+    direction: string;
+    confidenceBucket: string;
+    entryPriceBucket: string;
+    edgeBucket: string;
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    pnl: number;
+  }>;
+}
+
 interface PingProbe {
   key: string;
   label: string;
@@ -274,12 +445,12 @@ export default function BotDashboard() {
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null);
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+  const [tradeLogReplay, setTradeLogReplay] = useState<TradeLogReplayData | null>(null);
+  const [btcCutoffData, setBtcCutoffData] = useState<BtcCutoffData | null>(null);
   const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "analytics">("dashboard");
   const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
   const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
   const [learning, setLearning] = useState<LearningState | null>(null);
-  const [enabledAssets, setEnabledAssets] = useState<string[]>(["BTC"]);
-  const [assetsLoading, setAssetsLoading] = useState(false);
   const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
   const [ping, setPing] = useState<PingState | null>(null);
   const [pinging, setPinging] = useState(false);
@@ -289,7 +460,8 @@ export default function BotDashboard() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes] = await Promise.allSettled([
+      await fetch("/api/polymarket/discovery").catch(() => null);
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, replayRes, btcCutoffRes, calibRes, learningRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -300,6 +472,8 @@ export default function BotDashboard() {
         fetch("/api/bot/momentum-history").then((r) => r.json()),
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
+        fetch("/api/backtest/trade-log-replay").then((r) => r.json()),
+        fetch("/api/analytics/btc-cutoffs").then((r) => r.json()),
         fetch("/api/bot/calibration").then((r) => r.json()),
         fetch("/api/bot/learning").then((r) => r.json()),
       ]);
@@ -307,7 +481,6 @@ export default function BotDashboard() {
       if (statusRes.status === "fulfilled") {
         const s = statusRes.value as BotStatus;
         setStatus(s);
-        if (s.enabledAssets?.length) setEnabledAssets(s.enabledAssets);
       }
       if (logRes.status === "fulfilled") setLog((logRes.value as any).log || []);
       if (perfRes.status === "fulfilled" && !(perfRes.value as any).error) {
@@ -324,6 +497,12 @@ export default function BotDashboard() {
       if (analyticsRes.status === "fulfilled" && !(analyticsRes.value as any).error) {
         setAnalyticsData(analyticsRes.value as AnalyticsData);
       }
+      if (replayRes.status === "fulfilled" && !(replayRes.value as any).error) {
+        setTradeLogReplay(replayRes.value as TradeLogReplayData);
+      }
+      if (btcCutoffRes.status === "fulfilled" && !(btcCutoffRes.value as any).error) {
+        setBtcCutoffData(btcCutoffRes.value as BtcCutoffData);
+      }
       if (calibRes.status === "fulfilled") setCalibration(calibRes.value as any);
       if (learningRes.status === "fulfilled") setLearning(learningRes.value as LearningState);
     } catch {}
@@ -334,6 +513,12 @@ export default function BotDashboard() {
 
     const es = new EventSource("/api/bot/events");
     es.addEventListener("cycle", () => fetchAll());
+    es.addEventListener("infra", ((event: MessageEvent<string>) => {
+      try {
+        const infra = JSON.parse(event.data) as BotInfraStatus;
+        setStatus((prev) => (prev ? { ...prev, infra } : prev));
+      } catch {}
+    }) as EventListener);
     // Reconnect silently on error — browser retries EventSource automatically
     return () => es.close();
   }, [fetchAll]);
@@ -378,25 +563,6 @@ export default function BotDashboard() {
       }, index * 250);
     });
   }, [log]);
-
-  const handleToggleAsset = async (asset: string) => {
-    const next = enabledAssets.includes(asset)
-      ? enabledAssets.filter(a => a !== asset)
-      : [...enabledAssets, asset];
-    if (next.length === 0) return; // must keep at least one
-    setAssetsLoading(true);
-    try {
-      const res = await fetch("/api/bot/assets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assets: next }),
-      });
-      const data = await res.json();
-      if (res.ok) setEnabledAssets(data.enabled);
-    } finally {
-      setAssetsLoading(false);
-    }
-  };
 
   const handleResetConfidence = async () => {
     setResetConfLoading(true);
@@ -549,6 +715,18 @@ export default function BotDashboard() {
   }, [sessionTradeLog]);
 
   const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
+  const infra = status?.infra ?? null;
+  const btcDiscovery = infra?.marketDiscovery?.BTC ?? null;
+  const streamBooks = infra ? Object.values(infra.stream.books) : [];
+  const streamRecentTrades = infra ? Object.values(infra.stream.recentTrades).flat().sort((a, b) => b.timestamp - a.timestamp).slice(0, 4) : [];
+
+  const formatAge = (iso: string | null | undefined, fallbackMs?: number | null) => {
+    const diffMs = iso ? Date.now() - new Date(iso).getTime() : fallbackMs ?? null;
+    if (diffMs == null || !Number.isFinite(diffMs)) return "—";
+    if (diffMs < 1_000) return `${Math.max(0, Math.round(diffMs))}ms ago`;
+    if (diffMs < 60_000) return `${Math.round(diffMs / 1_000)}s ago`;
+    return `${Math.round(diffMs / 60_000)}m ago`;
+  };
 
   return (
     <div className="space-y-6">
@@ -559,7 +737,7 @@ export default function BotDashboard() {
             <Bot className="w-6 h-6 text-blue-400" />
             Bot Control Center
           </h2>
-          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC · ETH · SOL market trading engine</p>
+          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC market trading engine</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -609,6 +787,93 @@ export default function BotDashboard() {
       {/* ── BACKTEST TAB ── */}
       {activeTab === "backtest" && (
         <div className="space-y-4">
+          <div className="glass-card p-4">
+            <div className="flex items-center justify-between mb-4 gap-3">
+              <div>
+                <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                  <Shield className="w-4 h-4 text-amber-400" />
+                  Trade Log Replay
+                </h3>
+                <p className="text-[10px] text-zinc-600 mt-0.5">
+                  Replay current BTC rules against executed trades persisted in `trade_log.jsonl`
+                </p>
+              </div>
+              {tradeLogReplay && (
+                <span className="text-[10px] text-zinc-600">
+                  {tradeLogReplay.scope.totalTrades} BTC trades
+                </span>
+              )}
+            </div>
+
+            {!tradeLogReplay ? (
+              <div className="text-xs text-zinc-600">Replay report belum tersedia.</div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {[
+                    {
+                      label: "Baseline PnL",
+                      value: `${tradeLogReplay.baseline.totalPnl >= 0 ? "+" : ""}$${tradeLogReplay.baseline.totalPnl.toFixed(2)}`,
+                      sub: `${tradeLogReplay.baseline.wins}W / ${tradeLogReplay.baseline.losses}L`,
+                      color: tradeLogReplay.baseline.totalPnl >= 0 ? "text-green-400" : "text-red-400",
+                    },
+                    {
+                      label: "Replay PnL",
+                      value: `${tradeLogReplay.replay.totalPnl >= 0 ? "+" : ""}$${tradeLogReplay.replay.totalPnl.toFixed(2)}`,
+                      sub: `${tradeLogReplay.replay.wins}W / ${tradeLogReplay.replay.losses}L`,
+                      color: tradeLogReplay.replay.totalPnl >= 0 ? "text-green-400" : "text-red-400",
+                    },
+                    {
+                      label: "Blocked Trades",
+                      value: String(tradeLogReplay.replay.blockedTrades),
+                      sub: `${tradeLogReplay.replay.blockedPnl >= 0 ? "+" : ""}$${tradeLogReplay.replay.blockedPnl.toFixed(2)} filtered`,
+                      color: "text-amber-400",
+                    },
+                    {
+                      label: "PnL Delta",
+                      value: `${tradeLogReplay.replay.pnlDelta >= 0 ? "+" : ""}$${tradeLogReplay.replay.pnlDelta.toFixed(2)}`,
+                      sub: `conf >= ${tradeLogReplay.config.minConfidence}% | edge >= ${(tradeLogReplay.config.minEdge * 100).toFixed(0)}c`,
+                      color: tradeLogReplay.replay.pnlDelta >= 0 ? "text-green-400" : "text-red-400",
+                    },
+                  ].map(({ label, value, sub, color }) => (
+                    <div key={label} className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+                      <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">{label}</div>
+                      <div className={cn("text-xl font-mono font-bold", color)}>{value}</div>
+                      <div className="text-[10px] text-zinc-600 mt-0.5">{sub}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">Blocked By Reason</div>
+                    <div className="space-y-2">
+                      {tradeLogReplay.blockedByReason.slice(0, 6).map((reason) => (
+                        <div key={reason.reason} className="flex items-center justify-between gap-3 text-xs">
+                          <span className="text-zinc-300">{reason.reason}</span>
+                          <span className="font-mono text-zinc-500 shrink-0">
+                            {reason.trades} tr · {reason.totalPnl >= 0 ? "+" : ""}${reason.totalPnl.toFixed(2)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">Replay Assumptions</div>
+                    <div className="space-y-1.5">
+                      {tradeLogReplay.scope.assumptions.map((assumption) => (
+                        <div key={assumption} className="text-xs text-zinc-400">
+                          {assumption}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="glass-card p-4">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
@@ -726,6 +991,112 @@ export default function BotDashboard() {
             </div>
           ) : (
             <>
+              {btcCutoffData && (
+                <div className="glass-card p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div>
+                      <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                        <Shield className="w-4 h-4 text-amber-400" />
+                        BTC Cutoff Matrix
+                      </h3>
+                      <p className="text-[10px] text-zinc-600 mt-0.5">
+                        BTC-only report by direction, confidence, entry price, and normalized edge
+                      </p>
+                    </div>
+                    <span className={cn(
+                      "text-sm font-mono font-bold",
+                      btcCutoffData.total.totalPnl >= 0 ? "text-green-400" : "text-red-400"
+                    )}>
+                      {btcCutoffData.total.totalPnl >= 0 ? "+" : ""}${btcCutoffData.total.totalPnl.toFixed(2)}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">By Confidence</div>
+                      <div className="space-y-2">
+                        {btcCutoffData.byConfidence.map((row) => (
+                          <div key={row.label} className="flex items-center justify-between text-xs">
+                            <span className="text-zinc-300">{row.label}</span>
+                            <span className="font-mono text-zinc-500">
+                              {row.trades} tr · {row.winRate != null ? `${row.winRate}%` : "—"} · {row.pnl >= 0 ? "+" : ""}${row.pnl.toFixed(2)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">By Entry Price</div>
+                      <div className="space-y-2">
+                        {btcCutoffData.byEntryPrice.map((row) => (
+                          <div key={row.label} className="flex items-center justify-between text-xs">
+                            <span className="text-zinc-300">{row.label}</span>
+                            <span className="font-mono text-zinc-500">
+                              {row.trades} tr · {row.winRate != null ? `${row.winRate}%` : "—"} · {row.pnl >= 0 ? "+" : ""}${row.pnl.toFixed(2)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">Best vs Worst Buckets</div>
+                      <div className="space-y-2">
+                        {[
+                          btcCutoffData.bestBuckets[0],
+                          btcCutoffData.worstBuckets[0],
+                        ].filter(Boolean).map((row, idx) => (
+                          <div key={`${row.label}-${idx}`} className="text-xs">
+                            <div className={cn("font-semibold", idx === 0 ? "text-green-400" : "text-red-400")}>
+                              {idx === 0 ? "Best" : "Worst"}: {row.direction} | {row.confidenceBucket} | {row.entryPriceBucket} | {row.edgeBucket}
+                            </div>
+                            <div className="text-zinc-500 font-mono">
+                              {row.trades} tr · {row.winRate != null ? `${row.winRate}%` : "—"} · {row.pnl >= 0 ? "+" : ""}${row.pnl.toFixed(2)}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-left text-[10px] uppercase tracking-widest text-zinc-600 border-b border-zinc-800">
+                          <th className="pb-2 pr-3">Direction</th>
+                          <th className="pb-2 pr-3">Conf</th>
+                          <th className="pb-2 pr-3">Entry</th>
+                          <th className="pb-2 pr-3">Edge</th>
+                          <th className="pb-2 pr-3">Trades</th>
+                          <th className="pb-2 pr-3">WR</th>
+                          <th className="pb-2">PnL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {btcCutoffData.matrix
+                          .slice()
+                          .sort((a, b) => b.pnl - a.pnl)
+                          .slice(0, 12)
+                          .map((row) => (
+                            <tr key={row.label} className="border-b border-zinc-800/40 hover:bg-zinc-800/30">
+                              <td className={cn("py-1.5 pr-3 font-bold", row.direction === "UP" ? "text-green-400" : "text-red-400")}>{row.direction}</td>
+                              <td className="py-1.5 pr-3 text-zinc-300">{row.confidenceBucket}</td>
+                              <td className="py-1.5 pr-3 text-zinc-300">{row.entryPriceBucket}</td>
+                              <td className="py-1.5 pr-3 text-zinc-300">{row.edgeBucket}</td>
+                              <td className="py-1.5 pr-3 font-mono text-zinc-500">{row.trades}</td>
+                              <td className="py-1.5 pr-3 font-mono text-zinc-400">{row.winRate != null ? `${row.winRate}%` : "—"}</td>
+                              <td className={cn("py-1.5 font-mono font-bold", row.pnl >= 0 ? "text-green-400" : "text-red-400")}>
+                                {row.pnl >= 0 ? "+" : ""}${row.pnl.toFixed(2)}
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
               <div className="glass-card p-4">
                 <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
                   <BarChart2 className="w-4 h-4 text-blue-400" />
@@ -910,6 +1281,168 @@ export default function BotDashboard() {
             </AreaChart>
           </ResponsiveContainer>
         )}
+      </div>
+
+      {/* ── Market Infra ── */}
+      <div className="glass-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+              <Activity className="w-4 h-4 text-orange-400" />
+              Market Infra
+            </h3>
+            <p className="text-[10px] text-zinc-600 mt-0.5">
+              pmxt-inspired discovery cache, websocket feed, prewarm, dan execution quote depth-aware
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-[10px]">
+            <span className={cn(
+              "px-2 py-0.5 rounded-full border font-bold uppercase",
+              infra?.stream.connected
+                ? "bg-green-500/10 text-green-400 border-green-500/30"
+                : "bg-zinc-800 text-zinc-500 border-zinc-700"
+            )}>
+              {infra?.stream.connected ? "WS Live" : infra?.stream.mode === "disabled" ? "WS Off" : "WS Idle"}
+            </span>
+            <span className={cn(
+              "px-2 py-0.5 rounded-full border font-bold uppercase",
+              infra?.prewarm.totalReady
+                ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+                : "bg-zinc-800 text-zinc-500 border-zinc-700"
+            )}>
+              {infra ? `${infra.prewarm.totalReady}/${infra.prewarm.totalTracked} warm` : "prewarm —"}
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+          <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+            <div className="flex items-center gap-2 mb-2">
+              <Tag className="w-4 h-4 text-amber-400" />
+              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Discovery</span>
+            </div>
+            {btcDiscovery ? (
+              <div className="space-y-2">
+                <div>
+                  <div className="text-[10px] text-zinc-500">Current slug</div>
+                  <div className="font-mono text-[11px] text-zinc-200 break-all">{btcDiscovery.currentSlug}</div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                    <div className="text-[10px] text-zinc-500 uppercase">Current</div>
+                    <div className="font-mono text-white">{btcDiscovery.currentMarketCount}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                    <div className="text-[10px] text-zinc-500 uppercase">Next</div>
+                    <div className="font-mono text-white">{btcDiscovery.nextMarketCount}</div>
+                  </div>
+                </div>
+                <div className="text-[10px] text-zinc-600">
+                  refreshed {formatAge(btcDiscovery.fetchedAt, btcDiscovery.ageMs)} · tracked {btcDiscovery.trackedTokenIds.length} tokens
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs text-zinc-600">Discovery cache belum terisi.</div>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+            <div className="flex items-center gap-2 mb-2">
+              <Wifi className="w-4 h-4 text-cyan-400" />
+              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Stream Feed</span>
+            </div>
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                  <div className="text-[10px] text-zinc-500 uppercase">Watched</div>
+                  <div className="font-mono text-white">{infra?.stream.watchedTokenIds.length ?? 0}</div>
+                </div>
+                <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                  <div className="text-[10px] text-zinc-500 uppercase">Reconnect</div>
+                  <div className="font-mono text-white">{infra?.stream.reconnectCount ?? 0}</div>
+                </div>
+              </div>
+              <div className="text-[10px] text-zinc-600">
+                book {formatAge(infra?.stream.lastBookAt)} · trade {formatAge(infra?.stream.lastTradeAt)}
+              </div>
+              {streamBooks.length > 0 ? (
+                <div className="space-y-1.5">
+                  {streamBooks.slice(0, 2).map((book) => (
+                    <div key={book.tokenId} className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-2.5 py-2 text-[10px]">
+                      <span className="font-mono text-zinc-500">{book.tokenId.slice(0, 8)}…</span>
+                      <span className="text-zinc-300">bid {book.bestBid != null ? `${(book.bestBid * 100).toFixed(1)}¢` : "—"}</span>
+                      <span className="text-zinc-300">ask {book.bestAsk != null ? `${(book.bestAsk * 100).toFixed(1)}¢` : "—"}</span>
+                      <span className="text-zinc-500">{book.source}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-zinc-600">Belum ada snapshot order book live.</div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+            <div className="flex items-center gap-2 mb-2">
+              <DollarSign className="w-4 h-4 text-green-400" />
+              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Execution Quote</span>
+            </div>
+            {infra?.executionQuote ? (
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                    <div className="text-[10px] text-zinc-500 uppercase">Avg Fill</div>
+                    <div className="font-mono text-white">
+                      {infra.executionQuote.averagePrice != null ? `${(infra.executionQuote.averagePrice * 100).toFixed(1)}¢` : "—"}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                    <div className="text-[10px] text-zinc-500 uppercase">Limit</div>
+                    <div className="font-mono text-white">
+                      {infra.executionQuote.limitPrice != null ? `${(infra.executionQuote.limitPrice * 100).toFixed(1)}¢` : "—"}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-[10px]">
+                  <div className="rounded-lg bg-zinc-800/40 px-2.5 py-2">
+                    <div className="text-zinc-500 uppercase">Spend</div>
+                    <div className="font-mono text-zinc-200">{infra.executionQuote.amountMode === "SPEND" ? `$${infra.executionQuote.amount.toFixed(2)}` : infra.executionQuote.amount.toFixed(4)}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-800/40 px-2.5 py-2">
+                    <div className="text-zinc-500 uppercase">Shares</div>
+                    <div className="font-mono text-zinc-200">{infra.executionQuote.filledSize.toFixed(4)}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-800/40 px-2.5 py-2">
+                    <div className="text-zinc-500 uppercase">Slip</div>
+                    <div className={cn("font-mono", (infra.executionQuote.slippageBps ?? 0) <= 0 ? "text-green-400" : "text-yellow-400")}>
+                      {infra.executionQuote.slippageBps != null ? `${infra.executionQuote.slippageBps.toFixed(1)} bps` : "—"}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between text-[10px] text-zinc-600">
+                  <span>{infra.executionQuote.source} · {infra.executionQuote.levelsConsumed} levels</span>
+                  <span>{infra.executionQuote.fullyFilled ? "fully filled" : "partial depth"}</span>
+                </div>
+                {streamRecentTrades.length > 0 && (
+                  <div className="border-t border-zinc-800/70 pt-2 space-y-1">
+                    {streamRecentTrades.slice(0, 2).map((trade) => (
+                      <div key={`${trade.tokenId}-${trade.timestamp}-${trade.price}`} className="flex items-center justify-between text-[10px]">
+                        <span className="font-mono text-zinc-500">{trade.tokenId.slice(0, 8)}…</span>
+                        <span className={cn("font-semibold", trade.side === "BUY" ? "text-green-400" : trade.side === "SELL" ? "text-red-400" : "text-zinc-400")}>
+                          {trade.side}
+                        </span>
+                        <span className="text-zinc-300">{(trade.price * 100).toFixed(1)}¢</span>
+                        <span className="text-zinc-500">{trade.size.toFixed(2)} sh</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="text-xs text-zinc-600">Belum ada quote aktif. Quote akan muncul setelah discovery dan snapshot entry terisi.</div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* ── Ping Dashboard ── */}
@@ -1409,49 +1942,14 @@ export default function BotDashboard() {
             <Activity className="w-3.5 h-3.5" />
             Active Markets
           </div>
-          <div className="flex flex-col gap-2">
-            {(["BTC", "ETH", "SOL"] as const).map((asset) => {
-              const active = enabledAssets.includes(asset);
-              const isLast = active && enabledAssets.length === 1;
-              const assetColor: Record<string, string> = { BTC: "orange", ETH: "blue", SOL: "purple" };
-              const color = assetColor[asset];
-              return (
-                <button
-                  key={asset}
-                  type="button"
-                  title={isLast ? "At least one asset must remain active" : `${active ? "Disable" : "Enable"} ${asset}`}
-                  onClick={() => !isLast && handleToggleAsset(asset)}
-                  disabled={assetsLoading || isLast}
-                  className={cn(
-                    "w-full text-left rounded-lg border p-2.5 transition-all",
-                    active
-                      ? color === "orange"
-                        ? "bg-orange-500/15 border-orange-500/50"
-                        : color === "blue"
-                          ? "bg-blue-500/15 border-blue-500/50"
-                          : "bg-purple-500/15 border-purple-500/50"
-                      : "bg-zinc-800/50 border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 opacity-50",
-                    isLast ? "cursor-default" : "cursor-pointer disabled:opacity-40"
-                  )}
-                >
-                  <div className={cn(
-                    "flex items-center gap-1.5 font-bold text-xs",
-                    active
-                      ? color === "orange" ? "text-orange-300" : color === "blue" ? "text-blue-300" : "text-purple-300"
-                      : "text-zinc-500"
-                  )}>
-                    <span className="font-mono">{asset}</span>
-                    {active
-                      ? <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ON</span>
-                      : <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-zinc-700 text-zinc-500 font-bold">OFF</span>
-                    }
-                  </div>
-                </button>
-              );
-            })}
+          <div className="w-full rounded-lg border border-orange-500/50 bg-orange-500/15 p-2.5">
+            <div className="flex items-center gap-1.5 font-bold text-xs text-orange-300">
+              <span className="font-mono">BTC</span>
+              <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ON</span>
+            </div>
           </div>
           <div className="text-[10px] text-zinc-600">
-            {enabledAssets.length === 1 ? `Scanning ${enabledAssets[0]} only` : `Scanning ${enabledAssets.join(" + ")}`}
+            Scanning BTC only
           </div>
         </div>
 
