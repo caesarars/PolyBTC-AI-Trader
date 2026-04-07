@@ -238,15 +238,10 @@ type BtcCandle = {
   volume: number;
 };
 
-// ── Multi-asset support: BTC, ETH, SOL ───────────────────────────────────────
+// ── BTC-only market scope ────────────────────────────────────────────────────
 type TradingAsset = "BTC" | "ETH" | "SOL";
-const ALL_ASSETS: TradingAsset[] = ["BTC", "ETH", "SOL"];
-// Runtime-mutable: default BTC only. Override via env ENABLED_ASSETS=BTC,ETH,SOL
-let ENABLED_ASSETS: TradingAsset[] = (
-  (process.env.ENABLED_ASSETS || "BTC").split(",")
-    .map(s => s.trim().toUpperCase())
-    .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset))
-);
+const ALL_ASSETS: TradingAsset[] = ["BTC"];
+let ENABLED_ASSETS: TradingAsset[] = ["BTC"];
 const ASSET_CONFIG: Record<TradingAsset, {
   binanceSymbol: string;
   coinbaseProduct: string;
@@ -293,6 +288,10 @@ const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
 const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_000);
 const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 3_000);
+const MARKET_DISCOVERY_CACHE_MS = Number(process.env.MARKET_DISCOVERY_CACHE_MS || 10_000);
+const POLYMARKET_STREAM_STALE_MS = Number(process.env.POLYMARKET_STREAM_STALE_MS || 7_000);
+const POLYMARKET_PREWARM_TTL_MS = Number(process.env.POLYMARKET_PREWARM_TTL_MS || 5 * 60 * 1000);
+const POLYMARKET_STREAM_TRADE_BUFFER = Number(process.env.POLYMARKET_STREAM_TRADE_BUFFER || 12);
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
@@ -339,6 +338,1043 @@ function dynamicKellyFraction(confidence: number): number {
   if (confidence >= 85) return 0.55;
   if (confidence >= 75) return 0.50;
   return 0.25;
+}
+
+function getBtcPremiumEntryBlockReason(
+  asset: TradingAsset,
+  bestAsk: number,
+  confidence: number,
+  estimatedEdge: number
+): string | null {
+  if (asset !== "BTC") return null;
+  if (bestAsk > 0.50 && confidence < 82) {
+    return `BTC premium price gate: ask ${(bestAsk * 100).toFixed(1)}¢ > 50.0¢ requires confidence >= 82%`;
+  }
+  if (bestAsk >= 0.495 && estimatedEdge < 0.21) {
+    return `BTC premium price gate: ask ${(bestAsk * 100).toFixed(1)}¢ >= 49.5¢ requires edge >= 21.0¢`;
+  }
+  if (confidence >= 75 && confidence <= 79 && bestAsk >= 0.49 && estimatedEdge < 0.28) {
+    return `BTC selective confidence gate: 75–79% confidence at ask >= 49.0¢ requires edge >= 28.0¢`;
+  }
+  return null;
+}
+
+type QuoteSide = "BUY" | "SELL";
+type QuoteAmountMode = "SPEND" | "SIZE";
+
+interface NormalizedOrderLevel {
+  price: number;
+  size: number;
+}
+
+interface NormalizedOrderBookSnapshot {
+  tokenId: string;
+  bids: NormalizedOrderLevel[];
+  asks: NormalizedOrderLevel[];
+  bestBid: number | null;
+  bestAsk: number | null;
+  spread: number | null;
+  mid: number | null;
+  imbalance: number;
+  imbalanceSignal: "BUY_PRESSURE" | "SELL_PRESSURE" | "NEUTRAL";
+  totalLiquidityUsdc: number;
+  source: "rest" | "ws";
+  updatedAt: number;
+}
+
+interface ExecutionQuote {
+  tokenId: string;
+  side: QuoteSide;
+  amount: number;
+  amountMode: QuoteAmountMode;
+  referencePrice: number | null;
+  averagePrice: number | null;
+  limitPrice: number | null;
+  worstPrice: number | null;
+  estimatedCost: number;
+  filledSize: number;
+  fullyFilled: boolean;
+  levelsConsumed: number;
+  slippageAbs: number | null;
+  slippageBps: number | null;
+  source: "depth" | "fallback" | "unavailable";
+  updatedAt: string;
+}
+
+interface NormalizedPolymarketOutcome {
+  label: string;
+  index: number;
+  tokenId: string | null;
+  marketPrice: number | null;
+  side: "YES" | "NO";
+}
+
+interface NormalizedPolymarketMarket {
+  id: string;
+  conditionId: string;
+  question: string;
+  description: string;
+  outcomes: string[];
+  outcomePrices: string[];
+  clobTokenIds: string[];
+  active: boolean;
+  closed: boolean;
+  image: string;
+  icon: string;
+  category: string;
+  volume: string;
+  liquidity: string;
+  eventSlug: string;
+  eventTitle: string;
+  eventId: string;
+  startDate: string;
+  endDate: string;
+  asset: TradingAsset;
+  normalizedOutcomes: NormalizedPolymarketOutcome[];
+}
+
+interface MarketDiscoverySnapshot {
+  asset: TradingAsset;
+  windowStart: number;
+  currentSlug: string;
+  nextSlug: string;
+  currentMarkets: NormalizedPolymarketMarket[];
+  nextMarkets: NormalizedPolymarketMarket[];
+  fetchedAt: number;
+  source: string;
+  activeMarketId: string | null;
+  trackedTokenIds: string[];
+  prewarmedTokenIds: string[];
+}
+
+interface StreamTradeSnapshot {
+  tokenId: string;
+  price: number;
+  size: number;
+  side: "BUY" | "SELL" | "UNKNOWN";
+  timestamp: number;
+}
+
+interface MarketInfraStatus {
+  marketDiscovery: Record<string, {
+    asset: TradingAsset;
+    currentSlug: string;
+    nextSlug: string;
+    currentMarketCount: number;
+    nextMarketCount: number;
+    activeMarketId: string | null;
+    fetchedAt: string | null;
+    ageMs: number | null;
+    trackedTokenIds: string[];
+    prewarmedTokenIds: string[];
+  }>;
+  stream: {
+    mode: "websocket" | "disabled";
+    packageAvailable: boolean;
+    connected: boolean;
+    watchedTokenIds: string[];
+    lastBookAt: string | null;
+    lastTradeAt: string | null;
+    reconnectCount: number;
+    lastError: string | null;
+    books: Record<string, {
+      tokenId: string;
+      bestBid: number | null;
+      bestAsk: number | null;
+      spread: number | null;
+      imbalanceSignal: string;
+      updatedAt: string;
+      source: "rest" | "ws";
+    }>;
+    recentTrades: Record<string, StreamTradeSnapshot[]>;
+  };
+  prewarm: {
+    readyTokenIds: string[];
+    totalReady: number;
+    totalTracked: number;
+    lastError: string | null;
+  };
+  executionQuote: ExecutionQuote | null;
+}
+
+const marketDiscoveryByAsset = new Map<TradingAsset, MarketDiscoverySnapshot>();
+const prewarmedTokenState = new Map<string, { warmedAt: number; ok: boolean; error: string | null }>();
+const cachedExecutionQuotes = new Map<string, ExecutionQuote>();
+const streamBooksByToken = new Map<string, NormalizedOrderBookSnapshot>();
+const streamRecentTradesByToken = new Map<string, StreamTradeSnapshot[]>();
+let currentExecutionQuote: ExecutionQuote | null = null;
+let polymarketWsManager: any = null;
+let polymarketWsInitPromise: Promise<any> | null = null;
+let polymarketWsPackageAvailable: boolean | null = null;
+let polymarketWsConnected = false;
+let polymarketWsLastError: string | null = null;
+let polymarketWsReconnectCount = 0;
+let polymarketWsLastBookAt: number | null = null;
+let polymarketWsLastTradeAt: number | null = null;
+const polymarketWatchedTokenIds = new Set<string>();
+let marketInfraPushTimeout: NodeJS.Timeout | null = null;
+
+function parsePolyArray(val: any): any[] {
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function toFiniteNumber(value: any): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function normalizeOrderBookSide(levels: any[], side: QuoteSide): NormalizedOrderLevel[] {
+  return (levels || [])
+    .map((level) => ({
+      price: Number(level?.price || 0),
+      size: Number(level?.size || 0),
+    }))
+    .filter((level) => Number.isFinite(level.price) && level.price > 0 && Number.isFinite(level.size) && level.size > 0)
+    .sort((a, b) => (side === "BUY" ? a.price - b.price : b.price - a.price));
+}
+
+function normalizeOrderBookSnapshot(
+  tokenId: string,
+  raw: any,
+  source: "rest" | "ws"
+): NormalizedOrderBookSnapshot {
+  const bids = normalizeOrderBookSide(raw?.bids ?? [], "SELL");
+  const asks = normalizeOrderBookSide(raw?.asks ?? [], "BUY");
+  const bestBid = bids[0]?.price ?? null;
+  const bestAsk = asks[0]?.price ?? null;
+  const bidSize = bids.reduce((sum, level) => sum + level.size, 0);
+  const askSize = asks.reduce((sum, level) => sum + level.size, 0);
+  const totalSize = bidSize + askSize;
+  const imbalance = totalSize > 0 ? Number((bidSize / totalSize).toFixed(4)) : 0.5;
+  const imbalanceSignal =
+    imbalance > 0.6 ? "BUY_PRESSURE" :
+    imbalance < 0.4 ? "SELL_PRESSURE" :
+    "NEUTRAL";
+  const totalLiquidityUsdc = Number(
+    (
+      bids.reduce((sum, level) => sum + level.price * level.size, 0) +
+      asks.reduce((sum, level) => sum + level.price * level.size, 0)
+    ).toFixed(2)
+  );
+
+  return {
+    tokenId,
+    bids,
+    asks,
+    bestBid,
+    bestAsk,
+    spread: bestBid !== null && bestAsk !== null ? Number((bestAsk - bestBid).toFixed(4)) : null,
+    mid: bestBid !== null && bestAsk !== null ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : null,
+    imbalance,
+    imbalanceSignal,
+    totalLiquidityUsdc,
+    source,
+    updatedAt: Date.now(),
+  };
+}
+
+function getExecutionQuoteDetailed(
+  orderBook: Pick<NormalizedOrderBookSnapshot, "tokenId" | "bids" | "asks" | "bestBid" | "bestAsk">,
+  side: QuoteSide,
+  amount: number,
+  amountMode: QuoteAmountMode,
+  fallbackPrice?: number | null
+): ExecutionQuote {
+  const normalizedFallback = Number.isFinite(Number(fallbackPrice)) && Number(fallbackPrice) > 0
+    ? Number(fallbackPrice)
+    : null;
+  const referencePrice = side === "BUY" ? (orderBook.bestAsk ?? normalizedFallback) : (orderBook.bestBid ?? normalizedFallback);
+
+  if (!(amount > 0)) {
+    return {
+      tokenId: orderBook.tokenId,
+      side,
+      amount,
+      amountMode,
+      referencePrice,
+      averagePrice: null,
+      limitPrice: normalizedFallback,
+      worstPrice: normalizedFallback,
+      estimatedCost: 0,
+      filledSize: 0,
+      fullyFilled: false,
+      levelsConsumed: 0,
+      slippageAbs: null,
+      slippageBps: null,
+      source: "unavailable",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const levels = (side === "BUY" ? orderBook.asks : orderBook.bids).filter((level) => level.size > 0);
+  const EPSILON = 1e-8;
+
+  if (levels.length === 0) {
+    if (!normalizedFallback) {
+      return {
+        tokenId: orderBook.tokenId,
+        side,
+        amount,
+        amountMode,
+        referencePrice,
+        averagePrice: null,
+        limitPrice: null,
+        worstPrice: null,
+        estimatedCost: 0,
+        filledSize: 0,
+        fullyFilled: false,
+        levelsConsumed: 0,
+        slippageAbs: null,
+        slippageBps: null,
+        source: "unavailable",
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    const filledSize = amountMode === "SPEND" ? amount / normalizedFallback : amount;
+    return {
+      tokenId: orderBook.tokenId,
+      side,
+      amount,
+      amountMode,
+      referencePrice,
+      averagePrice: normalizedFallback,
+      limitPrice: normalizedFallback,
+      worstPrice: normalizedFallback,
+      estimatedCost: amountMode === "SPEND" ? amount : Number((filledSize * normalizedFallback).toFixed(6)),
+      filledSize: Number(filledSize.toFixed(6)),
+      fullyFilled: true,
+      levelsConsumed: 1,
+      slippageAbs: 0,
+      slippageBps: 0,
+      source: "fallback",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  let remaining = amount;
+  let totalNotional = 0;
+  let filledSize = 0;
+  let levelsConsumed = 0;
+  let worstPrice: number | null = null;
+
+  for (const level of levels) {
+    if (remaining <= EPSILON) break;
+
+    let fillSize = 0;
+    if (amountMode === "SPEND") {
+      const maxNotionalAtLevel = level.price * level.size;
+      const usedNotional = Math.min(remaining, maxNotionalAtLevel);
+      fillSize = usedNotional / level.price;
+      totalNotional += usedNotional;
+      remaining -= usedNotional;
+    } else {
+      fillSize = Math.min(remaining, level.size);
+      totalNotional += fillSize * level.price;
+      remaining -= fillSize;
+    }
+
+    if (fillSize > EPSILON) {
+      filledSize += fillSize;
+      levelsConsumed += 1;
+      worstPrice = level.price;
+    }
+  }
+
+  const fullyFilled = remaining <= EPSILON;
+  const averagePrice = filledSize > EPSILON ? Number((totalNotional / filledSize).toFixed(4)) : null;
+  const slippageAbs = averagePrice !== null && referencePrice !== null
+    ? Number((side === "BUY" ? averagePrice - referencePrice : referencePrice - averagePrice).toFixed(4))
+    : null;
+  const slippageBps = slippageAbs !== null && referencePrice !== null && referencePrice > 0
+    ? Number(((slippageAbs / referencePrice) * 10_000).toFixed(1))
+    : null;
+
+  return {
+    tokenId: orderBook.tokenId,
+    side,
+    amount,
+    amountMode,
+    referencePrice,
+    averagePrice,
+    limitPrice: worstPrice ?? averagePrice ?? normalizedFallback,
+    worstPrice,
+    estimatedCost: Number(totalNotional.toFixed(6)),
+    filledSize: Number(filledSize.toFixed(6)),
+    fullyFilled,
+    levelsConsumed,
+    slippageAbs,
+    slippageBps,
+    source: "depth",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function normalizePolymarketMarket(event: any, market: any, asset: TradingAsset): NormalizedPolymarketMarket {
+  const outcomes = parsePolyArray(market?.outcomes).map(String);
+  const outcomePrices = parsePolyArray(market?.outcomePrices).map((value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric.toFixed(4) : String(value ?? "");
+  });
+  const clobTokenIds = parsePolyArray(market?.clobTokenIds).map(String);
+
+  return {
+    ...market,
+    id: String(market?.id || ""),
+    conditionId: String(market?.conditionId || ""),
+    question: String(market?.question || event?.title || ""),
+    description: String(market?.description || ""),
+    outcomes,
+    outcomePrices,
+    clobTokenIds,
+    active: Boolean(market?.active ?? event?.active ?? false),
+    closed: Boolean(market?.closed ?? event?.closed ?? false),
+    image: String(market?.image || event?.image || ""),
+    icon: String(market?.icon || ""),
+    category: String(market?.category || event?.category || ""),
+    volume: String(market?.volume ?? market?.volume24hr ?? market?.volume_24h ?? ""),
+    liquidity: String(market?.liquidity ?? ""),
+    eventSlug: String(event?.slug || ""),
+    eventTitle: String(event?.title || ""),
+    eventId: String(event?.id || ""),
+    startDate: String(event?.startDate || market?.startDate || ""),
+    endDate: String(event?.endDate || market?.endDate || ""),
+    asset,
+    normalizedOutcomes: outcomes.map((label, index) => ({
+      label,
+      index,
+      tokenId: clobTokenIds[index] || null,
+      marketPrice: toFiniteNumber(outcomePrices[index]),
+      side: index === 0 ? "YES" : "NO",
+    })),
+  };
+}
+
+function scheduleMarketInfraPush() {
+  if (marketInfraPushTimeout) return;
+  marketInfraPushTimeout = setTimeout(() => {
+    marketInfraPushTimeout = null;
+    pushSSE("infra", getMarketInfraStatus());
+  }, 150);
+}
+
+function getMarketInfraStatus(): MarketInfraStatus {
+  const now = Date.now();
+  const marketDiscovery = Object.fromEntries(
+    Array.from(marketDiscoveryByAsset.entries()).map(([asset, snapshot]) => [
+      asset,
+      {
+        asset,
+        currentSlug: snapshot.currentSlug,
+        nextSlug: snapshot.nextSlug,
+        currentMarketCount: snapshot.currentMarkets.length,
+        nextMarketCount: snapshot.nextMarkets.length,
+        activeMarketId: snapshot.activeMarketId,
+        fetchedAt: new Date(snapshot.fetchedAt).toISOString(),
+        ageMs: now - snapshot.fetchedAt,
+        trackedTokenIds: snapshot.trackedTokenIds,
+        prewarmedTokenIds: snapshot.prewarmedTokenIds,
+      },
+    ])
+  );
+
+  const readyTokenIds = Array.from(prewarmedTokenState.entries())
+    .filter(([, state]) => state.ok && now - state.warmedAt <= POLYMARKET_PREWARM_TTL_MS)
+    .map(([tokenId]) => tokenId);
+  const prewarmErrors = Array.from(prewarmedTokenState.values()).map((state) => state.error).filter(Boolean);
+
+  return {
+    marketDiscovery,
+    stream: {
+      mode: polymarketWsPackageAvailable === false ? "disabled" : "websocket",
+      packageAvailable: polymarketWsPackageAvailable !== false,
+      connected: polymarketWsConnected,
+      watchedTokenIds: Array.from(polymarketWatchedTokenIds),
+      lastBookAt: polymarketWsLastBookAt ? new Date(polymarketWsLastBookAt).toISOString() : null,
+      lastTradeAt: polymarketWsLastTradeAt ? new Date(polymarketWsLastTradeAt).toISOString() : null,
+      reconnectCount: polymarketWsReconnectCount,
+      lastError: polymarketWsLastError,
+      books: Object.fromEntries(
+        Array.from(streamBooksByToken.entries()).map(([tokenId, book]) => [
+          tokenId,
+          {
+            tokenId,
+            bestBid: book.bestBid,
+            bestAsk: book.bestAsk,
+            spread: book.spread,
+            imbalanceSignal: book.imbalanceSignal,
+            updatedAt: new Date(book.updatedAt).toISOString(),
+            source: book.source,
+          },
+        ])
+      ),
+      recentTrades: Object.fromEntries(streamRecentTradesByToken.entries()),
+    },
+    prewarm: {
+      readyTokenIds,
+      totalReady: readyTokenIds.length,
+      totalTracked: prewarmedTokenState.size,
+      lastError: prewarmErrors.length > 0 ? String(prewarmErrors[prewarmErrors.length - 1]) : null,
+    },
+    executionQuote: currentExecutionQuote,
+  };
+}
+
+function rememberExecutionQuote(quote: ExecutionQuote | null) {
+  currentExecutionQuote = quote;
+  if (quote) cachedExecutionQuotes.set(quote.tokenId, quote);
+  scheduleMarketInfraPush();
+}
+
+function rememberStreamTrade(trade: StreamTradeSnapshot) {
+  const existing = streamRecentTradesByToken.get(trade.tokenId) ?? [];
+  existing.unshift(trade);
+  if (existing.length > POLYMARKET_STREAM_TRADE_BUFFER) existing.length = POLYMARKET_STREAM_TRADE_BUFFER;
+  streamRecentTradesByToken.set(trade.tokenId, existing);
+}
+
+function handlePolymarketBookSnapshot(event: any) {
+  const tokenId = String(event?.asset_id || "");
+  if (!tokenId) return;
+  const book = normalizeOrderBookSnapshot(tokenId, { bids: event?.bids ?? [], asks: event?.asks ?? [] }, "ws");
+  streamBooksByToken.set(tokenId, book);
+  polymarketWsConnected = true;
+  polymarketWsLastBookAt = Date.now();
+  scheduleMarketInfraPush();
+}
+
+function handlePolymarketBookDelta(event: any) {
+  const changes: any[] = Array.isArray(event?.price_changes) ? event.price_changes : [];
+  for (const change of changes) {
+    const tokenId = String(change?.asset_id || "");
+    const existing = streamBooksByToken.get(tokenId);
+    if (!existing) continue;
+
+    const price = Number(change?.price || 0);
+    const size = Number(change?.size || 0);
+    const side = String(change?.side || "").toUpperCase();
+    if (!(price > 0) || !Number.isFinite(size) || !["BUY", "SELL"].includes(side)) continue;
+
+    const levels = side === "BUY" ? existing.bids : existing.asks;
+    const index = levels.findIndex((level) => level.price === price);
+
+    if (size <= 0) {
+      if (index !== -1) levels.splice(index, 1);
+    } else if (index !== -1) {
+      levels[index].size = size;
+    } else {
+      levels.push({ price, size });
+    }
+
+    if (side === "BUY") {
+      levels.sort((a, b) => b.price - a.price);
+    } else {
+      levels.sort((a, b) => a.price - b.price);
+    }
+
+    const refreshed = normalizeOrderBookSnapshot(tokenId, existing, "ws");
+    streamBooksByToken.set(tokenId, refreshed);
+    polymarketWsConnected = true;
+    polymarketWsLastBookAt = Date.now();
+  }
+  scheduleMarketInfraPush();
+}
+
+function handlePolymarketTrade(event: any) {
+  const tokenId = String(event?.asset_id || "");
+  const price = Number(event?.price || 0);
+  const size = Number(event?.size || 0);
+  if (!tokenId || !(price > 0) || !(size > 0)) return;
+
+  rememberStreamTrade({
+    tokenId,
+    price,
+    size,
+    side: String(event?.side || "").toUpperCase() === "BUY"
+      ? "BUY"
+      : String(event?.side || "").toUpperCase() === "SELL"
+        ? "SELL"
+        : "UNKNOWN",
+    timestamp: event?.timestamp
+      ? (Number.isFinite(Number(event.timestamp)) ? Number(event.timestamp) : new Date(event.timestamp).getTime())
+      : Date.now(),
+  });
+  polymarketWsConnected = true;
+  polymarketWsLastTradeAt = Date.now();
+  scheduleMarketInfraPush();
+}
+
+async function ensurePolymarketWsManager() {
+  if (polymarketWsManager) return polymarketWsManager;
+  if (polymarketWsInitPromise) return polymarketWsInitPromise;
+
+  polymarketWsInitPromise = (async () => {
+    try {
+      const poly: any = await import("@nevuamarkets/poly-websockets");
+      polymarketWsPackageAvailable = true;
+      polymarketWsReconnectCount += 1;
+      polymarketWsManager = new poly.WSSubscriptionManager(
+        {
+          onBook: async (events: any[]) => {
+            for (const event of events) handlePolymarketBookSnapshot(event);
+          },
+          onPriceChange: async (events: any[]) => {
+            for (const event of events) handlePolymarketBookDelta(event);
+          },
+          onLastTradePrice: async (events: any[]) => {
+            for (const event of events) handlePolymarketTrade(event);
+          },
+          onError: async (error: Error) => {
+            polymarketWsConnected = false;
+            polymarketWsLastError = error?.message || "WebSocket error";
+            scheduleMarketInfraPush();
+          },
+        },
+        {
+          reconnectAndCleanupIntervalMs: 5_000,
+          pendingFlushIntervalMs: 100,
+        }
+      );
+      polymarketWsConnected = true;
+      polymarketWsLastError = null;
+      return polymarketWsManager;
+    } catch (error: any) {
+      polymarketWsPackageAvailable = false;
+      polymarketWsConnected = false;
+      polymarketWsLastError = error?.message || String(error);
+      polymarketWsManager = null;
+      return null;
+    } finally {
+      polymarketWsInitPromise = null;
+      scheduleMarketInfraPush();
+    }
+  })();
+
+  return polymarketWsInitPromise;
+}
+
+async function ensurePolymarketStreamSubscriptions(tokenIds: string[]) {
+  const uniqueTokenIds = Array.from(new Set(tokenIds.filter(Boolean)));
+  if (uniqueTokenIds.length === 0) return;
+
+  const manager = await ensurePolymarketWsManager();
+  if (!manager) return;
+
+  const currentlyWatched = typeof manager.getAssetIds === "function"
+    ? (manager.getAssetIds() as string[])
+    : Array.from(polymarketWatchedTokenIds);
+  const missing = uniqueTokenIds.filter((tokenId) => !currentlyWatched.includes(tokenId));
+  if (missing.length === 0) return;
+
+  await manager.addSubscriptions(missing);
+  for (const tokenId of missing) polymarketWatchedTokenIds.add(tokenId);
+  polymarketWsConnected = true;
+  scheduleMarketInfraPush();
+}
+
+async function resetPolymarketStream() {
+  try {
+    if (polymarketWsManager?.clearState) {
+      await polymarketWsManager.clearState();
+    }
+  } catch (error: any) {
+    polymarketWsLastError = error?.message || String(error);
+  } finally {
+    polymarketWsManager = null;
+    polymarketWatchedTokenIds.clear();
+    streamBooksByToken.clear();
+    streamRecentTradesByToken.clear();
+    polymarketWsConnected = false;
+    polymarketWsLastBookAt = null;
+    polymarketWsLastTradeAt = null;
+    scheduleMarketInfraPush();
+  }
+}
+
+function isTokenPrewarmed(tokenId: string): boolean {
+  const state = prewarmedTokenState.get(tokenId);
+  return Boolean(state?.ok && Date.now() - state.warmedAt <= POLYMARKET_PREWARM_TTL_MS);
+}
+
+async function preWarmMarketToken(tokenId: string) {
+  if (!tokenId || isTokenPrewarmed(tokenId)) return;
+  const client = await getClobClient();
+  if (!client) return;
+
+  try {
+    await Promise.all([
+      client.getTickSize(tokenId),
+      typeof (client as any).getFeeRateBps === "function"
+        ? (client as any).getFeeRateBps(tokenId)
+        : Promise.resolve(null),
+      client.getNegRisk(tokenId),
+    ]);
+    prewarmedTokenState.set(tokenId, { warmedAt: Date.now(), ok: true, error: null });
+  } catch (error: any) {
+    prewarmedTokenState.set(tokenId, {
+      warmedAt: Date.now(),
+      ok: false,
+      error: error?.message || String(error),
+    });
+  }
+  scheduleMarketInfraPush();
+}
+
+async function getNormalizedOrderBookSnapshot(
+  tokenId: string,
+  options?: { preferStream?: boolean }
+): Promise<NormalizedOrderBookSnapshot> {
+  const preferStream = options?.preferStream !== false;
+  const streamed = streamBooksByToken.get(tokenId);
+  if (preferStream && streamed && Date.now() - streamed.updatedAt <= POLYMARKET_STREAM_STALE_MS) {
+    return streamed;
+  }
+
+  const client = await getClobClient();
+  const raw = client
+    ? await client.getOrderBook(tokenId)
+    : (await axios.get(`https://clob.polymarket.com/book?token_id=${tokenId}`, { timeout: 6_000 })).data;
+  const snapshot = normalizeOrderBookSnapshot(tokenId, raw, "rest");
+  streamBooksByToken.set(tokenId, snapshot);
+  return snapshot;
+}
+
+async function fetchMarketDiscoverySnapshot(
+  asset: TradingAsset,
+  windowStart: number,
+  forceRefresh = false
+): Promise<MarketDiscoverySnapshot> {
+  const cached = marketDiscoveryByAsset.get(asset);
+  if (
+    cached &&
+    !forceRefresh &&
+    cached.windowStart === windowStart &&
+    Date.now() - cached.fetchedAt <= MARKET_DISCOVERY_CACHE_MS
+  ) {
+    return cached;
+  }
+
+  const currentSlug = `${ASSET_CONFIG[asset].polySlugPrefix}-${windowStart}`;
+  const nextSlug = `${ASSET_CONFIG[asset].polySlugPrefix}-${windowStart + MARKET_SESSION_SECONDS}`;
+  const [currentRes, nextRes] = await Promise.allSettled([
+    axios.get(`https://gamma-api.polymarket.com/events/slug/${currentSlug}`, { timeout: 8_000 }),
+    axios.get(`https://gamma-api.polymarket.com/events/slug/${nextSlug}`, { timeout: 8_000 }),
+  ]);
+
+  const currentEvent = currentRes.status === "fulfilled" ? currentRes.value.data : null;
+  const nextEvent = nextRes.status === "fulfilled" ? nextRes.value.data : null;
+  const currentMarkets = (currentEvent?.markets || []).map((market: any) => normalizePolymarketMarket(currentEvent, market, asset));
+  const nextMarkets = (nextEvent?.markets || []).map((market: any) => normalizePolymarketMarket(nextEvent, market, asset));
+  const trackedTokenIds = Array.from(
+    new Set(
+      [...currentMarkets, ...nextMarkets].flatMap((market) => market.clobTokenIds).filter(Boolean)
+    )
+  );
+
+  const snapshot: MarketDiscoverySnapshot = {
+    asset,
+    windowStart,
+    currentSlug,
+    nextSlug,
+    currentMarkets,
+    nextMarkets,
+    fetchedAt: Date.now(),
+    source: "gamma",
+    activeMarketId: currentMarkets[0]?.id ?? null,
+    trackedTokenIds,
+    prewarmedTokenIds: trackedTokenIds.filter((tokenId) => isTokenPrewarmed(tokenId)),
+  };
+
+  marketDiscoveryByAsset.set(asset, snapshot);
+  void ensurePolymarketStreamSubscriptions(trackedTokenIds);
+  void Promise.allSettled(trackedTokenIds.map((tokenId) => preWarmMarketToken(tokenId))).then(() => {
+    const latest = marketDiscoveryByAsset.get(asset);
+    if (!latest) return;
+    latest.prewarmedTokenIds = latest.trackedTokenIds.filter((tokenId) => isTokenPrewarmed(tokenId));
+    scheduleMarketInfraPush();
+  });
+  scheduleMarketInfraPush();
+  return snapshot;
+}
+
+type BucketStat = {
+  label: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  pnl: number;
+};
+
+type ReplaySummary = {
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  totalPnl: number;
+};
+
+function normalizeLoggedEdge(edge: number): number {
+  const numeric = Number(edge);
+  if (!Number.isFinite(numeric)) return 0;
+  return numeric >= 1 ? Number((numeric / 100).toFixed(4)) : numeric;
+}
+
+function detectTradeAsset(market: string): TradingAsset | null {
+  const normalized = String(market || "").toLowerCase();
+  if (normalized.includes("bitcoin") || normalized.includes("btc")) return "BTC";
+  if (normalized.includes("ethereum") || normalized.includes("eth")) return "ETH";
+  if (normalized.includes("solana") || normalized.includes("sol")) return "SOL";
+  return null;
+}
+
+function summarizeReplayEntries(entries: Array<{ result: "WIN" | "LOSS"; pnl: number }>): ReplaySummary {
+  const wins = entries.filter((entry) => entry.result === "WIN").length;
+  const losses = entries.length - wins;
+  const totalPnl = Number(entries.reduce((sum, entry) => sum + Number(entry.pnl || 0), 0).toFixed(2));
+  return {
+    trades: entries.length,
+    wins,
+    losses,
+    winRate: entries.length > 0 ? Number(((wins / entries.length) * 100).toFixed(1)) : null,
+    totalPnl,
+  };
+}
+
+function getReplayBlockReasons(
+  entry: TradeLogEntry,
+  config: ReturnType<typeof getActiveConfig>
+): string[] {
+  const reasons: string[] = [];
+  const asset = detectTradeAsset(entry.market);
+  const edge = normalizeLoggedEdge(entry.edge);
+  const confidence = Number(entry.confidence || 0);
+  const entryPrice = Number(entry.entryPrice || 0);
+
+  if (asset !== "BTC") {
+    reasons.push("BTC-only market scope");
+    return reasons;
+  }
+  if (confidence < config.minConfidence) {
+    reasons.push(`Confidence ${confidence}% < ${config.minConfidence}%`);
+  }
+  if (edge < config.minEdge) {
+    reasons.push(`Edge ${(edge * 100).toFixed(1)}c < ${(config.minEdge * 100).toFixed(1)}c`);
+  }
+
+  const divergenceStrength = String(entry.divergenceStrength || "").toUpperCase();
+  const isDivergenceStrong = divergenceStrength === "STRONG";
+  const dynamicMaxEntry = isDivergenceStrong
+    ? 0.80
+    : Math.min(0.75, (confidence - 15) / 100);
+  if (entryPrice > dynamicMaxEntry) {
+    reasons.push(`Entry ${(entryPrice * 100).toFixed(1)}c > dynamic max ${(dynamicMaxEntry * 100).toFixed(1)}c`);
+  }
+
+  const premiumGate = getBtcPremiumEntryBlockReason("BTC", entryPrice, confidence, edge);
+  if (premiumGate) {
+    reasons.push(premiumGate);
+  }
+
+  const imbalanceSignal = String(entry.imbalanceSignal || "").toUpperCase();
+  if (imbalanceSignal) {
+    const pressureOpposesDirection =
+      (entry.direction === "UP" && imbalanceSignal === "SELL_PRESSURE") ||
+      (entry.direction === "DOWN" && imbalanceSignal === "BUY_PRESSURE");
+    if (pressureOpposesDirection) {
+      reasons.push(`Order book pressure opposed ${entry.direction}`);
+    }
+  }
+
+  return reasons;
+}
+
+function buildTradeLogReplayReport(entries: TradeLogEntry[], config: ReturnType<typeof getActiveConfig>) {
+  const btcEntries = entries
+    .map((entry) => ({
+      ...entry,
+      asset: detectTradeAsset(entry.market),
+      normalizedEdge: normalizeLoggedEdge(entry.edge),
+    }))
+    .filter((entry) => entry.asset === "BTC");
+
+  const replayEntries = btcEntries.map((entry) => {
+    const replayReasons = getReplayBlockReasons(
+      { ...entry, edge: entry.normalizedEdge },
+      config
+    );
+    return {
+      ...entry,
+      replayReasons,
+      replayAllowed: replayReasons.length === 0,
+    };
+  });
+
+  const allowed = replayEntries.filter((entry) => entry.replayAllowed);
+  const blocked = replayEntries.filter((entry) => !entry.replayAllowed);
+  const reasonMap = new Map<string, { trades: number; wins: number; losses: number; totalPnl: number }>();
+
+  for (const entry of blocked) {
+    for (const reason of entry.replayReasons) {
+      const bucket = reasonMap.get(reason) || { trades: 0, wins: 0, losses: 0, totalPnl: 0 };
+      bucket.trades += 1;
+      if (entry.result === "WIN") bucket.wins += 1;
+      else bucket.losses += 1;
+      bucket.totalPnl += Number(entry.pnl || 0);
+      reasonMap.set(reason, bucket);
+    }
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    scope: {
+      asset: "BTC" as const,
+      totalTrades: replayEntries.length,
+      assumptions: [
+        "Replay uses fields present in trade_log.jsonl only",
+        "Replays BTC-only scope, min confidence/edge, dynamic max entry, premium confidence gate, and pressure filter when imbalance exists",
+        "Risk-level and full AI context are not replayed because they are not persisted in trade_log.jsonl",
+      ],
+    },
+    config: {
+      minConfidence: config.minConfidence,
+      minEdge: config.minEdge,
+    },
+    baseline: summarizeReplayEntries(replayEntries),
+    replay: {
+      ...summarizeReplayEntries(allowed),
+      blockedTrades: blocked.length,
+      blockedPnl: Number(blocked.reduce((sum, entry) => sum + Number(entry.pnl || 0), 0).toFixed(2)),
+      pnlDelta: Number(
+        (
+          allowed.reduce((sum, entry) => sum + Number(entry.pnl || 0), 0) -
+          replayEntries.reduce((sum, entry) => sum + Number(entry.pnl || 0), 0)
+        ).toFixed(2)
+      ),
+    },
+    blockedByReason: Array.from(reasonMap.entries())
+      .map(([reason, stats]) => ({
+        reason,
+        trades: stats.trades,
+        wins: stats.wins,
+        losses: stats.losses,
+        totalPnl: Number(stats.totalPnl.toFixed(2)),
+      }))
+      .sort((a, b) => a.totalPnl - b.totalPnl),
+    entries: replayEntries
+      .slice()
+      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime())
+      .slice(0, 40)
+      .map((entry) => ({
+        ts: entry.ts,
+        market: entry.market,
+        direction: entry.direction,
+        confidence: entry.confidence,
+        edge: Number((entry.normalizedEdge * 100).toFixed(1)),
+        entryPrice: Number((Number(entry.entryPrice || 0) * 100).toFixed(1)),
+        pnl: Number(Number(entry.pnl || 0).toFixed(2)),
+        result: entry.result,
+        replayAllowed: entry.replayAllowed,
+        replayReasons: entry.replayReasons,
+      })),
+  };
+}
+
+function buildBucketStat(label: string, rows: TradeLogEntry[]): BucketStat {
+  const wins = rows.filter((entry) => entry.result === "WIN").length;
+  const losses = rows.length - wins;
+  return {
+    label,
+    trades: rows.length,
+    wins,
+    losses,
+    winRate: rows.length > 0 ? Number(((wins / rows.length) * 100).toFixed(1)) : null,
+    pnl: Number(rows.reduce((sum, entry) => sum + Number(entry.pnl || 0), 0).toFixed(2)),
+  };
+}
+
+function buildBtcCutoffReport(entries: TradeLogEntry[]) {
+  const btcEntries = entries
+    .map((entry) => ({
+      ...entry,
+      asset: detectTradeAsset(entry.market),
+      normalizedEdge: normalizeLoggedEdge(entry.edge),
+    }))
+    .filter((entry) => entry.asset === "BTC");
+
+  const byDirection = ["UP", "DOWN"].map((direction) =>
+    buildBucketStat(direction, btcEntries.filter((entry) => entry.direction === direction))
+  );
+
+  const confidenceBuckets = [
+    { label: "70-74", fn: (entry: typeof btcEntries[number]) => entry.confidence >= 70 && entry.confidence <= 74 },
+    { label: "75-79", fn: (entry: typeof btcEntries[number]) => entry.confidence >= 75 && entry.confidence <= 79 },
+    { label: "80-84", fn: (entry: typeof btcEntries[number]) => entry.confidence >= 80 && entry.confidence <= 84 },
+    { label: "85+", fn: (entry: typeof btcEntries[number]) => entry.confidence >= 85 },
+  ];
+  const entryPriceBuckets = [
+    { label: "<49.0c", fn: (entry: typeof btcEntries[number]) => entry.entryPrice < 0.49 },
+    { label: "49.0-49.9c", fn: (entry: typeof btcEntries[number]) => entry.entryPrice >= 0.49 && entry.entryPrice < 0.5 },
+    { label: ">=50.0c", fn: (entry: typeof btcEntries[number]) => entry.entryPrice >= 0.5 },
+  ];
+  const edgeBuckets = [
+    { label: "<22.0c", fn: (entry: typeof btcEntries[number]) => entry.normalizedEdge < 0.22 },
+    { label: "22.0-27.9c", fn: (entry: typeof btcEntries[number]) => entry.normalizedEdge >= 0.22 && entry.normalizedEdge < 0.28 },
+    { label: ">=28.0c", fn: (entry: typeof btcEntries[number]) => entry.normalizedEdge >= 0.28 },
+  ];
+
+  const byConfidence = confidenceBuckets.map((bucket) =>
+    buildBucketStat(bucket.label, btcEntries.filter(bucket.fn))
+  ).filter((bucket) => bucket.trades > 0);
+
+  const byEntryPrice = entryPriceBuckets.map((bucket) =>
+    buildBucketStat(bucket.label, btcEntries.filter(bucket.fn))
+  ).filter((bucket) => bucket.trades > 0);
+
+  const matrix = byDirection.flatMap((directionStat) =>
+    confidenceBuckets.flatMap((confidenceBucket) =>
+      entryPriceBuckets.flatMap((priceBucket) =>
+        edgeBuckets.map((edgeBucket) => {
+          const rows = btcEntries.filter((entry) =>
+            entry.direction === directionStat.label &&
+            confidenceBucket.fn(entry) &&
+            priceBucket.fn(entry) &&
+            edgeBucket.fn(entry)
+          );
+          return {
+            direction: directionStat.label,
+            confidenceBucket: confidenceBucket.label,
+            entryPriceBucket: priceBucket.label,
+            edgeBucket: edgeBucket.label,
+            ...buildBucketStat(
+              `${directionStat.label} | ${confidenceBucket.label} | ${priceBucket.label} | ${edgeBucket.label}`,
+              rows
+            ),
+          };
+        })
+      )
+    )
+  ).filter((row) => row.trades > 0);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    total: summarizeReplayEntries(btcEntries),
+    byDirection,
+    byConfidence,
+    byEntryPrice,
+    matrix,
+    bestBuckets: matrix.slice().sort((a, b) => b.pnl - a.pnl).slice(0, 8),
+    worstBuckets: matrix.slice().sort((a, b) => a.pnl - b.pnl).slice(0, 8),
+  };
 }
 
 // ── Bot runtime state ────────────────────────────────────────────────────────
@@ -1835,6 +2871,10 @@ async function startServer() {
       throw new Error("CLOB client not initialized. Check credentials.");
     }
 
+    if (!isTokenPrewarmed(tokenID)) {
+      void preWarmMarketToken(tokenID);
+    }
+
     const parsedAmount = Number(amount);
     const parsedSide = String(side || "BUY").toUpperCase() as Side;
     const normalizedMode = String(executionMode || "MANUAL").toUpperCase() as "MANUAL" | "PASSIVE" | "AGGRESSIVE";
@@ -1842,13 +2882,26 @@ async function startServer() {
       throw new Error("Trade amount must be greater than 0.");
     }
 
-    const orderbook = await client.getOrderBook(tokenID);
-    const bestBid = Number(orderbook?.bids?.[0]?.price || "0");
-    const bestAsk = Number(orderbook?.asks?.[0]?.price || "0");
+    const normalizedAmountMode =
+      amountMode || (parsedSide === Side.BUY ? "SPEND" : "SIZE");
+    const orderbook = await getNormalizedOrderBookSnapshot(tokenID);
+    const bestBid = Number(orderbook.bestBid || "0");
+    const bestAsk = Number(orderbook.bestAsk || "0");
 
     let parsedPrice = Number(price);
+    let executionQuote: ExecutionQuote | null = null;
     if (normalizedMode === "AGGRESSIVE") {
-      parsedPrice = parsedSide === Side.BUY ? bestAsk || parsedPrice : bestBid || parsedPrice;
+      executionQuote = getExecutionQuoteDetailed(
+        orderbook,
+        parsedSide === Side.BUY ? "BUY" : "SELL",
+        parsedAmount,
+        normalizedAmountMode,
+        parsedPrice
+      );
+      rememberExecutionQuote(executionQuote);
+      parsedPrice =
+        executionQuote.limitPrice ||
+        (parsedSide === Side.BUY ? bestAsk || parsedPrice : bestBid || parsedPrice);
     } else if (normalizedMode === "PASSIVE") {
       parsedPrice = parsedSide === Side.BUY ? bestBid || parsedPrice : bestAsk || parsedPrice;
     }
@@ -1857,8 +2910,6 @@ async function startServer() {
       throw new Error("Limit price must be between 0 and 1.");
     }
 
-    const normalizedAmountMode =
-      amountMode || (parsedSide === Side.BUY ? "SPEND" : "SIZE");
     const orderSize =
       normalizedAmountMode === "SIZE"
         ? parsedAmount
@@ -1937,11 +2988,13 @@ async function startServer() {
       executionMode: normalizedMode,
       amountMode: normalizedAmountMode,
       limitPriceUsed: parsedPrice,
+      executionQuote,
       marketSnapshot: {
         bestBid: bestBid || null,
         bestAsk: bestAsk || null,
         spread: bestBid > 0 && bestAsk > 0 ? Number((bestAsk - bestBid).toFixed(4)) : null,
         distanceToMarket: Number(distanceToMarket.toFixed(4)),
+        source: orderbook.source,
       },
       raw: order,
     };
@@ -2056,14 +3109,9 @@ async function startServer() {
           return;
         }
 
-
         // Fetch fresh order book + implied price for the target token
-        const r = await axios.get(
-          `https://clob.polymarket.com/book?token_id=${tokenId}`,
-          { timeout: 3000 }
-        );
-        const asks: any[] = r.data?.asks ?? [];
-        const clobAsk = asks.length > 0 ? parseFloat(asks[0].price) : 0;
+        const book = await getNormalizedOrderBookSnapshot(tokenId);
+        const clobAsk = book.bestAsk ?? 0;
         // Use outcomePrices from the atomically-captured market (not global alias which may have shifted)
         const divOutcomeIndex = direction === "UP" ? 0 : 1;
         const divImpliedPrice = parseFloat(market.outcomePrices?.[divOutcomeIndex] ?? "0");
@@ -2080,6 +3128,11 @@ async function startServer() {
         const confidence = 78;
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
         if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
+        const fastPriceGuardReason = getBtcPremiumEntryBlockReason(fastAsset, bestAsk, confidence, estimatedEdge);
+        if (fastPriceGuardReason) {
+          botPrint("SKIP", `[DIV FAST] ${fastPriceGuardReason}`);
+          return;
+        }
 
         // Kelly sizing — use last known balance (updated by bot cycle, fresh within ~30s)
         const balance = lastKnownBalance ?? botSessionStartBalance ?? 0;
@@ -2097,6 +3150,10 @@ async function startServer() {
           botPrint("SKIP", `[DIV FAST] Bet too small: $${betAmount.toFixed(2)} < $${MIN_BET.toFixed(2)} min`);
           return;
         }
+
+        rememberExecutionQuote(
+          getExecutionQuoteDetailed(book, "BUY", betAmount, "SPEND", bestAsk)
+        );
 
         botPrint("TRADE", `⚡ DIVERGENCE FAST PATH ⚡ STRONG BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} (30s) → ${direction} | ask=${(bestAsk * 100).toFixed(0)}¢ | $${betAmount.toFixed(2)} USDC | Gemini skipped`);
 
@@ -2774,6 +3831,7 @@ async function startServer() {
         for (const s of botExecutingTradesThisWindowByAsset.values()) s.clear();
         for (const s of botExecutedTradesThisWindowByAsset.values()) s.clear();
         currentWindowAiCache.clear();
+        currentExecutionQuote = null;
         botLastWindowStart = currentWindowStart;
         // Clear all per-asset YES ring buffers — old window's tokens are no longer valid
         for (const buf of yesRingBufferByAsset.values()) buf.length = 0;
@@ -2781,6 +3839,7 @@ async function startServer() {
         currentWindowNoTokenId  = null;
         currentWindowYesTokenIdByAsset.clear();
         currentWindowNoTokenIdByAsset.clear();
+        void resetPolymarketStream();
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
       }
 
@@ -2795,39 +3854,22 @@ async function startServer() {
         return;
       }
 
-      const parseArr = (val: any): any[] => {
-        if (Array.isArray(val)) return val;
-        if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
-        return [];
-      };
-
       // ── Fetch all asset markets in parallel, then process sequentially ──────
       const marketsByAsset = new Map<TradingAsset, any[]>();
       await Promise.allSettled(ENABLED_ASSETS.map(async (asset) => {
         const slug = `${ASSET_CONFIG[asset].polySlugPrefix}-${currentWindowStart}`;
         botPrint("INFO", `[${asset}] Scanning window ${mm}:${ss} remaining | elapsed=${windowElapsedSeconds}s | slug=${slug}`);
         try {
-          const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
-          const event = eventRes.data;
-          const markets = (event?.markets || []).map((m: any) => ({
-            ...m,
-            outcomes: parseArr(m.outcomes),
-            outcomePrices: parseArr(m.outcomePrices),
-            clobTokenIds: parseArr(m.clobTokenIds),
-            eventSlug: event.slug,
-            eventTitle: event.title,
-            eventId: event.id,
-            startDate: event.startDate,
-            endDate: event.endDate,
-          }));
+          const discovery = await fetchMarketDiscoverySnapshot(asset, currentWindowStart);
+          const markets = discovery.currentMarkets;
           if (markets.length === 0) {
             botPrint("WARN", `[${asset}] No markets found for slug: ${slug}`);
           } else {
-            botPrint("INFO", `[${asset}] Found ${markets.length} market(s) for window`);
+            botPrint("INFO", `[${asset}] Found ${markets.length} market(s) for window | next=${discovery.nextMarkets.length} | prewarm=${discovery.prewarmedTokenIds.length}/${discovery.trackedTokenIds.length}`);
             marketsByAsset.set(asset, markets);
           }
-        } catch {
-          botPrint("ERR", `[${asset}] Failed to fetch market for slug: ${slug}`);
+        } catch (error: any) {
+          botPrint("ERR", `[${asset}] Failed to fetch market for slug: ${slug} (${error?.message || "unknown error"})`);
         }
       }));
 
@@ -2909,22 +3951,11 @@ async function startServer() {
             orderBooks = {};
             await Promise.all(tokenIds.map(async (tid, idx) => {
               try {
-                const client = await getClobClient();
-                const raw: any = client
-                  ? await client.getOrderBook(tid)
-                  : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
-                const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
-                const sumNotional = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
-                const bidSize = sumSize(raw.bids);
-                const askSize = sumSize(raw.asks);
-                const total = bidSize + askSize;
-                const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
-                const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
-                const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
-                orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
+                const book = await getNormalizedOrderBookSnapshot(tid);
+                orderBooks[tid] = book;
                 const outcome = market.outcomes?.[idx] ?? `Token${idx}`;
-                botPrint("OK", `OrderBook [${outcome}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} imbalance=${(imbalance * 100).toFixed(0)}% (${imbalanceSignal}) liquidity=$${totalLiquidityUsdc}`);
-              } catch {
+                botPrint("OK", `OrderBook [${outcome}]: bid=${book.bestBid ?? "?"} ask=${book.bestAsk ?? "?"} imbalance=${(book.imbalance * 100).toFixed(0)}% (${book.imbalanceSignal}) liquidity=$${book.totalLiquidityUsdc} [${book.source}]`);
+              } catch (error: any) {
                 botPrint("WARN", `Failed to fetch order book for token ${tid.slice(0, 12)}...`);
               }
             }));
@@ -3192,6 +4223,7 @@ async function startServer() {
             const yesAsk = orderBooks[tokenIds[0]]?.asks?.[0]?.price ?? market.outcomePrices?.[0] ?? null;
             const noAsk  = orderBooks[tokenIds[1]]?.asks?.[0]?.price ?? market.outcomePrices?.[1] ?? null;
             const entryAsk = orderBooks[tokenIds[outcomeIdx]]?.asks?.[0]?.price ?? market.outcomePrices?.[outcomeIdx] ?? null;
+            const entryTokenId = tokenIds[outcomeIdx] || null;
             currentEntrySnapshot = {
               market: market.question || market.id,
               windowStart: currentWindowStart,
@@ -3210,7 +4242,20 @@ async function startServer() {
               fastLoopMomentum: fastMom ? { direction: fastMom.direction, strength: fastMom.strength, vw: fastMom.volumeWeighted } : null,
               updatedAt: new Date().toISOString(),
             };
-            void oppIdx; void entryAsk; // suppress unused warnings
+            if (entryTokenId && orderBooks[entryTokenId] && entryAsk !== null) {
+              rememberExecutionQuote(
+                getExecutionQuoteDetailed(
+                  orderBooks[entryTokenId],
+                  "BUY",
+                  getActiveConfig().fixedTradeUsdc,
+                  "SPEND",
+                  Number(entryAsk)
+                )
+              );
+            } else if (rec.decision !== "TRADE") {
+              rememberExecutionQuote(null);
+            }
+            void oppIdx;
           }
 
           const qualifies =
@@ -3348,6 +4393,15 @@ async function startServer() {
                   if (botLog.length > 100) botLog.pop();
                   // Remove from analyzed set so next cycle re-checks the price
                   // (signal is still valid, only price was too high this moment)
+                  analyzedThisWindow.delete(market.id);
+                  pushSSE("cycle", { ts: new Date().toISOString() });
+                  continue;
+                }
+
+                const btcPremiumEntryGuard = getBtcPremiumEntryBlockReason(currentAsset, bestAsk, rec.confidence, rec.estimatedEdge);
+                if (btcPremiumEntryGuard) {
+                  botPrint("SKIP", `${btcPremiumEntryGuard} | re-check enabled`);
+                  logEntry.reasoning += ` | Skipped: ${btcPremiumEntryGuard}.`;
                   analyzedThisWindow.delete(market.id);
                   pushSSE("cycle", { ts: new Date().toISOString() });
                   continue;
@@ -3571,7 +4625,6 @@ async function startServer() {
     const nowUtcSeconds = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
     const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
-    const nowSec = Math.floor(Date.now() / 1000);
     res.json({
       enabled: botEnabled,
       running: botRunning,
@@ -3580,6 +4633,7 @@ async function startServer() {
       windowElapsedSeconds,
       analyzedThisWindow: botAnalyzedThisWindow.size,
       entrySnapshot: currentEntrySnapshot,
+      infra: getMarketInfraStatus(),
       enabledAssets: ENABLED_ASSETS,
       config: {
         minConfidence: getActiveConfig().minConfidence,
@@ -3677,6 +4731,7 @@ async function startServer() {
 
     // Send current log snapshot so the client is immediately up-to-date
     res.write(`event: snapshot\ndata: ${JSON.stringify({ log: rawLog.slice(0, 200) })}\n\n`);
+    res.write(`event: infra\ndata: ${JSON.stringify(getMarketInfraStatus())}\n\n`);
 
     sseClients.add(res as unknown as ServerResponse);
     req.on("close", () => sseClients.delete(res as unknown as ServerResponse));
@@ -3771,6 +4826,17 @@ async function startServer() {
     }
   });
 
+  app.get("/api/backtest/trade-log-replay", (req, res) => {
+    try {
+      const days = Number.parseInt(String(req.query.days || ""), 10);
+      const trades = filterTradeLogByDays(loadTradeLog(), days);
+      const replay = buildTradeLogReplayReport(trades, getActiveConfig());
+      res.json(replay);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Trade log replay failed" });
+    }
+  });
+
   app.get("/api/analytics", (_req, res) => {
     try {
       const trades = loadTradeLog();
@@ -3811,6 +4877,16 @@ async function startServer() {
     }
   });
 
+  app.get("/api/analytics/btc-cutoffs", (req, res) => {
+    try {
+      const days = Number.parseInt(String(req.query.days || ""), 10);
+      const trades = filterTradeLogByDays(loadTradeLog(), days);
+      res.json(buildBtcCutoffReport(trades));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "BTC cutoff analytics failed" });
+    }
+  });
+
   app.post("/api/bot/config", (req, res) => {
     const { minConfidence, minEdge, fixedTradeUsdc } = req.body || {};
     if (minConfidence !== undefined) {
@@ -3840,20 +4916,9 @@ async function startServer() {
     res.json({ all: ALL_ASSETS, enabled: ENABLED_ASSETS });
   });
 
-  app.post("/api/bot/assets", (req, res) => {
-    const { assets } = req.body || {};
-    if (!Array.isArray(assets) || assets.length === 0) {
-      return res.status(400).json({ error: "assets must be a non-empty array" });
-    }
-    const next = assets
-      .map((s: any) => String(s).trim().toUpperCase())
-      .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset));
-    if (next.length === 0) {
-      return res.status(400).json({ error: "No valid assets provided. Valid: BTC, ETH, SOL" });
-    }
-    ENABLED_ASSETS = next;
-    botPrint("INFO", `Active assets updated: ${ENABLED_ASSETS.join(", ")}`);
-    res.json({ ok: true, enabled: ENABLED_ASSETS });
+  app.post("/api/bot/assets", (_req, res) => {
+    ENABLED_ASSETS = ["BTC"];
+    res.json({ ok: true, enabled: ENABLED_ASSETS, locked: true });
   });
 
   app.post("/api/bot/reset-confidence", (_req, res) => {
@@ -3893,57 +4958,10 @@ async function startServer() {
     try {
       const nowUtcSeconds = Math.floor(Date.now() / 1000);
       const currentStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
-
-      // Generate slugs for current + next window across all enabled assets
-      const slugs: string[] = [];
-      for (const asset of ENABLED_ASSETS) {
-        for (let i = 0; i < 2; i++) {
-          const ts = currentStart + i * MARKET_SESSION_SECONDS;
-          slugs.push(`${ASSET_CONFIG[asset].polySlugPrefix}-${ts}`);
-        }
-      }
-
-      console.log("Fetching slugs:", slugs);
-
-      // Fetch each slug via /events/slug/{slug} in parallel
-      const results = await Promise.allSettled(
-        slugs.map((slug) =>
-          axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 })
-        )
+      const snapshots = await Promise.all(
+        ENABLED_ASSETS.map((asset) => fetchMarketDiscoverySnapshot(asset, currentStart))
       );
-
-      // Collect all found events (skip 404s / failures)
-      const events = results
-        .filter((r) => r.status === "fulfilled")
-        .map((r) => (r as PromiseFulfilledResult<any>).value.data)
-        .filter(Boolean);
-
-      // Gamma API returns outcomes/outcomePrices/clobTokenIds as JSON strings — parse them
-      const parseArr = (val: any): any[] => {
-        if (Array.isArray(val)) return val;
-        if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
-        return [];
-      };
-
-      // Flatten each event's markets and attach event metadata + asset tag
-      const markets = events.flatMap((event: any) => {
-        // Detect asset from slug prefix
-        const asset = ENABLED_ASSETS.find(a => event.slug?.startsWith(ASSET_CONFIG[a].polySlugPrefix)) ?? "BTC";
-        return (event.markets || []).map((m: any) => ({
-          ...m,
-          outcomes: parseArr(m.outcomes),
-          outcomePrices: parseArr(m.outcomePrices),
-          clobTokenIds: parseArr(m.clobTokenIds),
-          eventSlug: event.slug,
-          eventTitle: event.title,
-          eventId: event.id,
-          startDate: event.startDate,
-          endDate: event.endDate,
-          asset, // "BTC" | "ETH" | "SOL"
-        }));
-      });
-
-      console.log(`Fetched ${events.length}/${slugs.length} events → ${markets.length} markets`);
+      const markets = snapshots.flatMap((snapshot) => [...snapshot.currentMarkets, ...snapshot.nextMarkets]);
       res.json(markets);
     } catch (error: any) {
       console.error("Polymarket Events API Error:", error.message);
@@ -3951,40 +4969,86 @@ async function startServer() {
     }
   });
 
+  app.get("/api/polymarket/discovery", async (_req, res) => {
+    try {
+      const nowUtcSeconds = Math.floor(Date.now() / 1000);
+      const currentStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+      const snapshots = await Promise.all(
+        ENABLED_ASSETS.map((asset) => fetchMarketDiscoverySnapshot(asset, currentStart))
+      );
+      res.json({
+        windowStart: currentStart,
+        snapshots,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: "Failed to fetch market discovery", detail: error?.message || String(error) });
+    }
+  });
+
   // API for Polymarket CLOB Order Book (with imbalance signal)
   app.get("/api/polymarket/orderbook/:tokenID", async (req, res) => {
     try {
       const { tokenID } = req.params;
-      const client = await getClobClient();
+      const book = await getNormalizedOrderBookSnapshot(tokenID);
+      const amount = Number(req.query.amount || getActiveConfig().fixedTradeUsdc);
+      const amountMode = String(req.query.amountMode || "SPEND").toUpperCase() as QuoteAmountMode;
+      const side = String(req.query.side || "BUY").toUpperCase() as QuoteSide;
+      const includeQuote = String(req.query.includeQuote || "true").toLowerCase() !== "false";
+      const quote = includeQuote && amount > 0
+        ? getExecutionQuoteDetailed(book, side, amount, amountMode, side === "BUY" ? book.bestAsk : book.bestBid)
+        : null;
 
-      let raw: any;
-      if (!client) {
-        const response = await axios.get(`https://clob.polymarket.com/book?token_id=${tokenID}`, { timeout: 6000 });
-        raw = response.data;
-      } else {
-        raw = await client.getOrderBook(tokenID);
-      }
+      if (quote) rememberExecutionQuote(quote);
 
-      // Compute order book imbalance: totalBidSize / (totalBidSize + totalAskSize)
-      const sumSize = (orders: any[]) =>
-        (orders || []).reduce((acc: number, o: any) => acc + parseFloat(o.size || "0"), 0);
-      const sumNotional = (orders: any[]) =>
-        (orders || []).reduce((acc: number, o: any) => acc + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
-      const bidSize = sumSize(raw.bids);
-      const askSize = sumSize(raw.asks);
-      const total = bidSize + askSize;
-      const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
-      const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE"
-                            : imbalance < 0.40 ? "SELL_PRESSURE"
-                            : "NEUTRAL";
-      // Total USDC liquidity (notional value of all resting orders)
-      const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
-
-      res.json({ ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc });
+      res.json({
+        ...book,
+        updatedAt: new Date(book.updatedAt).toISOString(),
+        quote,
+      });
     } catch (error: any) {
       console.error("Polymarket CLOB API Error:", error.message);
       res.status(500).json({ error: "Failed to fetch order book" });
     }
+  });
+
+  app.get("/api/polymarket/execution-quote/:tokenID", async (req, res) => {
+    try {
+      const { tokenID } = req.params;
+      const amount = Number(req.query.amount || getActiveConfig().fixedTradeUsdc);
+      const amountMode = String(req.query.amountMode || "SPEND").toUpperCase() as QuoteAmountMode;
+      const side = String(req.query.side || "BUY").toUpperCase() as QuoteSide;
+      if (!(amount > 0)) {
+        return res.status(400).json({ error: "amount must be greater than 0" });
+      }
+
+      const book = await getNormalizedOrderBookSnapshot(tokenID);
+      const quote = getExecutionQuoteDetailed(
+        book,
+        side,
+        amount,
+        amountMode,
+        side === "BUY" ? book.bestAsk : book.bestBid
+      );
+      rememberExecutionQuote(quote);
+      res.json({
+        quote,
+        book: {
+          tokenId: tokenID,
+          bestBid: book.bestBid,
+          bestAsk: book.bestAsk,
+          spread: book.spread,
+          imbalanceSignal: book.imbalanceSignal,
+          source: book.source,
+          updatedAt: new Date(book.updatedAt).toISOString(),
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: "Failed to compute execution quote", detail: error?.message || String(error) });
+    }
+  });
+
+  app.get("/api/polymarket/stream", (_req, res) => {
+    res.json(getMarketInfraStatus().stream);
   });
 
   app.get("/api/polymarket/automation", async (_req, res) => {
