@@ -9,6 +9,20 @@ import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 import { MongoClient, Db, Collection } from "mongodb";
+import { buildAlphaResearchReport } from "./src/server/alpha/analytics.js";
+import { scoreBtcAlpha } from "./src/server/alpha/model.js";
+import {
+  appendDecisionLog,
+  createDecisionLogEntry,
+  filterDecisionLogByDays,
+  loadDecisionLog as loadPersistedDecisionLog,
+} from "./src/server/alpha/persistence.js";
+import type {
+  AlphaModelSnapshot,
+  DecisionAction,
+  DecisionLogEntry as AlphaDecisionLogEntry,
+  ExecutedTradeSample,
+} from "./src/server/alpha/types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +31,7 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
 const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
+const DECISION_LOG_FILE = path.join(DATA_DIR, "decision_log.jsonl");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -79,6 +94,29 @@ function filterTradeLogByDays(entries: TradeLogEntry[], days?: number): TradeLog
     const ts = new Date(entry.ts).getTime();
     return Number.isFinite(ts) && ts >= cutoffMs;
   });
+}
+
+function saveDecisionSnapshot(entry: AlphaDecisionLogEntry): void {
+  try {
+    appendDecisionLog(DECISION_LOG_FILE, entry);
+  } catch (e: any) {
+    console.error("[Persist] Failed to write decision_log.jsonl:", e.message);
+  }
+  getDecisionLogCollection().then((col) => {
+    if (!col) return;
+    col.insertOne({ ...entry }).catch((e: any) =>
+      console.error("[Persist] Failed to save decision to MongoDB:", e.message)
+    );
+  });
+}
+
+function loadDecisionSnapshots(): AlphaDecisionLogEntry[] {
+  try {
+    return loadPersistedDecisionLog(DECISION_LOG_FILE);
+  } catch (e: any) {
+    console.error("[Persist] Failed to read decision_log.jsonl:", e.message);
+    return [];
+  }
 }
 
 // Load last 100 resolved trades from MongoDB into botLog on startup.
@@ -281,6 +319,7 @@ const MONGODB_CHART_COLLECTION = process.env.MONGODB_CHART_COLLECTION || "chart"
 const MONGODB_POSITION_AUTOMATION_COLLECTION =
   process.env.MONGODB_POSITION_AUTOMATION_COLLECTION || "position_automation";
 const MONGODB_TRADES_COLLECTION = process.env.MONGODB_TRADES_COLLECTION || "trades";
+const MONGODB_DECISION_LOG_COLLECTION = process.env.MONGODB_DECISION_LOG_COLLECTION || "decision_log";
 const BTC_PRICE_CACHE_MS = 2_000;
 const BTC_HISTORY_CACHE_MS = 8_000;
 const BTC_INDICATORS_CACHE_MS = 15_000;
@@ -1484,9 +1523,156 @@ interface EntrySnapshot {
   asset?: TradingAsset;
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
+  alphaModel: AlphaModelSnapshot | null;
   updatedAt: string;
 }
 let currentEntrySnapshot: EntrySnapshot | null = null;
+
+function extractStrikePrice(question: string): number | null {
+  const match = String(question || "").match(/\$([0-9,]+(?:\.[0-9]+)?)/);
+  if (!match) return null;
+  const parsed = Number(match[1].replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildAlphaModelSnapshot(input: {
+  asset: TradingAsset;
+  direction: "UP" | "DOWN" | "NONE";
+  confidence: number;
+  edge: number;
+  entryPrice: number | null;
+  riskLevel: string;
+  imbalanceSignal?: string | null;
+  signalScore?: number | null;
+  rsi?: number | null;
+  emaCross?: string | null;
+  divergenceDirection?: string | null;
+  divergenceStrength?: string | null;
+  fastLoopDirection?: string | null;
+  fastLoopStrength?: string | null;
+  fastLoopVw?: number | null;
+  windowElapsedSeconds?: number | null;
+}): AlphaModelSnapshot | null {
+  const model = scoreBtcAlpha({
+    asset: input.asset,
+    direction: input.direction,
+    confidence: input.confidence,
+    edge: input.edge,
+    entryPrice: input.entryPrice,
+    riskLevel: input.riskLevel,
+    imbalanceSignal: input.imbalanceSignal,
+    signalScore: input.signalScore,
+    rsi: input.rsi,
+    emaCross: input.emaCross,
+    divergenceDirection: input.divergenceDirection,
+    divergenceStrength: input.divergenceStrength,
+    fastLoopDirection: input.fastLoopDirection,
+    fastLoopStrength: input.fastLoopStrength,
+    fastLoopVw: input.fastLoopVw,
+    windowElapsedSeconds: input.windowElapsedSeconds,
+  });
+  return model.probability == null ? null : model;
+}
+
+function persistDecisionSnapshotFromSignal(params: {
+  asset: TradingAsset;
+  market: NormalizedPolymarketMarket;
+  windowStart: number;
+  windowElapsedSeconds: number;
+  decision: "TRADE" | "NO_TRADE";
+  action: DecisionAction;
+  direction: "UP" | "DOWN" | "NONE";
+  confidence: number;
+  edge: number;
+  riskLevel: string;
+  reasoning: string;
+  filterReasons?: string[];
+  yesPrice: number | null;
+  noPrice: number | null;
+  estimatedBet?: number | null;
+  btcPrice?: number | null;
+  rsi?: number | null;
+  emaCross?: string | null;
+  signalScore?: number | null;
+  imbalanceSignal?: string | null;
+  divergenceDirection?: string | null;
+  divergenceStrength?: string | null;
+  btcDelta30s?: number | null;
+  yesDelta30s?: number | null;
+  fastLoopDirection?: string | null;
+  fastLoopStrength?: string | null;
+  fastLoopVw?: number | null;
+  tradeExecuted?: boolean;
+  tradeAmount?: number | null;
+  tradePrice?: number | null;
+  orderId?: string | null;
+}): AlphaDecisionLogEntry {
+  const entryPrice =
+    params.direction === "UP" ? params.yesPrice :
+    params.direction === "DOWN" ? params.noPrice :
+    null;
+  const model = buildAlphaModelSnapshot({
+    asset: params.asset,
+    direction: params.direction,
+    confidence: params.confidence,
+    edge: params.edge,
+    entryPrice,
+    riskLevel: params.riskLevel,
+    imbalanceSignal: params.imbalanceSignal,
+    signalScore: params.signalScore,
+    rsi: params.rsi,
+    emaCross: params.emaCross,
+    divergenceDirection: params.divergenceDirection,
+    divergenceStrength: params.divergenceStrength,
+    fastLoopDirection: params.fastLoopDirection,
+    fastLoopStrength: params.fastLoopStrength,
+    fastLoopVw: params.fastLoopVw,
+    windowElapsedSeconds: params.windowElapsedSeconds,
+  });
+
+  const entry = createDecisionLogEntry({
+    windowStart: params.windowStart,
+    windowEnd: params.windowStart + MARKET_SESSION_SECONDS,
+    asset: params.asset,
+    market: params.market.question || params.market.id,
+    marketId: params.market.id,
+    eventSlug: params.market.eventSlug || "",
+    decision: params.decision,
+    action: params.action,
+    direction: params.direction,
+    confidence: params.confidence,
+    edge: params.edge,
+    riskLevel: params.riskLevel,
+    reasoning: params.reasoning,
+    filterReasons: params.filterReasons || [],
+    entryPrice,
+    yesPrice: params.yesPrice,
+    noPrice: params.noPrice,
+    estimatedBet: params.estimatedBet ?? null,
+    btcPrice: params.btcPrice ?? null,
+    strikePrice: extractStrikePrice(params.market.question || ""),
+    windowElapsedSeconds: params.windowElapsedSeconds,
+    imbalanceSignal: params.imbalanceSignal ?? null,
+    signalScore: params.signalScore ?? null,
+    rsi: params.rsi ?? null,
+    emaCross: params.emaCross ?? null,
+    divergenceDirection: params.divergenceDirection ?? null,
+    divergenceStrength: params.divergenceStrength ?? null,
+    btcDelta30s: params.btcDelta30s ?? null,
+    yesDelta30s: params.yesDelta30s ?? null,
+    fastLoopDirection: params.fastLoopDirection ?? null,
+    fastLoopStrength: params.fastLoopStrength ?? null,
+    fastLoopVw: params.fastLoopVw ?? null,
+    model,
+    tradeExecuted: params.tradeExecuted ?? false,
+    tradeAmount: params.tradeAmount ?? null,
+    tradePrice: params.tradePrice ?? null,
+    orderId: params.orderId ?? null,
+  });
+
+  saveDecisionSnapshot(entry);
+  return entry;
+}
 
 interface BotLogEntry {
   timestamp: string;
@@ -1730,6 +1916,31 @@ async function getCandlesCollection() {
   return db?.collection<BtcCandleDocument>(MONGODB_CHART_COLLECTION) || null;
 }
 
+async function loadBtcCandlesRange(startTime: number, endTime: number): Promise<Array<{ time: number; close: number }>> {
+  const collection = await getCandlesCollection();
+  if (!collection) return [];
+  const safeStart = Math.max(0, Math.floor(startTime) - 60);
+  const safeEnd = Math.max(safeStart, Math.floor(endTime) + 60);
+  const docs = await collection
+    .find(
+      {
+        symbol: "BTCUSDT",
+        interval: "1m",
+        time: { $gte: safeStart, $lte: safeEnd },
+      },
+      {
+        projection: { _id: 0, time: 1, close: 1 },
+        sort: { time: 1 },
+      }
+    )
+    .toArray();
+
+  return docs.map((doc) => ({
+    time: Number(doc.time),
+    close: Number(doc.close),
+  }));
+}
+
 async function getPositionAutomationCollection() {
   const db = await getMongoDb();
   return db?.collection<PositionAutomationDocument>(MONGODB_POSITION_AUTOMATION_COLLECTION) || null;
@@ -1738,6 +1949,11 @@ async function getPositionAutomationCollection() {
 async function getTradesCollection() {
   const db = await getMongoDb();
   return db?.collection<TradeLogEntry & { _id?: any }>(MONGODB_TRADES_COLLECTION) || null;
+}
+
+async function getDecisionLogCollection() {
+  const db = await getMongoDb();
+  return db?.collection<AlphaDecisionLogEntry & { _id?: any }>(MONGODB_DECISION_LOG_COLLECTION) || null;
 }
 
 async function ensureMongoCollections() {
@@ -1749,6 +1965,7 @@ async function ensureMongoCollections() {
     const priceSnapshots = db.collection(MONGODB_PRICE_SNAPSHOTS_COLLECTION);
     const candles = db.collection(MONGODB_CHART_COLLECTION);
     const automations = db.collection(MONGODB_POSITION_AUTOMATION_COLLECTION);
+    const decisionLog = db.collection(MONGODB_DECISION_LOG_COLLECTION);
 
     await Promise.all([
       marketCache.createIndex({ fetchedAt: -1 }),
@@ -1766,6 +1983,9 @@ async function ensureMongoCollections() {
       ),
       automations.createIndex({ assetId: 1 }, { unique: true }),
       automations.createIndex({ armed: 1, updatedAt: -1 }),
+      decisionLog.createIndex({ ts: -1 }),
+      decisionLog.createIndex({ asset: 1, ts: -1 }),
+      decisionLog.createIndex({ marketId: 1, ts: -1 }),
     ]);
   } catch (error: any) {
     console.warn("MongoDB index initialization failed:", error?.message || error);
@@ -3190,6 +3410,36 @@ async function startServer() {
         markTradeExecutionFinished(fastAsset, market.id, true);
 
         botSessionTradesCount++;
+        persistDecisionSnapshotFromSignal({
+          asset: fastAsset,
+          market,
+          windowStart: nowWindowStart,
+          windowElapsedSeconds: now - nowWindowStart,
+          decision: "TRADE",
+          action: "FAST_PATH_EXECUTED",
+          direction,
+          confidence,
+          edge: estimatedEdge,
+          riskLevel: "MEDIUM",
+          reasoning: fastRec.reasoning,
+          filterReasons: [],
+          yesPrice: direction === "UP"
+            ? bestAsk
+            : Number(market.outcomePrices?.[0] ?? NaN) || null,
+          noPrice: direction === "DOWN"
+            ? bestAsk
+            : Number(market.outcomePrices?.[1] ?? NaN) || null,
+          estimatedBet: betAmount,
+          btcPrice: null,
+          divergenceDirection: direction,
+          divergenceStrength: "STRONG",
+          btcDelta30s: snapshot.btcDelta,
+          yesDelta30s: null,
+          tradeExecuted: true,
+          tradeAmount: betAmount,
+          tradePrice: bestAsk,
+          orderId: tradeResult.orderID,
+        });
         botPrint("OK", `⚡ FAST PATH EXECUTED ✓ | ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
         void sendNotification(
           `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(Gemini bypassed — STRONG divergence)`
@@ -4013,6 +4263,59 @@ async function startServer() {
             );
           }
 
+          const decisionTokenIds: string[] = market.clobTokenIds || [];
+          const yesDecisionPriceRaw = orderBooks[decisionTokenIds[0]]?.asks?.[0]?.price ?? market.outcomePrices?.[0] ?? null;
+          const noDecisionPriceRaw = orderBooks[decisionTokenIds[1]]?.asks?.[0]?.price ?? market.outcomePrices?.[1] ?? null;
+          const yesDecisionPrice = yesDecisionPriceRaw !== null ? Number(yesDecisionPriceRaw) : null;
+          const noDecisionPrice = noDecisionPriceRaw !== null ? Number(noDecisionPriceRaw) : null;
+          const yesImbalanceSignal = decisionTokenIds[0] ? orderBooks[decisionTokenIds[0]]?.imbalanceSignal ?? null : null;
+          const captureDecisionSnapshot = (payload: {
+            decision: "TRADE" | "NO_TRADE";
+            action: DecisionAction;
+            direction: "UP" | "DOWN" | "NONE";
+            confidence: number;
+            edge: number;
+            riskLevel: string;
+            reasoning: string;
+            filterReasons?: string[];
+            tradeExecuted?: boolean;
+            tradeAmount?: number | null;
+            tradePrice?: number | null;
+            orderId?: string | null;
+          }) => persistDecisionSnapshotFromSignal({
+            asset: currentAsset,
+            market,
+            windowStart: currentWindowStart,
+            windowElapsedSeconds,
+            decision: payload.decision,
+            action: payload.action,
+            direction: payload.direction,
+            confidence: payload.confidence,
+            edge: payload.edge,
+            riskLevel: payload.riskLevel,
+            reasoning: payload.reasoning,
+            filterReasons: payload.filterReasons,
+            yesPrice: yesDecisionPrice,
+            noPrice: noDecisionPrice,
+            estimatedBet: payload.decision === "TRADE" ? getActiveConfig().fixedTradeUsdc : null,
+            btcPrice: btcPriceData?.price ? Number(btcPriceData.price) : null,
+            rsi: btcIndicatorsData?.rsi,
+            emaCross: btcIndicatorsData?.emaCross,
+            signalScore: btcIndicatorsData?.signalScore,
+            imbalanceSignal: yesImbalanceSignal,
+            divergenceDirection: div?.direction ?? null,
+            divergenceStrength: div?.strength ?? null,
+            btcDelta30s: div?.btcDelta30s ?? null,
+            yesDelta30s: div?.yesDelta30s ?? null,
+            fastLoopDirection: fastMom?.direction ?? null,
+            fastLoopStrength: fastMom?.strength ?? null,
+            fastLoopVw: fastMom?.volumeWeighted ?? null,
+            tradeExecuted: payload.tradeExecuted,
+            tradeAmount: payload.tradeAmount,
+            tradePrice: payload.tradePrice,
+            orderId: payload.orderId,
+          });
+
           // ── Early window coin-flip guard ──────────────────────────────────
           // Block trade in first 60s if there's no divergence and BTC is flat.
           // At this point FastLoop hasn't built 5 fresh candles and any cached AI
@@ -4022,6 +4325,16 @@ async function startServer() {
             const noDivergence = !div || div.strength === "NONE";
             if (noDivergence && btcFlat) {
               botPrint("SKIP", `Early window coin-flip guard: elapsed=${windowElapsedSeconds}s, no divergence, BTC flat — waiting for signal | re-check enabled`);
+              captureDecisionSnapshot({
+                decision: "NO_TRADE",
+                action: "NO_TRADE",
+                direction: "NONE",
+                confidence: 0,
+                edge: 0,
+                riskLevel: "HIGH",
+                reasoning: "Early window coin-flip guard",
+                filterReasons: ["No divergence and BTC flat in the first 60s"],
+              });
               analyzedThisWindow.delete(market.id); // allow re-check once past 60s or when signal appears
               continue;
             }
@@ -4031,6 +4344,16 @@ async function startServer() {
           const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK";
           if (fastMomWeak && (!div || div.strength === "NONE")) {
             botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=MODERATE) + no divergence — skipping AI | re-check enabled`);
+            captureDecisionSnapshot({
+              decision: "NO_TRADE",
+              action: "NO_TRADE",
+              direction: "NONE",
+              confidence: 0,
+              edge: 0,
+              riskLevel: "HIGH",
+              reasoning: "FastLoop pre-filter blocked trade evaluation",
+              filterReasons: [`${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} with no divergence`],
+            });
             analyzedThisWindow.delete(market.id); // allow re-check when momentum/divergence appears later in the same window
             continue;
           }
@@ -4215,6 +4538,25 @@ async function startServer() {
           );
           botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
 
+          const alphaModel = buildAlphaModelSnapshot({
+            asset: currentAsset,
+            direction: rec.direction,
+            confidence: rec.confidence,
+            edge: rec.estimatedEdge,
+            entryPrice: rec.direction === "UP" ? yesDecisionPrice : rec.direction === "DOWN" ? noDecisionPrice : null,
+            riskLevel: rec.riskLevel,
+            imbalanceSignal: yesImbalanceSignal,
+            signalScore: btcIndicatorsData?.signalScore,
+            rsi: btcIndicatorsData?.rsi,
+            emaCross: btcIndicatorsData?.emaCross,
+            divergenceDirection: div?.direction ?? null,
+            divergenceStrength: div?.strength ?? null,
+            fastLoopDirection: fastMom?.direction ?? null,
+            fastLoopStrength: fastMom?.strength ?? null,
+            fastLoopVw: fastMom?.volumeWeighted ?? null,
+            windowElapsedSeconds,
+          });
+
           // ── Update entry snapshot for dashboard widget ──────────────────
           {
             const outcomeIdx = rec.direction === "DOWN" ? 1 : 0;
@@ -4240,6 +4582,7 @@ async function startServer() {
                 ? { direction: div.direction, strength: div.strength, btcDelta30s: div.btcDelta30s, yesDelta30s: div.yesDelta30s }
                 : null,
               fastLoopMomentum: fastMom ? { direction: fastMom.direction, strength: fastMom.strength, vw: fastMom.volumeWeighted } : null,
+              alphaModel,
               updatedAt: new Date().toISOString(),
             };
             if (entryTokenId && orderBooks[entryTokenId] && entryAsk !== null) {
@@ -4258,6 +4601,30 @@ async function startServer() {
             void oppIdx;
           }
 
+          if (
+            currentAsset === "BTC" &&
+            rec.decision === "TRADE" &&
+            rec.confidence >= 75 &&
+            rec.confidence <= 79 &&
+            alphaModel &&
+            !alphaModel.shouldTrade
+          ) {
+            const alphaReason = alphaModel.reasons[0] || `Alpha overlay rejected probability ${(alphaModel.probability ?? 0) * 100}%`;
+            botPrint("SKIP", `Alpha overlay veto: ${alphaReason} | 75–79% BTC setup blocked`);
+            captureDecisionSnapshot({
+              decision: "TRADE",
+              action: "FILTERED",
+              direction: rec.direction,
+              confidence: rec.confidence,
+              edge: rec.estimatedEdge,
+              riskLevel: rec.riskLevel,
+              reasoning: rec.reasoning,
+              filterReasons: [`Alpha overlay veto: ${alphaReason}`],
+            });
+            analyzedThisWindow.delete(market.id);
+            continue;
+          }
+
           const qualifies =
             rec.decision === "TRADE" &&
             rec.confidence >= effectiveMinConf &&
@@ -4270,6 +4637,16 @@ async function startServer() {
             if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}¢ < ${cfg.minEdge}¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")} | re-check enabled`);
+            captureDecisionSnapshot({
+              decision: "TRADE",
+              action: "FILTERED",
+              direction: rec.direction,
+              confidence: rec.confidence,
+              edge: rec.estimatedEdge,
+              riskLevel: rec.riskLevel,
+              reasoning: rec.reasoning,
+              filterReasons: reasons,
+            });
             analyzedThisWindow.delete(market.id); // re-check if divergence or cached conditions improve later this window
           }
 
@@ -4291,6 +4668,16 @@ async function startServer() {
 
             if (pressureOpposesDirection) {
               botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/UNKNOWN) | re-check next cycle`);
+              captureDecisionSnapshot({
+                decision: "TRADE",
+                action: "FILTERED",
+                direction: rec.direction,
+                confidence: rec.confidence,
+                edge: rec.estimatedEdge,
+                riskLevel: rec.riskLevel,
+                reasoning: rec.reasoning,
+                filterReasons: [`Pressure filter blocked by YES book ${yesSignal}`],
+              });
               analyzedThisWindow.delete(market.id); // re-check each cycle in case pressure shifts
               pushSSE("cycle", { ts: new Date().toISOString() });
               continue;
@@ -4316,6 +4703,16 @@ async function startServer() {
             if (!client) {
               logEntry.error = "CLOB client not ready — trade skipped.";
               botPrint("ERR", "CLOB client not initialized. Check POLYGON_PRIVATE_KEY.");
+              captureDecisionSnapshot({
+                decision: "TRADE",
+                action: "FILTERED",
+                direction: rec.direction,
+                confidence: rec.confidence,
+                edge: rec.estimatedEdge,
+                riskLevel: rec.riskLevel,
+                reasoning: rec.reasoning,
+                filterReasons: ["CLOB client not ready"],
+              });
             } else {
               // Initialise session balance on first qualifying trade
               if (botSessionStartBalance === null) {
@@ -4344,6 +4741,16 @@ async function startServer() {
               if (currentBalance < 1) {
                 botPrint("WARN", `Insufficient balance ($${currentBalance.toFixed(2)} USDC < $1 minimum). Skipping all trades this cycle.`);
                 logEntry.reasoning += ` | Skipped: Insufficient balance ($${currentBalance.toFixed(2)}).`;
+                captureDecisionSnapshot({
+                  decision: "TRADE",
+                  action: "FILTERED",
+                  direction: rec.direction,
+                  confidence: rec.confidence,
+                  edge: rec.estimatedEdge,
+                  riskLevel: rec.riskLevel,
+                  reasoning: rec.reasoning,
+                  filterReasons: [`Insufficient balance $${currentBalance.toFixed(2)}`],
+                });
                 botLog.unshift(logEntry);
                 if (botLog.length > 100) botLog.pop();
                 break;
@@ -4377,6 +4784,16 @@ async function startServer() {
                 // STRONG divergence is a structural edge (real price lag) → allow 80¢.
                 if (bestAsk <= 0) {
                   botPrint("SKIP", `No price data available — skipping for now | re-check enabled`);
+                  captureDecisionSnapshot({
+                    decision: "TRADE",
+                    action: "FILTERED",
+                    direction: rec.direction,
+                    confidence: rec.confidence,
+                    edge: rec.estimatedEdge,
+                    riskLevel: rec.riskLevel,
+                    reasoning: rec.reasoning,
+                    filterReasons: ["No price data available"],
+                  });
                   analyzedThisWindow.delete(market.id);
                   continue;
                 }
@@ -4389,6 +4806,16 @@ async function startServer() {
                   const priceSource = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD) ? "CLOB" : "AMM";
                   botPrint("SKIP", `Entry price too high: ${priceSource}=${( bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Monitoring for better price | re-check enabled`);
                   logEntry.reasoning += ` | Skipped: bestAsk ${(bestAsk * 100).toFixed(0)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ dynamic max (conf=${rec.confidence}%).`;
+                  captureDecisionSnapshot({
+                    decision: "TRADE",
+                    action: "FILTERED",
+                    direction: rec.direction,
+                    confidence: rec.confidence,
+                    edge: rec.estimatedEdge,
+                    riskLevel: rec.riskLevel,
+                    reasoning: rec.reasoning,
+                    filterReasons: [`Entry price ${(bestAsk * 100).toFixed(1)}¢ > dynamic max ${(MAX_ENTRY_PRICE * 100).toFixed(1)}¢`],
+                  });
                   botLog.unshift(logEntry);
                   if (botLog.length > 100) botLog.pop();
                   // Remove from analyzed set so next cycle re-checks the price
@@ -4402,6 +4829,16 @@ async function startServer() {
                 if (btcPremiumEntryGuard) {
                   botPrint("SKIP", `${btcPremiumEntryGuard} | re-check enabled`);
                   logEntry.reasoning += ` | Skipped: ${btcPremiumEntryGuard}.`;
+                  captureDecisionSnapshot({
+                    decision: "TRADE",
+                    action: "FILTERED",
+                    direction: rec.direction,
+                    confidence: rec.confidence,
+                    edge: rec.estimatedEdge,
+                    riskLevel: rec.riskLevel,
+                    reasoning: rec.reasoning,
+                    filterReasons: [btcPremiumEntryGuard],
+                  });
                   analyzedThisWindow.delete(market.id);
                   pushSSE("cycle", { ts: new Date().toISOString() });
                   continue;
@@ -4447,10 +4884,30 @@ async function startServer() {
                 if (betAmount < MIN_BET) {
                   botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC < $${MIN_BET.toFixed(2)} min). Balance may be too low or Kelly fraction too conservative. Skipping.`);
                   logEntry.reasoning += ` | Skipped: Adjusted bet $${betAmount.toFixed(2)} < $${MIN_BET.toFixed(2)} minimum (balance=$${currentBalance.toFixed(2)}).`;
+                  captureDecisionSnapshot({
+                    decision: "TRADE",
+                    action: "FILTERED",
+                    direction: rec.direction,
+                    confidence: rec.confidence,
+                    edge: rec.estimatedEdge,
+                    riskLevel: rec.riskLevel,
+                    reasoning: rec.reasoning,
+                    filterReasons: [`Bet $${betAmount.toFixed(2)} < min $${MIN_BET.toFixed(2)}`],
+                  });
                 } else {
                   const executionStatus = getTradeWindowStatus(currentAsset, market.id);
                   if (executionStatus) {
                     botPrint("SKIP", `[${currentAsset}] Trade ${executionStatus === "EXECUTED" ? "already executed" : "already submitting"} for this market in the current window — order entry cancelled`);
+                    captureDecisionSnapshot({
+                      decision: "TRADE",
+                      action: "FILTERED",
+                      direction: rec.direction,
+                      confidence: rec.confidence,
+                      edge: rec.estimatedEdge,
+                      riskLevel: rec.riskLevel,
+                      reasoning: rec.reasoning,
+                      filterReasons: [`Execution status ${executionStatus}`],
+                    });
                     continue;
                   }
 
@@ -4492,6 +4949,20 @@ async function startServer() {
                     logEntry.tradeAmount = betAmount;
                     logEntry.tradePrice = bestAsk;
                     logEntry.orderId = tradeResult.orderID;
+                    captureDecisionSnapshot({
+                      decision: "TRADE",
+                      action: "EXECUTED",
+                      direction: rec.direction,
+                      confidence: rec.confidence,
+                      edge: rec.estimatedEdge,
+                      riskLevel: rec.riskLevel,
+                      reasoning: rec.reasoning,
+                      filterReasons: [],
+                      tradeExecuted: true,
+                      tradeAmount: betAmount,
+                      tradePrice: bestAsk,
+                      orderId: tradeResult.orderID,
+                    });
                     analyzedThisWindow.add(market.id);
                     botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
                     void sendNotification(
@@ -4528,12 +4999,32 @@ async function startServer() {
                     markTradeExecutionFinished(currentAsset, market.id, false);
                     logEntry.error = tradeErr?.message || String(tradeErr);
                     botPrint("ERR", `Trade execution failed: ${logEntry.error}`);
+                    captureDecisionSnapshot({
+                      decision: "TRADE",
+                      action: "FILTERED",
+                      direction: rec.direction,
+                      confidence: rec.confidence,
+                      edge: rec.estimatedEdge,
+                      riskLevel: rec.riskLevel,
+                      reasoning: rec.reasoning,
+                      filterReasons: [`Execution failed: ${logEntry.error}`],
+                    });
                   }
                 }
               }
             }
           } else if (rec.decision === "NO_TRADE") {
             botPrint("SKIP", `No trade — conditions not met, will re-check next cycle`);
+            captureDecisionSnapshot({
+              decision: "NO_TRADE",
+              action: "NO_TRADE",
+              direction: rec.direction,
+              confidence: rec.confidence,
+              edge: rec.estimatedEdge,
+              riskLevel: rec.riskLevel,
+              reasoning: rec.reasoning,
+              filterReasons: ["Synthesized signal did not qualify for trade"],
+            });
             // Remove from analyzed set so next cycle re-evaluates if conditions change.
             // Keep AI cache so Gemini is not re-called — only re-check divergence/price/filters.
             analyzedThisWindow.delete(market.id);
@@ -4834,6 +5325,48 @@ async function startServer() {
       res.json(replay);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || "Trade log replay failed" });
+    }
+  });
+
+  app.get("/api/alpha/decision-log", (req, res) => {
+    try {
+      const days = Number.parseInt(String(req.query.days || ""), 10);
+      const limit = Math.min(parseInt(String(req.query.limit || "100"), 10), 500);
+      const entries = filterDecisionLogByDays(loadDecisionSnapshots(), days)
+        .slice()
+        .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+      res.json({
+        total: entries.length,
+        entries: entries.slice(0, limit),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Decision log load failed" });
+    }
+  });
+
+  app.get("/api/alpha/research", async (req, res) => {
+    try {
+      const days = Number.parseInt(String(req.query.days || ""), 10);
+      const decisions = filterDecisionLogByDays(loadDecisionSnapshots(), days);
+      const trades = filterTradeLogByDays(loadTradeLog(), days);
+      const btcDecisions = decisions.filter((entry) => entry.asset === "BTC");
+      const rangeStart = btcDecisions.length > 0
+        ? Math.min(...btcDecisions.map((entry) => Math.floor(new Date(entry.ts).getTime() / 1000)))
+        : 0;
+      const rangeEnd = btcDecisions.length > 0
+        ? Math.max(...btcDecisions.map((entry) => entry.windowEnd))
+        : 0;
+      const candles = rangeStart > 0 && rangeEnd > rangeStart
+        ? await loadBtcCandlesRange(rangeStart, rangeEnd)
+        : [];
+      const report = buildAlphaResearchReport({
+        decisions,
+        trades: trades as ExecutedTradeSample[],
+        candles,
+      });
+      res.json(report);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Alpha research analytics failed" });
     }
   });
 
