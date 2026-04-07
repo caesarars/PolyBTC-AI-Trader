@@ -54,6 +54,16 @@ interface EntrySnapshot {
   asset?: string; // "BTC"
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
+  alphaModel: {
+    version: string;
+    probability: number | null;
+    edge: number | null;
+    score: number | null;
+    conviction: "LOW" | "MEDIUM" | "HIGH" | null;
+    agreement: "ALIGNED" | "MIXED" | "CONFLICT" | "NEUTRAL";
+    shouldTrade: boolean;
+    reasons: string[];
+  } | null;
   updatedAt: string;
 }
 
@@ -398,6 +408,74 @@ interface BtcCutoffData {
   }>;
 }
 
+interface AlphaResearchData {
+  generatedAt: string;
+  scope: {
+    asset: string;
+    decisionCount: number;
+    tradeCount: number;
+  };
+  decisionSummary: {
+    total: number;
+    byAction: Array<{ label: string; count: number }>;
+    byDirection: Array<{ label: string; count: number }>;
+    executed: number;
+    filtered: number;
+    noTrade: number;
+  };
+  modelSummary: {
+    version: string;
+    avgProbability: number | null;
+    avgModelEdge: number | null;
+    avgHeuristicEdge: number | null;
+    heuristicBrier: number | null;
+    modelBrier: number | null;
+  };
+  calibration: {
+    heuristic: Array<{ label: string; trades: number; wins: number; losses: number; predictedRate: number | null; realizedRate: number | null; avgEdge: number | null; pnl: number }>;
+    model: Array<{ label: string; trades: number; wins: number; losses: number; predictedRate: number | null; realizedRate: number | null; avgEdge: number | null; pnl: number }>;
+  };
+  markouts: {
+    horizons: Array<{ label: string; count: number; favorableRate: number | null; avgSignedBps: number | null; medianSignedBps: number | null }>;
+    byAction: Array<{ label: string; favorableRate: number | null; avgSignedBps: number | null; count: number }>;
+  };
+  modelShadowReplay: {
+    baselineTrades: number;
+    baselinePnl: number;
+    keptTrades: number;
+    keptPnl: number;
+    blockedTrades: number;
+    blockedPnl: number;
+    pnlDelta: number;
+  };
+  recentDecisions: Array<{
+    id: string;
+    ts: string;
+    action: string;
+    direction: string;
+    decision: string;
+    confidence: number;
+    edge: number;
+    entryPrice: number | null;
+    filterReasons: string[];
+    tradeExecuted: boolean;
+    model: EntrySnapshot["alphaModel"];
+    market: string;
+  }>;
+  recentShadow: Array<{
+    market: string;
+    ts: string;
+    direction: "UP" | "DOWN";
+    result: "WIN" | "LOSS";
+    pnl: number;
+    confidence: number;
+    modelProbability: number | null;
+    modelEdge: number | null;
+    modelAllowed: boolean;
+    reasons: string[];
+  }>;
+}
+
 interface PingProbe {
   key: string;
   label: string;
@@ -447,6 +525,7 @@ export default function BotDashboard() {
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
   const [tradeLogReplay, setTradeLogReplay] = useState<TradeLogReplayData | null>(null);
   const [btcCutoffData, setBtcCutoffData] = useState<BtcCutoffData | null>(null);
+  const [alphaResearch, setAlphaResearch] = useState<AlphaResearchData | null>(null);
   const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "analytics">("dashboard");
   const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
   const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
@@ -461,7 +540,7 @@ export default function BotDashboard() {
   const fetchAll = useCallback(async () => {
     try {
       await fetch("/api/polymarket/discovery").catch(() => null);
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, replayRes, btcCutoffRes, calibRes, learningRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, replayRes, btcCutoffRes, alphaResearchRes, calibRes, learningRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -474,6 +553,7 @@ export default function BotDashboard() {
         fetch("/api/analytics").then((r) => r.json()),
         fetch("/api/backtest/trade-log-replay").then((r) => r.json()),
         fetch("/api/analytics/btc-cutoffs").then((r) => r.json()),
+        fetch("/api/alpha/research").then((r) => r.json()),
         fetch("/api/bot/calibration").then((r) => r.json()),
         fetch("/api/bot/learning").then((r) => r.json()),
       ]);
@@ -502,6 +582,9 @@ export default function BotDashboard() {
       }
       if (btcCutoffRes.status === "fulfilled" && !(btcCutoffRes.value as any).error) {
         setBtcCutoffData(btcCutoffRes.value as BtcCutoffData);
+      }
+      if (alphaResearchRes.status === "fulfilled" && !(alphaResearchRes.value as any).error) {
+        setAlphaResearch(alphaResearchRes.value as AlphaResearchData);
       }
       if (calibRes.status === "fulfilled") setCalibration(calibRes.value as any);
       if (learningRes.status === "fulfilled") setLearning(learningRes.value as LearningState);
@@ -991,6 +1074,192 @@ export default function BotDashboard() {
             </div>
           ) : (
             <>
+              {alphaResearch && (
+                <div className="glass-card p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div>
+                      <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                        <FlaskConical className="w-4 h-4 text-cyan-400" />
+                        Alpha Research
+                      </h3>
+                      <p className="text-[10px] text-zinc-600 mt-0.5">
+                        Decision log dataset, calibration, BTC markout, dan shadow replay model scorer
+                      </p>
+                    </div>
+                    <span className="text-[10px] text-zinc-600">
+                      {alphaResearch.scope.decisionCount} decisions · {alphaResearch.scope.tradeCount} resolved BTC trades
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                    {[
+                      {
+                        label: "Decision Log",
+                        value: String(alphaResearch.decisionSummary.total),
+                        sub: `${alphaResearch.decisionSummary.executed} executed`,
+                        color: "text-cyan-400",
+                      },
+                      {
+                        label: "Model Brier",
+                        value: alphaResearch.modelSummary.modelBrier != null ? alphaResearch.modelSummary.modelBrier.toFixed(4) : "—",
+                        sub: `heuristic ${alphaResearch.modelSummary.heuristicBrier != null ? alphaResearch.modelSummary.heuristicBrier.toFixed(4) : "—"}`,
+                        color: "text-amber-400",
+                      },
+                      {
+                        label: "Avg Model Prob",
+                        value: alphaResearch.modelSummary.avgProbability != null ? `${alphaResearch.modelSummary.avgProbability.toFixed(1)}%` : "—",
+                        sub: `edge ${alphaResearch.modelSummary.avgModelEdge != null ? `${(alphaResearch.modelSummary.avgModelEdge * 100).toFixed(1)}c` : "—"}`,
+                        color: "text-green-400",
+                      },
+                      {
+                        label: "Shadow Delta",
+                        value: `${alphaResearch.modelShadowReplay.pnlDelta >= 0 ? "+" : ""}$${alphaResearch.modelShadowReplay.pnlDelta.toFixed(2)}`,
+                        sub: `${alphaResearch.modelShadowReplay.keptTrades}/${alphaResearch.modelShadowReplay.baselineTrades} kept`,
+                        color: alphaResearch.modelShadowReplay.pnlDelta >= 0 ? "text-green-400" : "text-red-400",
+                      },
+                    ].map(({ label, value, sub, color }) => (
+                      <div key={label} className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                        <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">{label}</div>
+                        <div className={cn("text-xl font-mono font-bold", color)}>{value}</div>
+                        <div className="text-[10px] text-zinc-600 mt-1">{sub}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-4">
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-3">Calibration</div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                          <div className="text-[10px] text-zinc-500 uppercase mb-2">Heuristic</div>
+                          <div className="space-y-2">
+                            {alphaResearch.calibration.heuristic.slice(0, 5).map((row) => (
+                              <div key={`heur-${row.label}`} className="flex items-center justify-between text-xs">
+                                <span className="text-zinc-300">{row.label}</span>
+                                <span className="font-mono text-zinc-500">
+                                  {row.realizedRate != null ? `${row.realizedRate}%` : "—"} vs {row.predictedRate != null ? `${row.predictedRate}%` : "—"}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[10px] text-zinc-500 uppercase mb-2">Model</div>
+                          <div className="space-y-2">
+                            {alphaResearch.calibration.model.slice(0, 5).map((row) => (
+                              <div key={`model-${row.label}`} className="flex items-center justify-between text-xs">
+                                <span className="text-zinc-300">{row.label}</span>
+                                <span className="font-mono text-zinc-500">
+                                  {row.realizedRate != null ? `${row.realizedRate}%` : "—"} vs {row.predictedRate != null ? `${row.predictedRate}%` : "—"}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-3">BTC Markout</div>
+                      <div className="space-y-2 mb-3">
+                        {alphaResearch.markouts.horizons.map((row) => (
+                          <div key={row.label} className="flex items-center justify-between text-xs">
+                            <span className="text-zinc-300">{row.label}</span>
+                            <span className="font-mono text-zinc-500">
+                              {row.avgSignedBps != null ? `${row.avgSignedBps >= 0 ? "+" : ""}${row.avgSignedBps.toFixed(1)} bps` : "—"}
+                              {" · "}
+                              {row.favorableRate != null ? `${row.favorableRate}% fav` : "—"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">Decision Mix</div>
+                      <div className="flex flex-wrap gap-2">
+                        {alphaResearch.decisionSummary.byAction.map((row) => (
+                          <span key={row.label} className="px-2 py-0.5 rounded-full border border-zinc-700 text-[10px] font-mono text-zinc-400">
+                            {row.label}: {row.count}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="flex items-center justify-between gap-2 mb-3">
+                        <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Recent Decisions</div>
+                        <div className="text-[10px] text-zinc-600">new dataset</div>
+                      </div>
+                      <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                        {alphaResearch.recentDecisions.length === 0 ? (
+                          <div className="text-xs text-zinc-600">Decision log belum ada data baru.</div>
+                        ) : alphaResearch.recentDecisions.map((entry) => (
+                          <div key={entry.id} className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-2.5">
+                            <div className="flex items-center justify-between gap-2 text-[10px] mb-1">
+                              <span className="text-zinc-500">{new Date(entry.ts).toLocaleTimeString()}</span>
+                              <span className={cn(
+                                "font-bold",
+                                entry.tradeExecuted ? "text-green-400" : entry.action === "FILTERED" ? "text-yellow-400" : "text-zinc-500"
+                              )}>
+                                {entry.action}
+                              </span>
+                            </div>
+                            <div className="text-xs text-zinc-200 truncate">{entry.market}</div>
+                            <div className="flex flex-wrap gap-2 mt-2 text-[10px]">
+                              <span className="text-zinc-500">{entry.direction}</span>
+                              <span className="text-zinc-500">conf {entry.confidence}%</span>
+                              {entry.entryPrice !== null && <span className="text-zinc-500">entry {(entry.entryPrice * 100).toFixed(1)}c</span>}
+                              {entry.model?.probability !== null && <span className="text-cyan-400">alpha {(entry.model.probability * 100).toFixed(1)}%</span>}
+                            </div>
+                            {entry.filterReasons[0] && (
+                              <div className="text-[10px] text-zinc-600 mt-1 truncate">{entry.filterReasons[0]}</div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-3">
+                      <div className="flex items-center justify-between gap-2 mb-3">
+                        <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Model Shadow Replay</div>
+                        <div className={cn(
+                          "text-xs font-mono font-bold",
+                          alphaResearch.modelShadowReplay.keptPnl >= 0 ? "text-green-400" : "text-red-400"
+                        )}>
+                          {alphaResearch.modelShadowReplay.keptPnl >= 0 ? "+" : ""}${alphaResearch.modelShadowReplay.keptPnl.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                        {alphaResearch.recentShadow.map((row) => (
+                          <div key={`${row.ts}-${row.market}`} className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-2.5">
+                            <div className="flex items-center justify-between gap-2 text-[10px] mb-1">
+                              <span className="text-zinc-500">{new Date(row.ts).toLocaleString()}</span>
+                              <span className={cn("font-bold", row.modelAllowed ? "text-green-400" : "text-red-400")}>
+                                {row.modelAllowed ? "KEEP" : "BLOCK"}
+                              </span>
+                            </div>
+                            <div className="text-xs text-zinc-200 truncate">{row.market}</div>
+                            <div className="flex flex-wrap gap-2 mt-2 text-[10px] font-mono">
+                              <span className={row.result === "WIN" ? "text-green-400" : "text-red-400"}>{row.result}</span>
+                              <span className="text-zinc-500">{row.direction}</span>
+                              <span className="text-zinc-500">conf {row.confidence}%</span>
+                              {row.modelProbability !== null && <span className="text-cyan-400">{(row.modelProbability * 100).toFixed(1)}%</span>}
+                              {row.modelEdge !== null && <span className="text-zinc-500">{(row.modelEdge * 100).toFixed(1)}c</span>}
+                              <span className={row.pnl >= 0 ? "text-green-400" : "text-red-400"}>
+                                {row.pnl >= 0 ? "+" : ""}${row.pnl.toFixed(2)}
+                              </span>
+                            </div>
+                            {row.reasons[0] && (
+                              <div className="text-[10px] text-zinc-600 mt-1 truncate">{row.reasons[0]}</div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {btcCutoffData && (
                 <div className="glass-card p-4">
                   <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -2142,7 +2411,61 @@ export default function BotDashboard() {
                       </span>
                     </span>
                   )}
+                  {snap.alphaModel?.probability !== null && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.alphaModel.shouldTrade
+                        ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+                        : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                    )}>
+                      Alpha {(snap.alphaModel.probability * 100).toFixed(1)}%
+                    </span>
+                  )}
+                  {snap.alphaModel?.edge !== null && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
+                      Model edge {(snap.alphaModel.edge * 100).toFixed(1)}c
+                    </span>
+                  )}
+                  {snap.alphaModel?.conviction && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.alphaModel.conviction === "HIGH"
+                        ? "bg-green-500/10 text-green-400 border-green-500/30"
+                        : snap.alphaModel.conviction === "MEDIUM"
+                          ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
+                          : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                    )}>
+                      {snap.alphaModel.conviction}
+                    </span>
+                  )}
                 </div>
+
+                {snap.alphaModel && snap.alphaModel.reasons.length > 0 && (
+                  <div className="rounded-xl border border-zinc-700/40 bg-zinc-900/40 p-3">
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">
+                        Alpha Overlay
+                      </span>
+                      <span className={cn(
+                        "text-[10px] font-bold",
+                        snap.alphaModel.agreement === "ALIGNED"
+                          ? "text-green-400"
+                          : snap.alphaModel.agreement === "CONFLICT"
+                            ? "text-red-400"
+                            : "text-zinc-400"
+                      )}>
+                        {snap.alphaModel.agreement}
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      {snap.alphaModel.reasons.slice(0, 3).map((reason) => (
+                        <div key={reason} className="text-[11px] text-zinc-500">
+                          {reason}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
