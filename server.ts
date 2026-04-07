@@ -72,6 +72,15 @@ function loadTradeLog(): TradeLogEntry[] {
   }
 }
 
+function filterTradeLogByDays(entries: TradeLogEntry[], days?: number): TradeLogEntry[] {
+  if (!Number.isFinite(days) || !days || days <= 0) return entries;
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  return entries.filter((entry) => {
+    const ts = new Date(entry.ts).getTime();
+    return Number.isFinite(ts) && ts >= cutoffMs;
+  });
+}
+
 // Load last 100 resolved trades from MongoDB into botLog on startup.
 // This makes PnL chart persist across restarts (SSOT = MongoDB).
 async function loadBotLogFromDb(): Promise<void> {
@@ -3600,8 +3609,12 @@ async function startServer() {
     }
   });
 
-  app.get("/api/bot/log", (_req, res) => {
-    res.json({ log: botLog });
+  app.get("/api/bot/log", (req, res) => {
+    const executedOnly =
+      String(req.query.executedOnly || "").toLowerCase() === "1" ||
+      String(req.query.executedOnly || "").toLowerCase() === "true";
+    const log = executedOnly ? botLog.filter((entry) => entry.tradeExecuted) : botLog;
+    res.json({ log });
   });
 
   app.get("/api/bot/rawlog", (_req, res) => {
@@ -3856,18 +3869,20 @@ async function startServer() {
 
   app.get("/api/bot/trade-log", (req, res) => {
     const all = loadTradeLog();
+    const days = Number.parseInt(String(req.query.days || ""), 10);
+    const filtered = filterTradeLogByDays(all, days);
     const limit = Math.min(parseInt(String(req.query.limit || "200"), 10), 1000);
     const offset = parseInt(String(req.query.offset || "0"), 10);
-    const entries = all.slice().reverse().slice(offset, offset + limit);
-    const wins   = all.filter((e) => e.result === "WIN").length;
-    const losses = all.filter((e) => e.result === "LOSS").length;
-    const totalPnl = parseFloat(all.reduce((s, e) => s + e.pnl, 0).toFixed(2));
-    const winRate  = all.length > 0 ? parseFloat(((wins / all.length) * 100).toFixed(1)) : 0;
-    const divTrades = all.filter((e) => e.divergenceStrength === "STRONG" || e.divergenceStrength === "MODERATE");
+    const entries = filtered.slice().reverse().slice(offset, offset + limit);
+    const wins   = filtered.filter((e) => e.result === "WIN").length;
+    const losses = filtered.filter((e) => e.result === "LOSS").length;
+    const totalPnl = parseFloat(filtered.reduce((s, e) => s + e.pnl, 0).toFixed(2));
+    const winRate  = filtered.length > 0 ? parseFloat(((wins / filtered.length) * 100).toFixed(1)) : 0;
+    const divTrades = filtered.filter((e) => e.divergenceStrength === "STRONG" || e.divergenceStrength === "MODERATE");
     const divWins   = divTrades.filter((e) => e.result === "WIN").length;
     const divWinRate = divTrades.length > 0 ? parseFloat(((divWins / divTrades.length) * 100).toFixed(1)) : null;
     res.json({
-      total: all.length, wins, losses, winRate, totalPnl,
+      total: filtered.length, wins, losses, winRate, totalPnl,
       divergence: { trades: divTrades.length, wins: divWins, winRate: divWinRate },
       entries,
     });

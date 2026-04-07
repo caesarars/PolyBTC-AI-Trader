@@ -78,7 +78,7 @@ export default function BotLogSidebar() {
   const fetchMeta = useCallback(async () => {
     try {
       const [logRes, statusRes, learnRes] = await Promise.all([
-        fetch("/api/bot/log"),
+        fetch("/api/bot/log?executedOnly=1"),
         fetch("/api/bot/status"),
         fetch("/api/bot/learning"),
       ]);
@@ -316,14 +316,9 @@ export default function BotLogSidebar() {
                 >
                   <LayoutList className="w-3.5 h-3.5" />
                   Trades
-                  {log.filter(e => e.decision === "WIN").length > 0 && (
-                    <span className="ml-1 px-1.5 py-0.5 rounded-full bg-yellow-400/20 text-yellow-300 text-[9px] font-bold">
-                      {log.filter(e => e.decision === "WIN").length}W
-                    </span>
-                  )}
-                  {log.filter(e => e.decision === "LOSS").length > 0 && (
-                    <span className="px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-400 text-[9px] font-bold">
-                      {log.filter(e => e.decision === "LOSS").length}L
+                  {log.length > 0 && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 text-[9px] font-bold">
+                      {log.length}
                     </span>
                   )}
                 </button>
@@ -352,8 +347,8 @@ export default function BotLogSidebar() {
                     {log.length === 0 ? (
                       <div className="flex flex-col items-center justify-center h-48 gap-3 text-zinc-600">
                         <Bot className="w-10 h-10 opacity-20" />
-                        <p className="text-sm">No trade decisions yet.</p>
-                        <p className="text-xs text-center">Start the bot to see decisions here.</p>
+                        <p className="text-sm">No executed trades yet.</p>
+                        <p className="text-xs text-center">Only orders that passed all validations and were executed appear here.</p>
                       </div>
                     ) : (
                       <>

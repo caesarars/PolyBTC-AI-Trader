@@ -263,6 +263,7 @@ export default function BotDashboard() {
   const [resetConfLoading, setResetConfLoading] = useState(false);
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
+  const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
@@ -288,13 +289,14 @@ export default function BotDashboard() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
         fetch("/api/polymarket/automation").then((r) => r.json()),
         fetch("/api/polymarket/balance").then((r) => r.json()),
         fetch("/api/bot/trade-log?limit=50").then((r) => r.json()),
+        fetch("/api/bot/trade-log?days=7&limit=1000").then((r) => r.json()),
         fetch("/api/bot/momentum-history").then((r) => r.json()),
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
@@ -313,6 +315,7 @@ export default function BotDashboard() {
       }
       if (autoRes.status === "fulfilled") setAutomations((autoRes.value as any).automations || []);
       if (tradeLogRes.status === "fulfilled") setTradeLog(tradeLogRes.value as TradeLogStats);
+      if (sessionTradeLogRes.status === "fulfilled") setSessionTradeLog(sessionTradeLogRes.value as TradeLogStats);
       if (balRes.status === "fulfilled" && !(balRes.value as any).error) {
         setBalance((balRes.value as any).balance || "—");
       }
@@ -522,30 +525,28 @@ export default function BotDashboard() {
 
   // Build cumulative PnL series from WIN/LOSS log entries
   const pnlHistory = useMemo(() => {
-    const results = [...log]
-      .filter((e) => e.decision === "WIN" || e.decision === "LOSS")
-      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    const results = [...(sessionTradeLog?.entries ?? [])]
+      .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 
     let cumulative = 0;
     return results.map((entry, i) => {
-      // Compute PnL directly from entry data — avoids string parsing bugs
-      const betAmount  = entry.tradeAmount  ?? 0;
-      const entryPrice = entry.tradePrice   ?? 0.5;
-      // WIN: bought (betAmount / entryPrice) shares, each pays $1 → net = payout - cost
-      // LOSS: shares settle at $0 → net = -betAmount
-      const tradePnl = entry.decision === "WIN"
-        ? parseFloat(((betAmount / entryPrice) - betAmount).toFixed(2))
-        : parseFloat((-betAmount).toFixed(2));
+      const tradePnl = parseFloat(entry.pnl.toFixed(2));
       cumulative = parseFloat((cumulative + tradePnl).toFixed(2));
       return {
         label: `#${i + 1}`,
-        time: new Date(entry.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
+        time: new Date(entry.ts).toLocaleString("en-US", {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }),
         trade: tradePnl,
         cumulative,
-        decision: entry.decision,
+        decision: entry.result,
       };
     });
-  }, [log]);
+  }, [sessionTradeLog]);
 
   const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
 
@@ -819,7 +820,7 @@ export default function BotDashboard() {
             <LineChartIcon className="w-4 h-4" />
             Session PnL
             <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
-              {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
+              last 7 days · {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
             </span>
           </h3>
           {pnlHistory.length > 0 && (
@@ -835,7 +836,7 @@ export default function BotDashboard() {
         {pnlHistory.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
             <BarChart3 className="w-8 h-8 opacity-30" />
-            <p className="text-xs">No resolved trades yet — chart appears after first WIN or LOSS</p>
+            <p className="text-xs">No resolved trades in the last 7 days</p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={180}>
