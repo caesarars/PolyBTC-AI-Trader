@@ -1209,7 +1209,7 @@ export default function BotDashboard() {
                               <span className="text-zinc-500">{entry.direction}</span>
                               <span className="text-zinc-500">conf {entry.confidence}%</span>
                               {entry.entryPrice !== null && <span className="text-zinc-500">entry {(entry.entryPrice * 100).toFixed(1)}c</span>}
-                              {entry.model?.probability !== null && <span className="text-cyan-400">alpha {(entry.model.probability * 100).toFixed(1)}%</span>}
+                              {entry.model?.probability != null && <span className="text-cyan-400">alpha {(entry.model.probability * 100).toFixed(1)}%</span>}
                             </div>
                             {entry.filterReasons[0] && (
                               <div className="text-[10px] text-zinc-600 mt-1 truncate">{entry.filterReasons[0]}</div>
@@ -2411,7 +2411,7 @@ export default function BotDashboard() {
                       </span>
                     </span>
                   )}
-                  {snap.alphaModel?.probability !== null && (
+                  {snap.alphaModel?.probability != null && (
                     <span className={cn(
                       "px-2 py-0.5 rounded-full font-bold border",
                       snap.alphaModel.shouldTrade
@@ -2421,7 +2421,7 @@ export default function BotDashboard() {
                       Alpha {(snap.alphaModel.probability * 100).toFixed(1)}%
                     </span>
                   )}
-                  {snap.alphaModel?.edge !== null && (
+                  {snap.alphaModel?.edge != null && (
                     <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
                       Model edge {(snap.alphaModel.edge * 100).toFixed(1)}c
                     </span>
