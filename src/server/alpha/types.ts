@@ -60,6 +60,12 @@ export interface DecisionLogEntry {
   estimatedBet: number | null;
   btcPrice: number | null;
   strikePrice: number | null;
+  priceToBeatOpen: number | null;
+  priceToBeatCurrent: number | null;
+  priceToBeatDistance: number | null;
+  priceToBeatDirection: "UP" | "DOWN" | "FLAT" | null;
+  priceToBeatSource: string | null;
+  priceToBeatMode: "proxy" | "chainlink" | null;
   windowElapsedSeconds: number;
   imbalanceSignal: string | null;
   signalScore: number | null;

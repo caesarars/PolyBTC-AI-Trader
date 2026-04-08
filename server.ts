@@ -1551,6 +1551,103 @@ interface DivergenceState {
 const divergenceStateByAsset = new Map<TradingAsset, DivergenceState>();
 let divergenceTrackerInterval: NodeJS.Timeout | null = null;
 
+interface PriceToBeatState {
+  asset: TradingAsset;
+  windowStart: number;
+  openingPrice: number;
+  openingSource: string;
+  openingCapturedAt: string;
+  currentPrice: number;
+  currentSource: string;
+  currentUpdatedAt: string;
+  mode: "proxy" | "chainlink";
+}
+
+interface PriceToBeatSnapshot {
+  windowStart: number;
+  openingPrice: number;
+  currentPrice: number;
+  distanceUsd: number;
+  distancePct: number;
+  direction: "UP" | "DOWN" | "FLAT";
+  favoredOutcome: "UP" | "DOWN";
+  tieGoesToUp: true;
+  source: string;
+  mode: "proxy" | "chainlink";
+  updatedAt: string;
+}
+
+const priceToBeatStateByAsset = new Map<TradingAsset, PriceToBeatState>();
+
+function buildPriceToBeatSnapshot(state: PriceToBeatState): PriceToBeatSnapshot {
+  const distanceUsd = Number((state.currentPrice - state.openingPrice).toFixed(2));
+  const distancePct = state.openingPrice > 0
+    ? Number((((state.currentPrice - state.openingPrice) / state.openingPrice) * 100).toFixed(4))
+    : 0;
+  const direction =
+    distanceUsd > 0 ? "UP" :
+    distanceUsd < 0 ? "DOWN" :
+    "FLAT";
+  const favoredOutcome = distanceUsd >= 0 ? "UP" : "DOWN";
+
+  return {
+    windowStart: state.windowStart,
+    openingPrice: state.openingPrice,
+    currentPrice: state.currentPrice,
+    distanceUsd,
+    distancePct,
+    direction,
+    favoredOutcome,
+    tieGoesToUp: true,
+    source: state.currentSource,
+    mode: state.mode,
+    updatedAt: state.currentUpdatedAt,
+  };
+}
+
+function updatePriceToBeatState(
+  asset: TradingAsset,
+  windowStart: number,
+  currentPrice: number | null | undefined,
+  source?: string | null,
+  mode: "proxy" | "chainlink" = "proxy"
+): PriceToBeatSnapshot | null {
+  if (!Number.isFinite(currentPrice) || !currentPrice || currentPrice <= 0) {
+    return getPriceToBeatSnapshot(asset, windowStart);
+  }
+
+  const normalizedSource = String(source || "unknown");
+  const nowIso = new Date().toISOString();
+  const existing = priceToBeatStateByAsset.get(asset);
+
+  if (!existing || existing.windowStart !== windowStart) {
+    const freshState: PriceToBeatState = {
+      asset,
+      windowStart,
+      openingPrice: Number(currentPrice),
+      openingSource: normalizedSource,
+      openingCapturedAt: nowIso,
+      currentPrice: Number(currentPrice),
+      currentSource: normalizedSource,
+      currentUpdatedAt: nowIso,
+      mode,
+    };
+    priceToBeatStateByAsset.set(asset, freshState);
+    return buildPriceToBeatSnapshot(freshState);
+  }
+
+  existing.currentPrice = Number(currentPrice);
+  existing.currentSource = normalizedSource;
+  existing.currentUpdatedAt = nowIso;
+  return buildPriceToBeatSnapshot(existing);
+}
+
+function getPriceToBeatSnapshot(asset: TradingAsset, windowStart: number): PriceToBeatSnapshot | null {
+  const state = priceToBeatStateByAsset.get(asset);
+  if (!state || state.windowStart !== windowStart) return null;
+  return buildPriceToBeatSnapshot(state);
+}
+
 // ── Current entry snapshot (shown in dashboard widget) ────────────────────────
 interface EntrySnapshot {
   market: string;
@@ -1563,6 +1660,7 @@ interface EntrySnapshot {
   riskLevel: string | null;
   estimatedBet: number | null;
   btcPrice: number | null;
+  priceToBeat: PriceToBeatSnapshot | null;
   asset?: TradingAsset;
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
@@ -1634,6 +1732,7 @@ function persistDecisionSnapshotFromSignal(params: {
   noPrice: number | null;
   estimatedBet?: number | null;
   btcPrice?: number | null;
+  priceToBeat?: PriceToBeatSnapshot | null;
   rsi?: number | null;
   emaCross?: string | null;
   signalScore?: number | null;
@@ -1694,6 +1793,12 @@ function persistDecisionSnapshotFromSignal(params: {
     estimatedBet: params.estimatedBet ?? null,
     btcPrice: params.btcPrice ?? null,
     strikePrice: extractStrikePrice(params.market.question || ""),
+    priceToBeatOpen: params.priceToBeat?.openingPrice ?? null,
+    priceToBeatCurrent: params.priceToBeat?.currentPrice ?? null,
+    priceToBeatDistance: params.priceToBeat?.distanceUsd ?? null,
+    priceToBeatDirection: params.priceToBeat?.direction ?? null,
+    priceToBeatSource: params.priceToBeat?.source ?? null,
+    priceToBeatMode: params.priceToBeat?.mode ?? null,
     windowElapsedSeconds: params.windowElapsedSeconds,
     imbalanceSignal: params.imbalanceSignal ?? null,
     signalScore: params.signalScore ?? null,
@@ -3391,11 +3496,19 @@ async function startServer() {
         const confidence = 78;
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
         if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
+        const nowWindowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
         const fastPriceGuardReason = getBtcPremiumEntryBlockReason(fastAsset, bestAsk, confidence, estimatedEdge);
         if (fastPriceGuardReason) {
           botPrint("SKIP", `[DIV FAST] ${fastPriceGuardReason}`);
           return;
         }
+        const fastPriceToBeat = updatePriceToBeatState(
+          fastAsset,
+          nowWindowStart,
+          divergenceStateByAsset.get(fastAsset)?.currentBtcPrice ?? null,
+          "divergence-proxy",
+          "proxy"
+        );
 
         // Kelly sizing — use last known balance (updated by bot cycle, fresh within ~30s)
         const balance = lastKnownBalance ?? botSessionStartBalance ?? 0;
@@ -3425,7 +3538,6 @@ async function startServer() {
         markTradeExecutionStarted(fastAsset, market.id);
         lastDivergenceFastTradeAt = now;
 
-        const nowWindowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
         const fastRec = {
           decision: "TRADE",
           direction,
@@ -3474,6 +3586,7 @@ async function startServer() {
             : Number(market.outcomePrices?.[1] ?? NaN) || null,
           estimatedBet: betAmount,
           btcPrice: null,
+          priceToBeat: fastPriceToBeat,
           divergenceDirection: direction,
           divergenceStrength: "STRONG",
           btcDelta30s: snapshot.btcDelta,
@@ -4125,6 +4238,7 @@ async function startServer() {
         for (const s of botExecutedTradesThisWindowByAsset.values()) s.clear();
         currentWindowAiCache.clear();
         currentExecutionQuote = null;
+        currentEntrySnapshot = null;
         botLastWindowStart = currentWindowStart;
         // Clear all per-asset YES ring buffers — old window's tokens are no longer valid
         for (const buf of yesRingBufferByAsset.values()) buf.length = 0;
@@ -4134,6 +4248,21 @@ async function startServer() {
         currentWindowNoTokenIdByAsset.clear();
         void resetPolymarketStream();
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
+        await Promise.all(ENABLED_ASSETS.map(async (asset) => {
+          try {
+            const priceData = await getAssetPrice(asset, true);
+            const numericPrice = priceData?.price ? Number(priceData.price) : null;
+            const snapshot = updatePriceToBeatState(asset, currentWindowStart, numericPrice, priceData?.source || null, "proxy");
+            if (snapshot && asset === "BTC") {
+              botPrint(
+                "INFO",
+                `[${asset}] Price to beat anchored @ $${snapshot.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })} (${snapshot.mode}:${snapshot.source})`
+              );
+            }
+          } catch (error: any) {
+            botPrint("WARN", `[${asset}] Failed to anchor price to beat: ${error?.message || "unknown error"}`);
+          }
+        }));
       }
 
       // Only trade in the valid entry zone
@@ -4207,6 +4336,7 @@ async function startServer() {
           let sentimentData: any;
           let orderBooks: Record<string, any>;
           let marketHistory: { t: number; yes: number; no: number }[];
+          let priceToBeat: PriceToBeatSnapshot | null = getPriceToBeatSnapshot(currentAsset, currentWindowStart);
 
           {
             // Fetch all data fresh (no prefetch)
@@ -4219,6 +4349,22 @@ async function startServer() {
                 .then((r) => r.data.data[0]).catch(() => null),
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+
+            const liveAssetPrice = btcPriceData?.price ? Number(btcPriceData.price) : null;
+            priceToBeat = updatePriceToBeatState(
+              currentAsset,
+              currentWindowStart,
+              liveAssetPrice,
+              btcPriceData?.source || null,
+              "proxy"
+            );
+            if (currentAsset === "BTC" && priceToBeat) {
+              const beatSign = priceToBeat.distanceUsd >= 0 ? "+" : "";
+              botPrint(
+                "INFO",
+                `Price to beat: open=$${priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })} | now=$${priceToBeat.currentPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })} | delta=${beatSign}$${priceToBeat.distanceUsd.toFixed(2)} | favored=${priceToBeat.favoredOutcome}${priceToBeat.distanceUsd === 0 ? " (tie goes UP)" : ""} | ${priceToBeat.mode}:${priceToBeat.source}`
+              );
+            }
 
             // ── Strike price vs current price analysis ──────────────────────
             // Parse strike from question e.g. "Will BTC be above $95,500 at 12:05?"
@@ -4342,6 +4488,7 @@ async function startServer() {
             noPrice: noDecisionPrice,
             estimatedBet: payload.decision === "TRADE" ? getActiveConfig().fixedTradeUsdc : null,
             btcPrice: btcPriceData?.price ? Number(btcPriceData.price) : null,
+            priceToBeat,
             rsi: btcIndicatorsData?.rsi,
             emaCross: btcIndicatorsData?.emaCross,
             signalScore: btcIndicatorsData?.signalScore,
@@ -4636,6 +4783,7 @@ async function startServer() {
               riskLevel: rec.riskLevel,
               estimatedBet: rec.decision === "TRADE" ? getActiveConfig().fixedTradeUsdc : null,
               btcPrice: btcPriceData?.price ?? null,
+              priceToBeat,
               asset: currentAsset,
               divergence: div && div.strength !== "NONE"
                 ? { direction: div.direction, strength: div.strength, btcDelta30s: div.btcDelta30s, yesDelta30s: div.yesDelta30s }
