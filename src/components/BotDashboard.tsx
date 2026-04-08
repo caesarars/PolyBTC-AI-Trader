@@ -515,7 +515,7 @@ export default function BotDashboard() {
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
-  const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
+  const [fixedTradeInput, setFixedTradeInput] = useState<string>("");
   const [configSaving, setConfigSaving] = useState(false);
   const [configSaved, setConfigSaved] = useState(false);
   const [momentumHistory, setMomentumHistory] = useState<MomentumPoint[]>([]);
@@ -675,10 +675,11 @@ export default function BotDashboard() {
   const handleSaveConfig = async () => {
     const conf = confInput !== "" ? Number(confInput) : null;
     const edge = edgeInput !== "" ? Number(edgeInput) : null;
-    const fixedTradeUsdc = fixedTradeInput;
+    const fixedTradeUsdc = fixedTradeInput !== "" ? Number(fixedTradeInput) : null;
+    const maxFixedTradeUsdc = status?.config.maxBetUsdc ?? 250;
     if (conf !== null && (isNaN(conf) || conf < 50 || conf > 99)) return;
     if (edge !== null && (isNaN(edge) || edge < 0.01 || edge > 0.50)) return;
-    if (fixedTradeUsdc !== null && (!Number.isInteger(fixedTradeUsdc) || fixedTradeUsdc < 1 || fixedTradeUsdc > 5)) return;
+    if (fixedTradeUsdc !== null && (isNaN(fixedTradeUsdc) || fixedTradeUsdc < 0.1 || fixedTradeUsdc > maxFixedTradeUsdc)) return;
     setConfigSaving(true);
     try {
       await fetch("/api/bot/config", {
@@ -690,7 +691,7 @@ export default function BotDashboard() {
           ...(fixedTradeUsdc !== null && { fixedTradeUsdc }),
         }),
       });
-      setFixedTradeInput(null);
+      setFixedTradeInput("");
       setConfigSaved(true);
       setTimeout(() => setConfigSaved(false), 2000);
       await fetchAll();
@@ -771,6 +772,10 @@ export default function BotDashboard() {
       : null;
 
   const armedCount = automations.filter((a) => a.armed).length;
+  const parsedFixedTradeInput = fixedTradeInput !== "" ? Number(fixedTradeInput) : null;
+  const fixedTradePreview = parsedFixedTradeInput != null && Number.isFinite(parsedFixedTradeInput)
+    ? parsedFixedTradeInput
+    : (status?.config.fixedTradeUsdc ?? 1);
 
   // Build cumulative PnL series from WIN/LOSS log entries
   const pnlHistory = useMemo(() => {
@@ -2155,18 +2160,18 @@ export default function BotDashboard() {
               <div className="flex items-center justify-between text-[10px]">
                 <span className="text-zinc-400">Fixed Trade Size</span>
                 <span className="font-mono text-amber-400">
-                  ${(fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1).toFixed(2)}
-                  {fixedTradeInput !== null ? " (dipilih)" : " (aktif)"}
+                  ${fixedTradePreview.toFixed(2)}
+                  {fixedTradeInput !== "" ? " (manual)" : " (aktif)"}
                 </span>
               </div>
               <div className="grid grid-cols-5 gap-1.5">
                 {[1, 2, 3, 4, 5].map((amount) => {
-                  const selected = (fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1) === amount;
+                  const selected = fixedTradePreview === amount;
                   return (
                     <button
                       key={amount}
                       type="button"
-                      onClick={() => setFixedTradeInput(amount)}
+                      onClick={() => setFixedTradeInput(String(amount))}
                       className={cn(
                         "py-1.5 rounded-lg text-xs font-bold border transition-all",
                         selected
@@ -2179,8 +2184,37 @@ export default function BotDashboard() {
                   );
                 })}
               </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[10px]">
+                  <label htmlFor="fixed-trade-input" className="text-zinc-400">Manual Entry Value</label>
+                  <span className="font-mono text-zinc-600">0.10 - {(status?.config.maxBetUsdc ?? 250).toFixed(2)} USDC</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="fixed-trade-input"
+                    type="number"
+                    min={0.1}
+                    max={status?.config.maxBetUsdc ?? 250}
+                    step={0.1}
+                    inputMode="decimal"
+                    placeholder={`${(status?.config.fixedTradeUsdc ?? 1).toFixed(2)}`}
+                    value={fixedTradeInput}
+                    onChange={(e) => setFixedTradeInput(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-amber-500"
+                  />
+                  {fixedTradeInput !== "" && (
+                    <button
+                      type="button"
+                      onClick={() => setFixedTradeInput("")}
+                      className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-2 text-[10px] font-bold uppercase tracking-wider text-zinc-400 transition-colors hover:border-zinc-600 hover:text-white"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
               <div className="text-[9px] text-zinc-600">
-                Nominal buy per trade. Default awal tetap diambil dari `.env`, tapi pilihan ini override runtime.
+                Nominal buy per trade. Preset cepat tetap ada, tapi Anda sekarang bisa override runtime dengan nominal manual yang lebih presisi.
               </div>
             </div>
             {/* EV preview */}
@@ -2197,7 +2231,7 @@ export default function BotDashboard() {
             <button
               type="button"
               onClick={handleSaveConfig}
-              disabled={configSaving || (confInput === "" && edgeInput === "" && fixedTradeInput === null)}
+              disabled={configSaving || (confInput === "" && edgeInput === "" && fixedTradeInput === "")}
               className="w-full py-1.5 rounded-lg text-xs font-bold transition-all bg-zinc-700 text-zinc-300 hover:bg-emerald-600 hover:text-white disabled:opacity-40 disabled:cursor-default"
             >
               {configSaving ? "Saving…" : configSaved ? "✓ Saved" : "Apply"}
