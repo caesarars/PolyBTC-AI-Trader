@@ -5434,10 +5434,10 @@ async function startServer() {
     }
     if (fixedTradeUsdc !== undefined) {
       const val = Number(fixedTradeUsdc);
-      if (isNaN(val) || !Number.isInteger(val) || val < 1 || val > 5) {
-        return res.status(400).json({ error: "fixedTradeUsdc must be an integer 1–5" });
+      if (isNaN(val) || val < 0.1 || val > BOT_MAX_BET_USDC) {
+        return res.status(400).json({ error: `fixedTradeUsdc must be between 0.10 and ${BOT_MAX_BET_USDC.toFixed(2)}` });
       }
-      aggressiveFixedTradeUsdc = val;
+      aggressiveFixedTradeUsdc = parseFloat(val.toFixed(2));
     }
     const cfg = getActiveConfig();
     botPrint("INFO", `Config updated (AGGRESSIVE): conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢ fixed=$${aggressiveFixedTradeUsdc.toFixed(2)}`);
