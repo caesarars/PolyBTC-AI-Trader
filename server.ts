@@ -2017,6 +2017,7 @@ type PositionAutomationDocument = {
   stopLoss: string;
   trailingStop: string;
   armed: boolean;
+  strategyTag?: "STANDARD" | "FAST_PATH" | "CORRELATED";
   windowEnd?: number;       // unix seconds — when the 5-min market resolves
   highestPrice?: string;
   trailingStopPrice?: string;
@@ -2024,6 +2025,7 @@ type PositionAutomationDocument = {
   status?: string;
   lastExitOrderId?: string | null;
   updatedAt: Date;
+  enteredAt?: Date | null;
   lastTriggeredAt?: Date | null;
 };
 
@@ -3385,12 +3387,14 @@ async function startServer() {
       stopLoss: payload.stopLoss ?? existing?.stopLoss ?? "",
       trailingStop: payload.trailingStop ?? existing?.trailingStop ?? "",
       armed: payload.armed ?? existing?.armed ?? false,
+      strategyTag: payload.strategyTag ?? existing?.strategyTag ?? "STANDARD",
       highestPrice: payload.highestPrice ?? existing?.highestPrice,
       trailingStopPrice: payload.trailingStopPrice ?? existing?.trailingStopPrice,
       lastPrice: payload.lastPrice ?? existing?.lastPrice,
       status: payload.status ?? existing?.status ?? "Configured",
       lastExitOrderId: payload.lastExitOrderId ?? existing?.lastExitOrderId ?? null,
       updatedAt: new Date(),
+      enteredAt: payload.enteredAt ?? existing?.enteredAt ?? null,
       lastTriggeredAt: payload.lastTriggeredAt ?? existing?.lastTriggeredAt ?? null,
     };
 
@@ -3429,6 +3433,36 @@ async function startServer() {
       takeProfit: tpTarget.toFixed(2),
       stopLoss: slTarget.toFixed(2),
       trailingStop: trailingDistance.toFixed(2),
+    };
+  };
+
+  const recommendFastPathAutomationLevels = (averagePrice: number) => {
+    let tpTarget: number;
+    let slTarget: number;
+    let trailingDistance: number;
+
+    if (averagePrice < 0.40) {
+      tpTarget = Math.min(0.56, averagePrice + 0.09);
+      slTarget = Math.max(0.01, averagePrice - 0.06);
+      trailingDistance = 0.03;
+    } else if (averagePrice < 0.50) {
+      tpTarget = Math.min(0.58, averagePrice + 0.08);
+      slTarget = Math.max(0.01, averagePrice - 0.055);
+      trailingDistance = 0.03;
+    } else if (averagePrice < 0.65) {
+      tpTarget = Math.min(0.66, averagePrice + 0.07);
+      slTarget = Math.max(0.01, averagePrice - 0.05);
+      trailingDistance = 0.025;
+    } else {
+      tpTarget = Math.min(0.78, averagePrice + 0.06);
+      slTarget = Math.max(0.01, averagePrice - 0.045);
+      trailingDistance = 0.02;
+    }
+
+    return {
+      takeProfit: tpTarget.toFixed(2),
+      stopLoss: slTarget.toFixed(2),
+      trailingStop: trailingDistance.toFixed(3),
     };
   };
 
@@ -3601,7 +3635,7 @@ async function startServer() {
           `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(Gemini bypassed — STRONG divergence)`
         );
 
-        const levels = recommendAutomationLevels(bestAsk);
+        const levels = recommendFastPathAutomationLevels(bestAsk);
         await savePositionAutomation({
           assetId: tokenId,
           market: market.question || market.id,
@@ -3611,9 +3645,12 @@ async function startServer() {
           takeProfit: levels.takeProfit,
           stopLoss: levels.stopLoss,
           trailingStop: levels.trailingStop,
+          strategyTag: "FAST_PATH",
           windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
           armed: true,
+          enteredAt: new Date(),
         });
+        botPrint("OK", `FAST_PATH exit profile armed — TP ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS ${(parseFloat(levels.trailingStop) * 100).toFixed(1)}¢ | time-stop 40–120s | expiry lock <=30s`);
 
         pendingResults.set(tokenId, {
           eventSlug: `${ASSET_CONFIG[fastAsset].polySlugPrefix}-${nowWindowStart}`,
@@ -3721,8 +3758,10 @@ async function startServer() {
                 takeProfit: corrLevels.takeProfit,
                 stopLoss: corrLevels.stopLoss,
                 trailingStop: corrLevels.trailingStop,
+                strategyTag: "CORRELATED",
                 windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
                 armed: true,
+                enteredAt: new Date(),
               });
 
               pendingResults.set(corrTokenId, {
@@ -3820,6 +3859,8 @@ async function startServer() {
           const takeProfit = Number(automation.takeProfit || "0");
           const stopLoss   = Number(automation.stopLoss   || "0");
           const entryPrice = Number(automation.averagePrice || "0");
+          const strategyTag = automation.strategyTag || "STANDARD";
+          const isFastPathAutomation = strategyTag === "FAST_PATH";
 
           // ── Near-expiry forced exit ──────────────────────────────────────────
           // Binary markets collapse fast in the last minute — prices drop 20-30¢
@@ -3859,20 +3900,55 @@ async function startServer() {
           // ── Spike capture: early large move — take it before it reverses ────────
           // If within first 120s after entry the price has spiked +12¢, exit immediately.
           // Raised from +8¢/90s — early spikes at +8¢ often continue, cutting profit short.
-          const entryTimestamp = automation.lastTriggeredAt
+          const entryTimestamp = automation.enteredAt
+            ? Math.floor(new Date(automation.enteredAt).getTime() / 1000)
+            : automation.lastTriggeredAt
             ? Math.floor(new Date(automation.lastTriggeredAt).getTime() / 1000)
             : 0;
           const secondsSinceEntry = entryTimestamp > 0 ? nowSeconds - entryTimestamp : 9999;
           if (!triggerReason && entryPrice > 0 && secondsSinceEntry <= 120) {
             const spikeGain = currentPrice - entryPrice;
-            if (spikeGain >= 0.12) {
+            const spikeThreshold = isFastPathAutomation ? 0.08 : 0.12;
+            if (spikeGain >= spikeThreshold) {
               triggerReason = `spike capture (+${(spikeGain * 100).toFixed(0)}¢ in ${secondsSinceEntry}s — taking early gain)`;
+            }
+          }
+
+          // ── FAST PATH: time-stop if divergence fails to continue ─────────────
+          // These trades are meant to capture a short repricing, not sit flat.
+          if (!triggerReason && isFastPathAutomation && entryPrice > 0 && secondsSinceEntry >= 40 && secondsSinceEntry <= 120) {
+            const gain = currentPrice - entryPrice;
+            if (gain <= 0.01) {
+              triggerReason = `fast-path time stop (${secondsSinceEntry}s since entry with only ${(gain * 100).toFixed(1)}¢ progress)`;
             }
           }
 
           // Near-expiry: exit any profitable position (prevents late-window reversal)
           if (!triggerReason && isNearExpiry && entryPrice > 0 && currentPrice > entryPrice * 1.005) {
             triggerReason = `near-expiry exit (${secondsToExpiry}s remaining — locking ${(((currentPrice / entryPrice) - 1) * 100).toFixed(1)}% gain)`;
+          }
+
+          // ── FAST PATH: tighter profit lock and expiry salvage ────────────────
+          if (!triggerReason && isFastPathAutomation && entryPrice > 0) {
+            const bestSeenGain = highestPrice - entryPrice;
+            const currentGain = currentPrice - entryPrice;
+
+            if (bestSeenGain >= 0.04 && trailingStopDistance > 0.02) {
+              await savePositionAutomation({
+                assetId: automation.assetId,
+                trailingStop: "0.02",
+                status: `FAST_PATH profit lock: peak ${(bestSeenGain * 100).toFixed(0)}¢ — trailing tightened to 2¢`,
+              });
+              botPrint("INFO", `[FAST EXIT] Peak ${(bestSeenGain * 100).toFixed(0)}¢ seen — trailing tightened to 2¢`);
+            }
+
+            if (!triggerReason && secondsToExpiry > 0 && secondsToExpiry <= 30) {
+              if (currentGain > 0) {
+                triggerReason = `fast-path expiry lock (${secondsToExpiry}s remaining — preserving ${(currentGain * 100).toFixed(1)}¢ gain)`;
+              } else if (bestSeenGain >= 0.03 && currentGain >= -0.01) {
+                triggerReason = `fast-path expiry salvage (${secondsToExpiry}s remaining after giving back from +${(bestSeenGain * 100).toFixed(0)}¢)`;
+              }
+            }
           }
 
           if (triggerReason) {
@@ -5147,8 +5223,10 @@ async function startServer() {
                       takeProfit: levels.takeProfit,
                       stopLoss: levels.stopLoss,
                       trailingStop: levels.trailingStop,
+                      strategyTag: "STANDARD",
                       windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
                       armed: true,
+                      enteredAt: new Date(),
                     });
 
                     botSessionTradesCount++;
