@@ -51,6 +51,19 @@ interface EntrySnapshot {
   riskLevel: string | null;
   estimatedBet: number | null;
   btcPrice: number | null;
+  priceToBeat: {
+    windowStart: number;
+    openingPrice: number;
+    currentPrice: number;
+    distanceUsd: number;
+    distancePct: number;
+    direction: "UP" | "DOWN" | "FLAT";
+    favoredOutcome: "UP" | "DOWN";
+    tieGoesToUp: true;
+    source: string;
+    mode: "proxy" | "chainlink";
+    updatedAt: string;
+  } | null;
   asset?: string; // "BTC"
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
@@ -2425,6 +2438,21 @@ export default function BotDashboard() {
                       ${snap.estimatedBet.toFixed(2)} fixed
                     </span>
                   )}
+                  {snap.priceToBeat && (
+                    <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
+                      Beat ${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                    </span>
+                  )}
+                  {snap.priceToBeat && (
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.priceToBeat.favoredOutcome === "UP"
+                        ? "bg-green-500/10 text-green-400 border-green-500/30"
+                        : "bg-red-500/10 text-red-400 border-red-500/30"
+                    )}>
+                      vs Beat {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(0)} · {snap.priceToBeat.favoredOutcome}
+                    </span>
+                  )}
                   {oppPrice !== null && (
                     <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-500 border border-zinc-700">
                       Opp {(oppPrice * 100).toFixed(1)}¢
@@ -2497,6 +2525,29 @@ export default function BotDashboard() {
                           {reason}
                         </div>
                       ))}
+                    </div>
+                  </div>
+                )}
+
+                {snap.priceToBeat && (
+                  <div className="rounded-xl border border-zinc-700/40 bg-zinc-900/40 p-3">
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">
+                        Price To Beat
+                      </span>
+                      <span className="text-[10px] text-zinc-500 font-mono">
+                        {snap.priceToBeat.mode}:{snap.priceToBeat.source}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-[11px] text-zinc-400">
+                      <div>Open ${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</div>
+                      <div>Now ${snap.priceToBeat.currentPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</div>
+                      <div>
+                        Delta {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(2)} ({snap.priceToBeat.distancePct >= 0 ? "+" : ""}{snap.priceToBeat.distancePct.toFixed(3)}%)
+                      </div>
+                      <div>
+                        Favored {snap.priceToBeat.favoredOutcome}{snap.priceToBeat.direction === "FLAT" ? " · tie -> UP" : ""}
+                      </div>
                     </div>
                   </div>
                 )}

@@ -189,19 +189,20 @@ async function executeTrade(asset: Asset, direction: Direction, tokenId: string,
   const orderSize = betAmount / price;
   const [tickSize, negRisk] = await Promise.all([client.getTickSize(tokenId), client.getNegRisk(tokenId)]);
 
-  const order = await client.createOrder({
-    tokenID:   tokenId,
-    price:     price,
-    side:      Side.BUY,
-    size:      orderSize,
-    feeRateBps: 0,
-    orderType: OrderType.GTC,
-    nonce:     0,
-    expiration: 0,
-    taker:     "",
-  });
-
-  const resp = await client.postOrder(order, OrderType.GTC);
+  const resp = await client.createAndPostOrder(
+    {
+      tokenID: tokenId,
+      price,
+      side: Side.BUY,
+      size: orderSize,
+      feeRateBps: 0,
+      nonce: 0,
+      expiration: 0,
+      taker: "",
+    },
+    { tickSize, negRisk },
+    OrderType.GTC
+  );
   return { orderID: (resp as any).orderID ?? (resp as any).id ?? "?", status: (resp as any).status ?? "submitted", price, size: orderSize };
 }
 
