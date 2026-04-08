@@ -5266,6 +5266,37 @@ async function startServer() {
     });
   });
 
+  app.post("/api/notifications/test-telegram", async (req, res) => {
+    const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
+    const telegramChatId = process.env.TELEGRAM_CHAT_ID;
+    if (!telegramToken || !telegramChatId) {
+      return res.status(400).json({ error: "Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID." });
+    }
+
+    const customMessage = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const message =
+      customMessage ||
+      `🧪 <b>Telegram Test</b>\nBot: PolyBTC AI Trader\nTime: ${new Date().toLocaleString("en-US", { hour12: false })}\nStatus: local notification test`;
+
+    try {
+      const response = await axios.post(
+        `https://api.telegram.org/bot${telegramToken}/sendMessage`,
+        { chat_id: telegramChatId, text: message, parse_mode: "HTML" },
+        { timeout: 5000 }
+      );
+      return res.json({
+        ok: true,
+        telegram: true,
+        result: response.data?.result ?? null,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        error: "Failed to send Telegram test notification",
+        detail: error?.response?.data?.description || error?.message || String(error),
+      });
+    }
+  });
+
   app.post("/api/backtest", async (_req, res) => {
     try {
       const historyResult = await getBtcHistory();
