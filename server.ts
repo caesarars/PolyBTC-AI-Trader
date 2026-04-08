@@ -398,6 +398,40 @@ function getBtcPremiumEntryBlockReason(
   return null;
 }
 
+function getRequiredMinConfidence(params: {
+  baseMinConfidence: number;
+  minEdge: number;
+  direction?: string | null;
+  divergenceDirection?: string | null;
+  divergenceStrength?: string | null;
+  entryPrice?: number | null;
+  estimatedEdge?: number | null;
+}): number {
+  const divergenceStrength = String(params.divergenceStrength || "").toUpperCase();
+  const direction = String(params.direction || "").toUpperCase();
+  const divergenceDirection = String(params.divergenceDirection || "").toUpperCase();
+  const entryPrice = Number(params.entryPrice);
+  const estimatedEdge = Number(params.estimatedEdge);
+
+  const isAlignedStrongDivergence =
+    divergenceStrength === "STRONG" &&
+    direction !== "" &&
+    direction === divergenceDirection;
+  const hasReasonablePrice =
+    Number.isFinite(entryPrice) &&
+    entryPrice > 0 &&
+    entryPrice <= 0.80;
+  const hasHealthyEdge =
+    Number.isFinite(estimatedEdge) &&
+    estimatedEdge >= Math.max(params.minEdge, 0.20);
+
+  if (isAlignedStrongDivergence && hasReasonablePrice && hasHealthyEdge) {
+    return Math.min(params.baseMinConfidence, 72);
+  }
+
+  return params.baseMinConfidence;
+}
+
 type QuoteSide = "BUY" | "SELL";
 type QuoteAmountMode = "SPEND" | "SIZE";
 
@@ -1203,8 +1237,17 @@ function getReplayBlockReasons(
     reasons.push("BTC-only market scope");
     return reasons;
   }
-  if (confidence < config.minConfidence) {
-    reasons.push(`Confidence ${confidence}% < ${config.minConfidence}%`);
+  const requiredMinConfidence = getRequiredMinConfidence({
+    baseMinConfidence: config.minConfidence,
+    minEdge: config.minEdge,
+    direction: entry.direction,
+    divergenceDirection: entry.divergenceDirection,
+    divergenceStrength: entry.divergenceStrength,
+    entryPrice,
+    estimatedEdge: edge,
+  });
+  if (confidence < requiredMinConfidence) {
+    reasons.push(`Confidence ${confidence}% < ${requiredMinConfidence}%`);
   }
   if (edge < config.minEdge) {
     reasons.push(`Edge ${(edge * 100).toFixed(1)}c < ${(config.minEdge * 100).toFixed(1)}c`);
@@ -4538,12 +4581,28 @@ async function startServer() {
           );
           botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
 
+          const decisionEntryPrice =
+            rec.direction === "UP"
+              ? yesDecisionPrice
+              : rec.direction === "DOWN"
+                ? noDecisionPrice
+                : null;
+          const requiredMinConfidence = getRequiredMinConfidence({
+            baseMinConfidence: effectiveMinConf,
+            minEdge: cfg.minEdge,
+            direction: rec.direction,
+            divergenceDirection: div?.direction ?? null,
+            divergenceStrength: div?.strength ?? null,
+            entryPrice: decisionEntryPrice,
+            estimatedEdge: rec.estimatedEdge,
+          });
+
           const alphaModel = buildAlphaModelSnapshot({
             asset: currentAsset,
             direction: rec.direction,
             confidence: rec.confidence,
             edge: rec.estimatedEdge,
-            entryPrice: rec.direction === "UP" ? yesDecisionPrice : rec.direction === "DOWN" ? noDecisionPrice : null,
+            entryPrice: decisionEntryPrice,
             riskLevel: rec.riskLevel,
             imbalanceSignal: yesImbalanceSignal,
             signalScore: btcIndicatorsData?.signalScore,
@@ -4627,13 +4686,13 @@ async function startServer() {
 
           const qualifies =
             rec.decision === "TRADE" &&
-            rec.confidence >= effectiveMinConf &&
+            rec.confidence >= requiredMinConfidence &&
             rec.estimatedEdge >= cfg.minEdge &&
             rec.riskLevel !== "HIGH";
 
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
-            if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
+            if (rec.confidence < requiredMinConfidence) reasons.push(`conf ${rec.confidence}% < ${requiredMinConfidence}% (effective gate)`);
             if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}¢ < ${cfg.minEdge}¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")} | re-check enabled`);
