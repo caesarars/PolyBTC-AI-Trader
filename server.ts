@@ -4154,9 +4154,15 @@ async function startServer() {
               continue;
             }
 
+            // Use 98% of recorded size to account for the gap between theoretical
+            // order size (parsedAmount / price) and actual tokens received after
+            // fees / partial fills. Submitting the full size causes
+            // "balance not enough" errors when actual holding is slightly less.
+            const rawSize = Number(automation.size || "0");
+            const exitSize = rawSize > 0 ? (rawSize * 0.98).toFixed(6) : automation.size;
             const exit = await executePolymarketTrade({
               tokenID: automation.assetId,
-              amount: automation.size,
+              amount: exitSize,
               side: Side.SELL,
               price: executionPrice.toFixed(4),
               executionMode: "AGGRESSIVE",
