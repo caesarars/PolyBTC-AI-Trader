@@ -305,6 +305,7 @@ let btcHistoryCache: { data: BtcCandle[]; expiresAt: number } | null = null;
 let btcPriceCache: { data: { symbol: string; price: string; source?: string }; expiresAt: number } | null = null;
 let btcIndicatorsCache: { data: any; expiresAt: number } | null = null;
 let chainlinkBtcPriceCache: { price: number; updatedAt: Date; expiresAt: number } | null = null;
+let chainlinkConsecutiveFails = 0; // suppress repeated WARN logs when all RPCs are down
 let mongoDb: Db | null = null;
 let mongoInitPromise: Promise<Db | null> | null = null;
 let btcSyncInterval: NodeJS.Timeout | null = null;
@@ -2685,39 +2686,68 @@ const CHAINLINK_ABI = [
   "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
 ];
 const CHAINLINK_RPC_URLS = [
-  "https://rpc.ankr.com/eth",        // No API key needed
-  "https://cloudflare-eth.com",      // Cloudflare public RPC
-  "https://eth.llamarpc.com",        // LlamaNodes public RPC
+  "https://ethereum.publicnode.com",  // PublicNode — most reliable free RPC
+  "https://rpc.ankr.com/eth",         // Ankr
+  "https://1rpc.io/eth",              // 1RPC — privacy-focused, reliable
+  "https://eth.llamarpc.com",         // LlamaNodes
+  "https://cloudflare-eth.com",       // Cloudflare
 ];
-const CHAINLINK_CACHE_MS = 15_000; // 15s — Chainlink updates every ~20-30s
+const CHAINLINK_CACHE_MS = 20_000;       // 20s cache — Chainlink updates every ~20-30s
+const CHAINLINK_STALE_GRACE_MS = 90_000; // use stale cache up to 90s before giving up
 
 async function getChainlinkBtcPrice(forceRefresh = false): Promise<{ price: number; updatedAt: Date; source: "chainlink" } | null> {
-  if (!forceRefresh && chainlinkBtcPriceCache && chainlinkBtcPriceCache.expiresAt > Date.now()) {
+  const now = Date.now();
+
+  // Serve from fresh cache — skip network entirely
+  if (!forceRefresh && chainlinkBtcPriceCache && chainlinkBtcPriceCache.expiresAt > now) {
     return { price: chainlinkBtcPriceCache.price, updatedAt: chainlinkBtcPriceCache.updatedAt, source: "chainlink" };
   }
 
-  for (const rpcUrl of CHAINLINK_RPC_URLS) {
-    try {
-      const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-      const feed = new ethers.Contract(CHAINLINK_BTC_USD_ADDRESS, CHAINLINK_ABI, provider);
-      const [, answer, , updatedAt] = await Promise.race([
-        feed.latestRoundData() as Promise<[any, any, any, any, any]>,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 5_000)),
-      ]);
-      const price = Number(answer) / 1e8; // Chainlink BTC/USD has 8 decimals
-      const updatedAtDate = new Date(Number(updatedAt) * 1000);
-      chainlinkBtcPriceCache = { price, updatedAt: updatedAtDate, expiresAt: Date.now() + CHAINLINK_CACHE_MS };
-      return { price, updatedAt: updatedAtDate, source: "chainlink" };
-    } catch {
-      // Try next RPC
-    }
-  }
-
-  // All RPCs failed — return stale cache if available
-  if (chainlinkBtcPriceCache) {
+  // Stale cache still within grace window? Use it while fetching in background doesn't apply here,
+  // but at least don't block the caller for 15s — return stale immediately if very recent
+  if (chainlinkBtcPriceCache && now - chainlinkBtcPriceCache.expiresAt < CHAINLINK_STALE_GRACE_MS) {
+    // Still serve stale; try to refresh in parallel without blocking
+    void (async () => {
+      const fresh = await _fetchChainlinkFromRpcs();
+      if (fresh) {
+        chainlinkBtcPriceCache = { price: fresh.price, updatedAt: fresh.updatedAt, expiresAt: Date.now() + CHAINLINK_CACHE_MS };
+        chainlinkConsecutiveFails = 0;
+      }
+    })();
     return { price: chainlinkBtcPriceCache.price, updatedAt: chainlinkBtcPriceCache.updatedAt, source: "chainlink" };
   }
+
+  // No usable cache — must fetch synchronously
+  const fresh = await _fetchChainlinkFromRpcs();
+  if (fresh) {
+    chainlinkBtcPriceCache = { price: fresh.price, updatedAt: fresh.updatedAt, expiresAt: Date.now() + CHAINLINK_CACHE_MS };
+    chainlinkConsecutiveFails = 0;
+    return { price: fresh.price, updatedAt: fresh.updatedAt, source: "chainlink" };
+  }
+
+  chainlinkConsecutiveFails++;
   return null;
+}
+
+// Fire all RPCs in parallel — return the first successful response
+async function _fetchChainlinkFromRpcs(): Promise<{ price: number; updatedAt: Date } | null> {
+  const tryRpc = async (rpcUrl: string): Promise<{ price: number; updatedAt: Date }> => {
+    const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    const feed = new ethers.Contract(CHAINLINK_BTC_USD_ADDRESS, CHAINLINK_ABI, provider);
+    const [, answer, , updatedAt] = await Promise.race([
+      feed.latestRoundData() as Promise<[any, any, any, any, any]>,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 3_000)),
+    ]);
+    const price = Number(answer) / 1e8;
+    if (!price || price < 1000) throw new Error("invalid price");
+    return { price, updatedAt: new Date(Number(updatedAt) * 1000) };
+  };
+
+  try {
+    return await Promise.any(CHAINLINK_RPC_URLS.map(tryRpc));
+  } catch {
+    return null;
+  }
 }
 
 function computeBtcIndicatorsFromHistory(history: BtcCandle[]) {
@@ -4519,7 +4549,7 @@ async function startServer() {
             let priceMode: "proxy" | "chainlink" = "proxy";
 
             if (asset === "BTC") {
-              const chainlinkData = await getChainlinkBtcPrice(true);
+              const chainlinkData = await getChainlinkBtcPrice();
               if (chainlinkData?.price) {
                 numericPrice = chainlinkData.price;
                 priceSource = "chainlink";
@@ -4534,7 +4564,7 @@ async function startServer() {
               numericPrice = priceData?.price ? Number(priceData.price) : null;
               priceSource = priceData?.source || "spot";
               priceMode = "proxy";
-              if (asset === "BTC" && numericPrice) {
+              if (asset === "BTC" && numericPrice && chainlinkConsecutiveFails <= 1) {
                 botPrint("WARN", `[BTC] Chainlink unavailable — falling back to spot ($${numericPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })})`);
               }
             }
