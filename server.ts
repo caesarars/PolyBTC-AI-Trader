@@ -87,6 +87,21 @@ function loadTradeLog(): TradeLogEntry[] {
   }
 }
 
+// Trim a JSONL file to keep only the last `maxLines` entries.
+// Called at startup and periodically so log files never grow unbounded.
+function trimJsonlFile(filePath: string, maxLines: number): void {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const lines = fs.readFileSync(filePath, "utf8").split("\n").filter(Boolean);
+    if (lines.length <= maxLines) return;
+    const trimmed = lines.slice(lines.length - maxLines);
+    fs.writeFileSync(filePath, trimmed.join("\n") + "\n", "utf8");
+    console.log(`[Persist] Trimmed ${filePath}: ${lines.length} → ${trimmed.length} lines`);
+  } catch (e: any) {
+    console.error("[Persist] Failed to trim", filePath, e.message);
+  }
+}
+
 function filterTradeLogByDays(entries: TradeLogEntry[], days?: number): TradeLogEntry[] {
   if (!Number.isFinite(days) || !days || days <= 0) return entries;
   const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -110,9 +125,18 @@ function saveDecisionSnapshot(entry: AlphaDecisionLogEntry): void {
   });
 }
 
+const DECISION_LOG_MAX_LINES = 2000;  // keep last 2000 decisions (~2MB max)
+const TRADE_LOG_MAX_LINES    = 500;   // keep last 500 trades
+
+// Trim log files at startup so they never balloon across restarts
+trimJsonlFile(DECISION_LOG_FILE, DECISION_LOG_MAX_LINES);
+trimJsonlFile(TRADE_LOG_FILE, TRADE_LOG_MAX_LINES);
+
 function loadDecisionSnapshots(): AlphaDecisionLogEntry[] {
   try {
-    return loadPersistedDecisionLog(DECISION_LOG_FILE);
+    const all = loadPersistedDecisionLog(DECISION_LOG_FILE);
+    // Never load more than the cap into RAM — newest first for API responses
+    return all.length > DECISION_LOG_MAX_LINES ? all.slice(-DECISION_LOG_MAX_LINES) : all;
   } catch (e: any) {
     console.error("[Persist] Failed to read decision_log.jsonl:", e.message);
     return [];
@@ -6536,6 +6560,12 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+
+  // Trim log files every hour so they never grow unbounded between restarts
+  setInterval(() => {
+    trimJsonlFile(DECISION_LOG_FILE, DECISION_LOG_MAX_LINES);
+    trimJsonlFile(TRADE_LOG_FILE, TRADE_LOG_MAX_LINES);
+  }, 60 * 60 * 1000);
 }
 
 startServer();

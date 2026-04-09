@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Runtime data — never commit these (they grow large and change every cycle)
+data/decision_log.jsonl
+data/trade_log.jsonl
+data/loss_memory.json
