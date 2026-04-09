@@ -5287,6 +5287,35 @@ async function startServer() {
             botPrint("INFO", `DOWN filter: RSI=${rsi?.toFixed(1) ?? "?"} signalScore=${signalScore ?? "?"} ✓`);
           }
 
+          // ── Price-to-beat alignment gate ─────────────────────────────────────
+          // Chainlink data tells us whether BTC is currently above or below the
+          // window opening price. Betting against that reality is a coin-flip at best.
+          // Only block when Chainlink data is available and the gap is meaningful (>$30).
+          if (priceToBeat && priceToBeat.mode === "chainlink" && Math.abs(priceToBeat.distanceUsd) >= 30) {
+            const ptbOpposesDirection =
+              (rec.direction === "UP" && priceToBeat.favoredOutcome === "DOWN") ||
+              (rec.direction === "DOWN" && priceToBeat.favoredOutcome === "UP");
+
+            if (ptbOpposesDirection) {
+              const gapStr = `${priceToBeat.distanceUsd >= 0 ? "+" : ""}$${priceToBeat.distanceUsd.toFixed(0)}`;
+              botPrint("SKIP", `Price-to-beat misalign: betting ${rec.direction} but BTC is ${gapStr} vs open (favors ${priceToBeat.favoredOutcome}) — skipped`);
+              captureDecisionSnapshot({
+                decision: "TRADE",
+                action: "FILTERED",
+                direction: rec.direction,
+                confidence: rec.confidence,
+                edge: rec.estimatedEdge,
+                riskLevel: rec.riskLevel,
+                reasoning: rec.reasoning,
+                filterReasons: [`Price-to-beat misalign: ${rec.direction} vs Chainlink delta ${gapStr} (favors ${priceToBeat.favoredOutcome})`],
+              });
+              analyzedThisWindow.delete(market.id);
+              pushSSE("cycle", { ts: new Date().toISOString() });
+              continue;
+            }
+            botPrint("INFO", `Price-to-beat: ${rec.direction} aligned with Chainlink delta ${priceToBeat.distanceUsd >= 0 ? "+" : ""}$${priceToBeat.distanceUsd.toFixed(0)} (favors ${priceToBeat.favoredOutcome}) ✓`);
+          }
+
           const logEntry: BotLogEntry = {
             timestamp: new Date().toISOString(),
             market: market.question || market.id,
