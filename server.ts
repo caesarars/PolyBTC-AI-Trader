@@ -384,11 +384,16 @@ function getActiveConfig() {
   };
 }
 
+const POLYMARKET_MIN_ORDER_USDC = 5.0; // Polymarket rejects orders below $5
+
 function getFixedEntryBetAmount(balance: number): number {
   if (!Number.isFinite(balance) || balance <= 0) return 0;
   const reserve = Math.min(1.0, balance * 0.10);
   const spendable = Math.max(0, balance - reserve);
-  return parseFloat(Math.min(getActiveConfig().fixedTradeUsdc, spendable).toFixed(2));
+  const raw = Math.min(getActiveConfig().fixedTradeUsdc, spendable);
+  // Never submit below Polymarket's minimum order size
+  if (raw < POLYMARKET_MIN_ORDER_USDC) return 0;
+  return parseFloat(raw.toFixed(2));
 }
 
 // ── Dynamic Kelly fraction based on confidence ────────────────────────────────
@@ -3677,7 +3682,7 @@ async function startServer() {
         const kelly = (p * b - (1 - p)) / b;
         if (kelly <= 0) return;
 
-        const MIN_BET = Math.min(0.50, balance * 0.20);
+        const MIN_BET = POLYMARKET_MIN_ORDER_USDC;
         const betAmount = getFixedEntryBetAmount(balance);
 
         if (betAmount < MIN_BET) {
@@ -5462,7 +5467,7 @@ async function startServer() {
                 }
 
                 // Minimum bet scales with balance: floor at $0.50 or 20% of balance, whichever smaller
-                const MIN_BET = Math.min(0.50, currentBalance * 0.20);
+                const MIN_BET = POLYMARKET_MIN_ORDER_USDC;
 
                 // Entry sizing is fixed at the runtime-configured fixedTradeUsdc for every buy order.
                 const betAmount = getFixedEntryBetAmount(currentBalance);
