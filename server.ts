@@ -4125,21 +4125,25 @@ async function startServer() {
           });
         } catch (error: any) {
           const msg: string = error?.message || "";
-          // Order book gone → market resolved on-chain, disarm silently
+          // Order book gone → market resolved on-chain, disarm directly without going through
+          // savePositionAutomation (which does a full merge and could itself throw).
           if (msg.toLowerCase().includes("no orderbook exists") || msg.toLowerCase().includes("orderbook") || msg.toLowerCase().includes("token id")) {
-            botPrint("INFO", `[AUTOMATION] Market resolved (no orderbook) — disarming assetId ${automation.assetId?.slice(0, 12)}`);
-            await savePositionAutomation({
-              assetId: automation.assetId,
-              armed: false,
-              status: "Market resolved — order book removed (resolved on-chain)",
-              lastPrice: automation.lastPrice ?? "",
-            });
+            try {
+              await collection.updateOne(
+                { assetId: automation.assetId },
+                { $set: { armed: false, status: "Market resolved — order book removed", updatedAt: new Date() } }
+              );
+            } catch {
+              // If the DB write fails, we still don't want to log noise — just skip
+            }
           } else {
             botError("automation", `Position monitor failed for assetId ${automation.assetId?.slice(0,12)}`, error);
-            await savePositionAutomation({
-              assetId: automation.assetId,
-              status: `Monitor error: ${msg || "Unknown error"}`,
-            });
+            try {
+              await collection.updateOne(
+                { assetId: automation.assetId },
+                { $set: { status: `Monitor error: ${msg || "Unknown error"}`, updatedAt: new Date() } }
+              );
+            } catch { /* ignore */ }
           }
         }
       }
