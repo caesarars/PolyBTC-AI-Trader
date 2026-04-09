@@ -4124,11 +4124,23 @@ async function startServer() {
             status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢${expiryLabel}`,
           });
         } catch (error: any) {
-          botError("automation", `Position monitor failed for assetId ${automation.assetId?.slice(0,12)}`, error);
-          await savePositionAutomation({
-            assetId: automation.assetId,
-            status: `Monitor error: ${error?.message || "Unknown error"}`,
-          });
+          const msg: string = error?.message || "";
+          // Order book gone → market resolved on-chain, disarm silently
+          if (msg.toLowerCase().includes("no orderbook exists") || msg.toLowerCase().includes("orderbook") || msg.toLowerCase().includes("token id")) {
+            botPrint("INFO", `[AUTOMATION] Market resolved (no orderbook) — disarming assetId ${automation.assetId?.slice(0, 12)}`);
+            await savePositionAutomation({
+              assetId: automation.assetId,
+              armed: false,
+              status: "Market resolved — order book removed (resolved on-chain)",
+              lastPrice: automation.lastPrice ?? "",
+            });
+          } else {
+            botError("automation", `Position monitor failed for assetId ${automation.assetId?.slice(0,12)}`, error);
+            await savePositionAutomation({
+              assetId: automation.assetId,
+              status: `Monitor error: ${msg || "Unknown error"}`,
+            });
+          }
         }
       }
     } finally {
