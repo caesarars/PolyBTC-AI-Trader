@@ -3624,9 +3624,10 @@ async function startServer() {
           return;
         }
 
-        const confidence = 82;
+        // Use the active dashboard config — no hardcoded confidence override.
+        const confidence = cfg.minConfidence;
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
-        if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
+        if (estimatedEdge < cfg.minEdge) return;
         const nowWindowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
         const fastPriceGuardReason = getBtcPremiumEntryBlockReason(fastAsset, bestAsk, confidence, estimatedEdge);
         if (fastPriceGuardReason) {

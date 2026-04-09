@@ -2544,7 +2544,7 @@ export default function BotDashboard() {
                         ? "bg-green-500/10 text-green-400 border-green-500/30"
                         : "bg-red-500/10 text-red-400 border-red-500/30"
                     )}>
-                      vs Beat {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(0)} · {snap.priceToBeat.favoredOutcome}
+                      Current {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(0)} vs open · {snap.priceToBeat.favoredOutcome}
                     </span>
                   )}
                   {oppPrice !== null && (
@@ -2646,11 +2646,11 @@ export default function BotDashboard() {
                     </div>
                     <div className="grid grid-cols-2 gap-2 text-[11px] text-zinc-400">
                       <div>
-                        <span className="text-zinc-600">Open</span>{" "}
+                        <span className="text-zinc-600">Open (to beat)</span>{" "}
                         <span className="font-mono text-zinc-200">${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</span>
                       </div>
                       <div>
-                        <span className="text-zinc-600">Now</span>{" "}
+                        <span className="text-zinc-600">Current Price</span>{" "}
                         <span className="font-mono text-zinc-200">${snap.priceToBeat.currentPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</span>
                       </div>
                       <div className={cn(
