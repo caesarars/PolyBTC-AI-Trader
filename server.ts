@@ -388,7 +388,9 @@ const POLYMARKET_MIN_ORDER_USDC = 5.0; // Polymarket rejects orders below $5
 
 function getFixedEntryBetAmount(balance: number): number {
   if (!Number.isFinite(balance) || balance <= 0) return 0;
-  const reserve = Math.min(1.0, balance * 0.10);
+  // When balance is tight, skip the reserve so we can still meet the $5 minimum.
+  // Reserve only applies when balance is comfortably above the minimum.
+  const reserve = balance > POLYMARKET_MIN_ORDER_USDC * 1.5 ? Math.min(1.0, balance * 0.10) : 0;
   const spendable = Math.max(0, balance - reserve);
   const raw = Math.min(getActiveConfig().fixedTradeUsdc, spendable);
   // Never submit below Polymarket's minimum order size
