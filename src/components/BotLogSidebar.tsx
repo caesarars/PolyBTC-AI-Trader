@@ -60,44 +60,62 @@ interface LearningState {
   lossMemoryCount: number;
 }
 
-type Tab = "trades" | "live";
+interface ErrorLogEntry {
+  ts: string;
+  level: "ERR" | "WARN";
+  step: string;
+  msg: string;
+  detail?: string;
+}
+
+type Tab = "trades" | "live" | "errors";
 
 export default function BotLogSidebar() {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<Tab>("live");
   const [log, setLog] = useState<BotLogEntry[]>([]);
   const [rawLog, setRawLog] = useState<RawLogEntry[]>([]);
+  const [errorLog, setErrorLog] = useState<ErrorLogEntry[]>([]);
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [learning, setLearning] = useState<LearningState | null>(null);
   const [unread, setUnread] = useState(0);
+  const [unreadErrors, setUnreadErrors] = useState(0);
   const [connected, setConnected] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
   const prevLogLen = useRef(0);
   const prevRawLen = useRef(0);
+  const prevErrLen = useRef(0);
 
   const fetchMeta = useCallback(async () => {
     try {
-      const [logRes, statusRes, learnRes] = await Promise.all([
+      const [logRes, statusRes, learnRes, errRes] = await Promise.all([
         fetch("/api/bot/log?executedOnly=1"),
         fetch("/api/bot/status"),
         fetch("/api/bot/learning"),
+        fetch("/api/bot/errorlog"),
       ]);
       const entries: BotLogEntry[] = (await logRes.json()).log || [];
       const statusData = await statusRes.json();
       const learnData  = await learnRes.json();
+      const errData: ErrorLogEntry[] = (await errRes.json()).log || [];
 
       const newTrades = entries.length > prevLogLen.current ? entries.length - prevLogLen.current : 0;
       if (!open && newTrades > 0) setUnread((u) => u + newTrades);
       prevLogLen.current = entries.length;
 
+      const newErrors = errData.length > prevErrLen.current ? errData.length - prevErrLen.current : 0;
+      if (tab !== "errors" && newErrors > 0) setUnreadErrors((u) => u + newErrors);
+      prevErrLen.current = errData.length;
+
       setLog(entries);
       setStatus(statusData);
       setLearning(learnData);
+      setErrorLog(errData);
       setConnected(true);
     } catch {
       setConnected(false);
     }
-  }, [open]);
+  }, [open, tab]);
 
   useEffect(() => {
     fetchMeta(); // initial load for trades / status / learning
@@ -119,6 +137,12 @@ export default function BotLogSidebar() {
       prevRawLen.current += 1;
     });
 
+    es.addEventListener("error-log", (e: MessageEvent) => {
+      const entry: ErrorLogEntry = JSON.parse(e.data);
+      setErrorLog((prev) => [entry, ...prev].slice(0, 200));
+      setUnreadErrors((u) => u + 1);
+    });
+
     es.addEventListener("cycle", () => {
       fetchMeta();
     });
@@ -138,6 +162,11 @@ export default function BotLogSidebar() {
   const handleOpen = () => {
     setOpen(true);
     setUnread(0);
+  };
+
+  const handleTabChange = (t: Tab) => {
+    setTab(t);
+    if (t === "errors") setUnreadErrors(0);
   };
 
   const windowRemaining = status ? 300 - status.windowElapsedSeconds : 0;
@@ -169,8 +198,18 @@ export default function BotLogSidebar() {
                 : "bg-zinc-600"
             )} />
 
+            {/* Error badge */}
+            {unreadErrors > 0 && (
+              <motion.span
+                initial={{ scale: 0 }}
+                animate={{ scale: 1 }}
+                className="absolute -top-1 -left-1 w-5 h-5 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center"
+              >
+                {unreadErrors > 9 ? "9+" : unreadErrors}
+              </motion.span>
+            )}
             {/* Unread badge */}
-            {unread > 0 && (
+            {unread > 0 && unreadErrors === 0 && (
               <motion.span
                 initial={{ scale: 0 }}
                 animate={{ scale: 1 }}
@@ -218,7 +257,7 @@ export default function BotLogSidebar() {
                   <div>
                     <p className="text-sm font-bold text-white leading-none">Bot Log</p>
                     <p className="text-[10px] text-zinc-500 mt-0.5">
-                      {status?.enabled ? (status.running ? "Running..." : "Idle") : "Stopped"} · {tab === "trades" ? log.length : rawLog.length} entries
+                      {status?.enabled ? (status.running ? "Running..." : "Idle") : "Stopped"} · {tab === "trades" ? log.length : tab === "errors" ? errorLog.length : rawLog.length} entries
                     </p>
                   </div>
                 </div>
@@ -245,6 +284,7 @@ export default function BotLogSidebar() {
 
                   <button
                     type="button"
+                    title="Close"
                     onClick={() => setOpen(false)}
                     className="text-zinc-500 hover:text-white transition-colors p-1"
                   >
@@ -294,21 +334,23 @@ export default function BotLogSidebar() {
               {/* ── Tab switcher ── */}
               <div className="flex border-b border-zinc-800 bg-zinc-900/40">
                 <button
-                  onClick={() => setTab("live")}
+                  type="button"
+                  onClick={() => handleTabChange("live")}
                   className={cn(
-                    "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium border-b-2 transition-colors",
+                    "flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 transition-colors",
                     tab === "live"
                       ? "border-blue-500 text-blue-400"
                       : "border-transparent text-zinc-500 hover:text-zinc-300"
                   )}
                 >
                   <Terminal className="w-3.5 h-3.5" />
-                  Live Log
+                  Live
                 </button>
                 <button
-                  onClick={() => setTab("trades")}
+                  type="button"
+                  onClick={() => handleTabChange("trades")}
                   className={cn(
-                    "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium border-b-2 transition-colors",
+                    "flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 transition-colors",
                     tab === "trades"
                       ? "border-blue-500 text-blue-400"
                       : "border-transparent text-zinc-500 hover:text-zinc-300"
@@ -322,11 +364,55 @@ export default function BotLogSidebar() {
                     </span>
                   )}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => handleTabChange("errors")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 transition-colors",
+                    tab === "errors"
+                      ? "border-red-500 text-red-400"
+                      : "border-transparent text-zinc-500 hover:text-zinc-300"
+                  )}
+                >
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  Errors
+                  {(errorLog.length > 0 || unreadErrors > 0) && (
+                    <span className={cn(
+                      "ml-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold",
+                      unreadErrors > 0
+                        ? "bg-red-500/30 text-red-400 animate-pulse"
+                        : "bg-red-500/10 text-red-500"
+                    )}>
+                      {unreadErrors > 0 ? unreadErrors : errorLog.length}
+                    </span>
+                  )}
+                </button>
               </div>
 
               {/* ── Log content ── */}
               <div className="flex-1 overflow-y-auto scroll-smooth">
-                {tab === "live" ? (
+                {tab === "errors" ? (
+                  <div className="px-3 py-3 space-y-2">
+                    {errorLog.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center h-48 gap-3 text-zinc-600">
+                        <AlertTriangle className="w-10 h-10 opacity-20" />
+                        <p className="text-sm">No errors recorded.</p>
+                        <p className="text-xs text-center">ERR and WARN from all workflow steps appear here.</p>
+                      </div>
+                    ) : (
+                      <>
+                        <div ref={topRef} />
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] text-zinc-600">{errorLog.length} error{errorLog.length !== 1 ? "s" : ""} (last 200)</span>
+                          <span className="text-[10px] text-zinc-600">newest first</span>
+                        </div>
+                        {errorLog.map((entry, i) => (
+                          <ErrorCard key={i} entry={entry} />
+                        ))}
+                      </>
+                    )}
+                  </div>
+                ) : tab === "live" ? (
                   <div className="px-2 py-2 space-y-0.5 font-mono">
                     {rawLog.length === 0 ? (
                       <div className="flex flex-col items-center justify-center h-48 gap-3 text-zinc-600">
@@ -379,6 +465,77 @@ export default function BotLogSidebar() {
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+// ── Error card ───────────────────────────────────────────────────────────────
+const STEP_COLORS: Record<string, string> = {
+  "TRADE_EXEC":    "bg-yellow-500/20 text-yellow-300",
+  "ANALYSIS":      "bg-blue-500/20 text-blue-300",
+  "DIV_FAST":      "bg-purple-500/20 text-purple-300",
+  "MARKET_DISC":   "bg-cyan-500/20 text-cyan-300",
+  "PRICE_ANCHOR":  "bg-teal-500/20 text-teal-300",
+  "BALANCE":       "bg-green-500/20 text-green-300",
+  "CLOB":          "bg-orange-500/20 text-orange-300",
+  "AUTOMATION":    "bg-pink-500/20 text-pink-300",
+};
+
+function ErrorCard({ entry }: { entry: ErrorLogEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  const isErr = entry.level === "ERR";
+  const stepColor = STEP_COLORS[entry.step] ?? "bg-zinc-700 text-zinc-400";
+  const time = new Date(entry.ts).toLocaleTimeString("en-US", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18 }}
+      className={cn(
+        "rounded-lg border px-3 py-2 text-xs",
+        isErr
+          ? "bg-red-500/8 border-red-500/25"
+          : "bg-orange-500/8 border-orange-500/20"
+      )}
+    >
+      <div className="flex items-start gap-2 justify-between mb-1">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className={cn(
+            "text-[9px] font-bold px-1.5 py-0.5 rounded",
+            isErr ? "bg-red-500/25 text-red-400" : "bg-orange-500/25 text-orange-400"
+          )}>
+            {entry.level}
+          </span>
+          <span className={cn("text-[9px] font-bold px-1.5 py-0.5 rounded", stepColor)}>
+            {entry.step}
+          </span>
+        </div>
+        <span className="text-zinc-600 font-mono text-[9px] flex-shrink-0">{time}</span>
+      </div>
+
+      <p className={cn("text-[10px] leading-relaxed", isErr ? "text-red-300" : "text-orange-300")}>
+        {entry.msg}
+      </p>
+
+      {entry.detail && (
+        <>
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="mt-1 text-[9px] text-zinc-600 hover:text-zinc-400 transition-colors"
+          >
+            {expanded ? "▲ hide detail" : "▼ show detail"}
+          </button>
+          {expanded && (
+            <pre className="mt-1 text-[9px] text-zinc-500 font-mono whitespace-pre-wrap break-all bg-zinc-900 rounded p-1.5 max-h-32 overflow-y-auto">
+              {entry.detail}
+            </pre>
+          )}
+        </>
+      )}
+    </motion.div>
   );
 }
 

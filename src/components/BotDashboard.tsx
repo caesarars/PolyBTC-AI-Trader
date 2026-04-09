@@ -526,6 +526,7 @@ export default function BotDashboard() {
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
+  const [pnlPeriod, setPnlPeriod] = useState<"7d" | "1d">("7d");
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [fixedTradeInput, setFixedTradeInput] = useState<string>("");
@@ -791,9 +792,28 @@ export default function BotDashboard() {
     : (status?.config.fixedTradeUsdc ?? 1);
 
   // Build cumulative PnL series from WIN/LOSS log entries
+  const todayStats = useMemo(() => {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const entries = (sessionTradeLog?.entries ?? []).filter(
+      (e) => new Date(e.ts) >= todayStart
+    );
+    const wins = entries.filter((e) => e.pnl > 0).length;
+    const losses = entries.filter((e) => e.pnl < 0).length;
+    const pnl = parseFloat(entries.reduce((s, e) => s + e.pnl, 0).toFixed(2));
+    return { entries, wins, losses, pnl, total: entries.length };
+  }, [sessionTradeLog]);
+
   const pnlHistory = useMemo(() => {
-    const results = [...(sessionTradeLog?.entries ?? [])]
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const allEntries = [...(sessionTradeLog?.entries ?? [])]
       .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+
+    const results = pnlPeriod === "1d"
+      ? allEntries.filter((e) => new Date(e.ts) >= todayStart)
+      : allEntries;
 
     let cumulative = 0;
     return results.map((entry, i) => {
@@ -813,7 +833,7 @@ export default function BotDashboard() {
         decision: entry.result,
       };
     });
-  }, [sessionTradeLog]);
+  }, [sessionTradeLog, pnlPeriod]);
 
   const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
   const infra = status?.infra ?? null;
@@ -1478,23 +1498,84 @@ export default function BotDashboard() {
             <LineChartIcon className="w-4 h-4" />
             Session PnL
             <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
-              last 7 days · {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
+              {pnlPeriod === "1d" ? "today" : "last 7 days"} · {pnlHistory.length} trade{pnlHistory.length !== 1 ? "s" : ""}
             </span>
           </h3>
-          {pnlHistory.length > 0 && (
-            <span className={cn(
-              "text-sm font-mono font-bold",
-              lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
-            )}>
-              {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
-            </span>
-          )}
+          <div className="flex items-center gap-3">
+            {/* Period toggle */}
+            <div className="flex rounded-lg overflow-hidden border border-zinc-700 text-[10px] font-bold">
+              {(["1d", "7d"] as const).map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => setPnlPeriod(p)}
+                  className={cn(
+                    "px-3 py-1 transition-colors",
+                    pnlPeriod === p
+                      ? "bg-zinc-700 text-white"
+                      : "text-zinc-500 hover:text-zinc-300"
+                  )}
+                >
+                  {p === "1d" ? "Today" : "7 Days"}
+                </button>
+              ))}
+            </div>
+            {pnlHistory.length > 0 && (
+              <span className={cn(
+                "text-sm font-mono font-bold",
+                lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
+              )}>
+                {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
+              </span>
+            )}
+          </div>
         </div>
+
+        {/* Today's quick stats (always visible when today filter active or as summary row) */}
+        {pnlPeriod === "1d" && (
+          <div className="flex flex-wrap gap-3 mb-3">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800/60 border border-zinc-700/50">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Today PnL</span>
+              <span className={cn(
+                "text-sm font-mono font-bold",
+                todayStats.pnl > 0 ? "text-green-400" : todayStats.pnl < 0 ? "text-red-400" : "text-zinc-400"
+              )}>
+                {todayStats.pnl >= 0 ? "+" : ""}{todayStats.pnl.toFixed(2)} USDC
+              </span>
+            </div>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800/60 border border-zinc-700/50">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">W/L</span>
+              <span className="text-sm font-mono font-bold">
+                <span className="text-green-400">{todayStats.wins}W</span>
+                <span className="text-zinc-600 mx-1">/</span>
+                <span className="text-red-400">{todayStats.losses}L</span>
+              </span>
+            </div>
+            {todayStats.total > 0 && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800/60 border border-zinc-700/50">
+                <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Win Rate</span>
+                <span className={cn(
+                  "text-sm font-mono font-bold",
+                  (todayStats.wins / todayStats.total) >= 0.55 ? "text-green-400"
+                    : (todayStats.wins / todayStats.total) >= 0.45 ? "text-yellow-400"
+                    : "text-red-400"
+                )}>
+                  {((todayStats.wins / todayStats.total) * 100).toFixed(0)}%
+                </span>
+              </div>
+            )}
+            {todayStats.total === 0 && (
+              <div className="px-3 py-1.5 rounded-lg bg-zinc-800/60 border border-zinc-700/50 text-[10px] text-zinc-600">
+                No trades yet today
+              </div>
+            )}
+          </div>
+        )}
 
         {pnlHistory.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
             <BarChart3 className="w-8 h-8 opacity-30" />
-            <p className="text-xs">No resolved trades in the last 7 days</p>
+            <p className="text-xs">{pnlPeriod === "1d" ? "No trades today yet" : "No resolved trades in the last 7 days"}</p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={180}>
@@ -2406,11 +2487,11 @@ export default function BotDashboard() {
                   {snap.confidence !== null && (
                     <span className={cn(
                       "px-2 py-0.5 rounded-full font-bold border",
-                      snap.confidence >= 65 ? "bg-green-500/10 text-green-400 border-green-500/30"
-                        : snap.confidence >= 55 ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
-                        : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                      snap.confidence >= 80 ? "bg-green-500/10 text-green-400 border-green-500/30"
+                        : snap.confidence >= 75 ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/30"
+                        : "bg-red-500/10 text-red-400 border-red-500/30"
                     )}>
-                      Conf {snap.confidence}%
+                      Conf {snap.confidence}%{snap.confidence < 80 ? " ⚠" : ""}
                     </span>
                   )}
                   {snap.edge !== null && (
@@ -2428,19 +2509,32 @@ export default function BotDashboard() {
                       {snap.riskLevel}
                     </span>
                   )}
-                  {entryPrice !== null && (
-                    <span className="px-2 py-0.5 rounded-full font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">
-                      Entry {(entryPrice * 100).toFixed(1)}¢
-                    </span>
-                  )}
+                  {entryPrice !== null && (() => {
+                    const coinFlip = entryPrice >= 0.46 && entryPrice <= 0.54;
+                    return (
+                      <span className={cn(
+                        "px-2 py-0.5 rounded-full font-bold border",
+                        coinFlip
+                          ? "bg-orange-500/10 text-orange-400 border-orange-500/30"
+                          : "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                      )}>
+                        {coinFlip ? "⚠ " : ""}Entry {(entryPrice * 100).toFixed(1)}¢{coinFlip ? " coin-flip" : ""}
+                      </span>
+                    );
+                  })()}
                   {snap.estimatedBet !== null && snap.estimatedBet > 0 && (
                     <span className="px-2 py-0.5 rounded-full font-bold bg-purple-500/10 text-purple-400 border border-purple-500/30">
                       ${snap.estimatedBet.toFixed(2)} fixed
                     </span>
                   )}
                   {snap.priceToBeat && (
-                    <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
-                      Beat ${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                    <span className={cn(
+                      "px-2 py-0.5 rounded-full font-bold border",
+                      snap.priceToBeat.mode === "chainlink"
+                        ? "bg-cyan-500/10 text-cyan-300 border-cyan-500/30"
+                        : "bg-zinc-800 text-zinc-300 border-zinc-700"
+                    )}>
+                      {snap.priceToBeat.mode === "chainlink" ? "⛓ " : ""}Beat ${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}
                     </span>
                   )}
                   {snap.priceToBeat && (
@@ -2530,23 +2624,52 @@ export default function BotDashboard() {
                 )}
 
                 {snap.priceToBeat && (
-                  <div className="rounded-xl border border-zinc-700/40 bg-zinc-900/40 p-3">
+                  <div className={cn(
+                    "rounded-xl border p-3",
+                    snap.priceToBeat.mode === "chainlink"
+                      ? "border-cyan-500/30 bg-cyan-950/20"
+                      : "border-zinc-700/40 bg-zinc-900/40"
+                  )}>
                     <div className="flex items-center justify-between gap-2 mb-2">
                       <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">
                         Price To Beat
                       </span>
-                      <span className="text-[10px] text-zinc-500 font-mono">
-                        {snap.priceToBeat.mode}:{snap.priceToBeat.source}
-                      </span>
+                      {snap.priceToBeat.mode === "chainlink" ? (
+                        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">
+                          ⛓ Chainlink
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono text-zinc-500 bg-zinc-800 border border-zinc-700">
+                          ~proxy:{snap.priceToBeat.source}
+                        </span>
+                      )}
                     </div>
                     <div className="grid grid-cols-2 gap-2 text-[11px] text-zinc-400">
-                      <div>Open ${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</div>
-                      <div>Now ${snap.priceToBeat.currentPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</div>
                       <div>
-                        Delta {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(2)} ({snap.priceToBeat.distancePct >= 0 ? "+" : ""}{snap.priceToBeat.distancePct.toFixed(3)}%)
+                        <span className="text-zinc-600">Open</span>{" "}
+                        <span className="font-mono text-zinc-200">${snap.priceToBeat.openingPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</span>
                       </div>
                       <div>
-                        Favored {snap.priceToBeat.favoredOutcome}{snap.priceToBeat.direction === "FLAT" ? " · tie -> UP" : ""}
+                        <span className="text-zinc-600">Now</span>{" "}
+                        <span className="font-mono text-zinc-200">${snap.priceToBeat.currentPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })}</span>
+                      </div>
+                      <div className={cn(
+                        "font-mono font-bold",
+                        snap.priceToBeat.distanceUsd > 0 ? "text-green-400"
+                          : snap.priceToBeat.distanceUsd < 0 ? "text-red-400"
+                          : "text-zinc-400"
+                      )}>
+                        {snap.priceToBeat.distanceUsd >= 0 ? "+" : ""}${snap.priceToBeat.distanceUsd.toFixed(2)}
+                        <span className="text-zinc-600 font-normal ml-1">
+                          ({snap.priceToBeat.distancePct >= 0 ? "+" : ""}{snap.priceToBeat.distancePct.toFixed(3)}%)
+                        </span>
+                      </div>
+                      <div className={cn(
+                        "font-bold",
+                        snap.priceToBeat.favoredOutcome === "UP" ? "text-green-400" : "text-red-400"
+                      )}>
+                        {snap.priceToBeat.favoredOutcome === "UP" ? "▲" : "▼"} {snap.priceToBeat.favoredOutcome}
+                        {snap.priceToBeat.direction === "FLAT" && <span className="text-zinc-500 font-normal ml-1">· tie→UP</span>}
                       </div>
                     </div>
                   </div>

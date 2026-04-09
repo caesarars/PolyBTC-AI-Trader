@@ -304,6 +304,7 @@ const assetIndicatorsCaches = new Map<TradingAsset, { data: any; expiresAt: numb
 let btcHistoryCache: { data: BtcCandle[]; expiresAt: number } | null = null;
 let btcPriceCache: { data: { symbol: string; price: string; source?: string }; expiresAt: number } | null = null;
 let btcIndicatorsCache: { data: any; expiresAt: number } | null = null;
+let chainlinkBtcPriceCache: { price: number; updatedAt: Date; expiresAt: number } | null = null;
 let mongoDb: Db | null = null;
 let mongoInitPromise: Promise<Db | null> | null = null;
 let btcSyncInterval: NodeJS.Timeout | null = null;
@@ -334,7 +335,7 @@ const POLYMARKET_STREAM_TRADE_BUFFER = Number(process.env.POLYMARKET_STREAM_TRAD
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
-const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 75);
+const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 80);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.15);
 const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
@@ -353,7 +354,7 @@ function getActiveConfig() {
     maxBetUsdc:       BOT_MAX_BET_USDC,
     fixedTradeUsdc:   aggressiveFixedTradeUsdc,
     balanceCap:       0.25,
-    entryWindowStart: 10,
+    entryWindowStart: 35,   // was 10 — very early entries (≤30s) had 26% WR, -$18 PnL
     entryWindowEnd:   220,
   };
 }
@@ -1846,6 +1847,15 @@ interface RawLogEntry {
 }
 const rawLog: RawLogEntry[] = [];
 
+interface ErrorLogEntry {
+  ts: string;
+  level: "ERR" | "WARN";
+  step: string;   // which workflow step failed (e.g. "chainlink", "gemini", "execution")
+  msg: string;
+  detail?: string; // stack trace or extra context
+}
+const errorLog: ErrorLogEntry[] = [];
+
 // ── SSE clients for real-time push ────────────────────────────────────────────
 const sseClients = new Set<ServerResponse>();
 function pushSSE(event: string, data: unknown): void {
@@ -2664,6 +2674,49 @@ async function getBtcPrice(forceRefresh = false) {
     return { ...persisted.payload, source: "mongo-stale-cache" };
   }
 
+  return null;
+}
+
+// ── Chainlink BTC/USD on-chain price feed ─────────────────────────────────────
+// Contract: BTC/USD Aggregator on Ethereum Mainnet
+// Resolves the SAME price that Polymarket uses for market resolution.
+const CHAINLINK_BTC_USD_ADDRESS = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88b";
+const CHAINLINK_ABI = [
+  "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+];
+const CHAINLINK_RPC_URLS = [
+  "https://rpc.ankr.com/eth",        // No API key needed
+  "https://cloudflare-eth.com",      // Cloudflare public RPC
+  "https://eth.llamarpc.com",        // LlamaNodes public RPC
+];
+const CHAINLINK_CACHE_MS = 15_000; // 15s — Chainlink updates every ~20-30s
+
+async function getChainlinkBtcPrice(forceRefresh = false): Promise<{ price: number; updatedAt: Date; source: "chainlink" } | null> {
+  if (!forceRefresh && chainlinkBtcPriceCache && chainlinkBtcPriceCache.expiresAt > Date.now()) {
+    return { price: chainlinkBtcPriceCache.price, updatedAt: chainlinkBtcPriceCache.updatedAt, source: "chainlink" };
+  }
+
+  for (const rpcUrl of CHAINLINK_RPC_URLS) {
+    try {
+      const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+      const feed = new ethers.Contract(CHAINLINK_BTC_USD_ADDRESS, CHAINLINK_ABI, provider);
+      const [, answer, , updatedAt] = await Promise.race([
+        feed.latestRoundData() as Promise<[any, any, any, any, any]>,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 5_000)),
+      ]);
+      const price = Number(answer) / 1e8; // Chainlink BTC/USD has 8 decimals
+      const updatedAtDate = new Date(Number(updatedAt) * 1000);
+      chainlinkBtcPriceCache = { price, updatedAt: updatedAtDate, expiresAt: Date.now() + CHAINLINK_CACHE_MS };
+      return { price, updatedAt: updatedAtDate, source: "chainlink" };
+    } catch {
+      // Try next RPC
+    }
+  }
+
+  // All RPCs failed — return stale cache if available
+  if (chainlinkBtcPriceCache) {
+    return { price: chainlinkBtcPriceCache.price, updatedAt: chainlinkBtcPriceCache.updatedAt, source: "chainlink" };
+  }
   return null;
 }
 
@@ -3514,11 +3567,13 @@ async function startServer() {
         // Fetch fresh order book + implied price for the target token
         const book = await getNormalizedOrderBookSnapshot(tokenId);
         const clobAsk = book.bestAsk ?? 0;
-        // Use outcomePrices from the atomically-captured market (not global alias which may have shifted)
-        const divOutcomeIndex = direction === "UP" ? 0 : 1;
-        const divImpliedPrice = parseFloat(market.outcomePrices?.[divOutcomeIndex] ?? "0");
-        const bestAsk = (clobAsk > 0 && clobAsk < 0.97) ? clobAsk : divImpliedPrice > 0 ? divImpliedPrice : clobAsk;
-        if (bestAsk <= 0) return;
+        // Gate 1: Require valid CLOB ask — no blind entries using implied price fallback.
+        // Loss memory shows "order book data unavailable" was a recurring cause of DIV FAST PATH losses.
+        if (!(clobAsk > 0 && clobAsk < 0.97)) {
+          botPrint("SKIP", `[DIV FAST] No valid CLOB ask (${clobAsk}) — blind entry blocked, order book required`);
+          return;
+        }
+        const bestAsk = clobAsk;
 
         // Entry price gate — STRONG divergence gets the 85¢ override (same as main cycle)
         const MAX_ENTRY_PRICE = 0.85;
@@ -3527,7 +3582,19 @@ async function startServer() {
           return;
         }
 
-        const confidence = 78;
+        // Gate 2: Imbalance check — skip if crowd is betting against our direction.
+        // Loss memory: "Order book BUY_PRESSURE contradicted DOWN entry" was a repeated lesson.
+        const imbalance = book.imbalanceSignal as string | undefined;
+        if (direction === "UP" && imbalance === "SELL_PRESSURE") {
+          botPrint("SKIP", `[DIV FAST] Crowd SELL_PRESSURE contradicts UP divergence — skipped`);
+          return;
+        }
+        if (direction === "DOWN" && imbalance === "BUY_PRESSURE") {
+          botPrint("SKIP", `[DIV FAST] Crowd BUY_PRESSURE contradicts DOWN divergence — skipped`);
+          return;
+        }
+
+        const confidence = 82;
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
         if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
         const nowWindowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
@@ -3536,12 +3603,14 @@ async function startServer() {
           botPrint("SKIP", `[DIV FAST] ${fastPriceGuardReason}`);
           return;
         }
+        // Use Chainlink price for DIV FAST PATH — ensures price-to-beat aligns with resolution source
+        const chainlinkFast = fastAsset === "BTC" ? await getChainlinkBtcPrice() : null;
         const fastPriceToBeat = updatePriceToBeatState(
           fastAsset,
           nowWindowStart,
-          divergenceStateByAsset.get(fastAsset)?.currentBtcPrice ?? null,
-          "divergence-proxy",
-          "proxy"
+          chainlinkFast?.price ?? divergenceStateByAsset.get(fastAsset)?.currentBtcPrice ?? null,
+          chainlinkFast ? "chainlink" : "divergence-proxy",
+          chainlinkFast ? "chainlink" : "proxy"
         );
 
         // Kelly sizing — use last known balance (updated by bot cycle, fresh within ~30s)
@@ -3578,7 +3647,7 @@ async function startServer() {
           confidence,
           estimatedEdge,
           riskLevel: "MEDIUM",
-          reasoning: `[DIV FAST PATH] STRONG divergence: BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} in 30s, YES lagging. Gemini skipped.`,
+          reasoning: `[DIV FAST PATH] STRONG divergence: BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} in 30s, YES lagging. CLOB verified. Imbalance: ${imbalance ?? "NEUTRAL"}. Gemini skipped.`,
           candlePatterns: [],
           dataMode: "FULL_DATA" as const,
           reversalProbability: 30,
@@ -3791,7 +3860,7 @@ async function startServer() {
 
       } catch (err: any) {
         markTradeExecutionFinished(fastAsset, _fastMarket?.id ?? "", false);
-        botPrint("ERR", `[DIV FAST] Execution error: ${err?.message ?? err}`);
+        botError("execution", `[DIV FAST] Divergence fast path execution failed`, err);
       } finally {
         divergenceFastTradeRunning = false;
       }
@@ -3951,6 +4020,61 @@ async function startServer() {
             }
           }
 
+          // ── Chainlink reversal exit ──────────────────────────────────────────
+          // The standard SL tracks YES token price. This gate catches the gap case:
+          // BTC/Chainlink has clearly moved against our position but the YES token
+          // hasn't repriced yet — we exit before the market maker collapses the price.
+          //
+          // Thresholds (conservative to avoid noise exits):
+          //   $150 BTC move against position direction  → STRONG reversal exit
+          //   $75  BTC move + YES token still near entry → MODERATE reversal exit
+          if (!triggerReason && automation.windowEnd) {
+            const positionWindowStart = automation.windowEnd - MARKET_SESSION_SECONDS;
+            const outcomeStr = String(automation.outcome || "").toLowerCase();
+            const posDir: "UP" | "DOWN" | null =
+              outcomeStr.includes("up") || outcomeStr.includes("yes") ? "UP"
+              : outcomeStr.includes("down") || outcomeStr.includes("no") ? "DOWN"
+              : null;
+
+            if (posDir) {
+              // Use cached Chainlink snapshot (no extra RPC call — already fetched in bot cycle)
+              // Determine which asset this position belongs to from the market title
+              const mktTitle = String(automation.market || "").toLowerCase();
+              const posAsset: TradingAsset =
+                mktTitle.includes("ethereum") ? "ETH"
+                : mktTitle.includes("solana")  ? "SOL"
+                : "BTC";
+
+              const ptbSnap = getPriceToBeatSnapshot(posAsset, positionWindowStart);
+
+              if (ptbSnap && ptbSnap.mode === "chainlink") {
+                const delta = ptbSnap.distanceUsd; // positive = BTC above opening (favors UP)
+                const STRONG_REVERSAL_USD = 150;   // $150 clear move — unambiguous reversal
+                const MOD_REVERSAL_USD    = 75;    // $75 move + YES token near entry
+
+                const isStrongReversal =
+                  (posDir === "UP"   && delta < -STRONG_REVERSAL_USD) ||
+                  (posDir === "DOWN" && delta >  STRONG_REVERSAL_USD);
+
+                const isModReversal =
+                  !isStrongReversal && (
+                    (posDir === "UP"   && delta < -MOD_REVERSAL_USD && currentPrice <= (entryPrice + 0.04)) ||
+                    (posDir === "DOWN" && delta >  MOD_REVERSAL_USD && currentPrice <= (entryPrice + 0.04))
+                  );
+
+                if (isStrongReversal || isModReversal) {
+                  const severity = isStrongReversal ? "STRONG" : "MOD";
+                  const sign = delta >= 0 ? "+" : "";
+                  triggerReason = `chainlink reversal [${severity}] — BTC ${sign}$${delta.toFixed(0)} vs opening ${posDir === "UP" ? "▼" : "▲"} against ${posDir} position`;
+                  botPrint("WARN", `[CL-REVERSAL] ${triggerReason} | YES token @ ${(currentPrice * 100).toFixed(0)}¢`);
+                } else if (ptbSnap && posDir) {
+                  const sign = delta >= 0 ? "+" : "";
+                  botPrint("INFO", `[CL-REVERSAL] ${posDir} position OK — Chainlink delta ${sign}$${delta.toFixed(0)} (thresholds: STRONG >${STRONG_REVERSAL_USD} MOD >${MOD_REVERSAL_USD})`);
+                }
+              }
+            }
+          }
+
           if (triggerReason) {
             void (triggerReason === "take profit"); // isTakeProfit — guard removed; all triggers execute immediately
             // Execution price: best bid preferred. Fallback to ask * 0.97 (3¢ slippage) rather
@@ -4000,6 +4124,7 @@ async function startServer() {
             status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢${expiryLabel}`,
           });
         } catch (error: any) {
+          botError("automation", `Position monitor failed for assetId ${automation.assetId?.slice(0,12)}`, error);
           await savePositionAutomation({
             assetId: automation.assetId,
             status: `Monitor error: ${error?.message || "Unknown error"}`,
@@ -4023,7 +4148,7 @@ async function startServer() {
 
   // ── Bot logging helper ────────────────────────────────────────────────────
   const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
-  const botPrint = (level: "INFO" | "WARN" | "TRADE" | "OK" | "SKIP" | "ERR", msg: string) => {
+  const botPrint = (level: "INFO" | "WARN" | "TRADE" | "OK" | "SKIP" | "ERR", msg: string, step?: string) => {
     const icons: Record<string, string> = {
       INFO:  "─",
       WARN:  "⚠",
@@ -4037,6 +4162,51 @@ async function startServer() {
     rawLog.unshift(entry);
     if (rawLog.length > 500) rawLog.pop();
     pushSSE("log", entry);
+
+    // Auto-capture ERR and WARN into dedicated errorLog
+    if (level === "ERR" || level === "WARN") {
+      const errEntry: ErrorLogEntry = {
+        ts: entry.ts,
+        level,
+        step: step || inferStepFromMsg(msg),
+        msg,
+      };
+      errorLog.unshift(errEntry);
+      if (errorLog.length > 200) errorLog.pop();
+      pushSSE("error-log", errEntry);
+    }
+  };
+
+  // Infer workflow step from message content for automatic categorization
+  function inferStepFromMsg(msg: string): string {
+    const m = msg.toLowerCase();
+    if (m.includes("chainlink"))            return "chainlink";
+    if (m.includes("gemini"))               return "gemini";
+    if (m.includes("clob") || m.includes("order book")) return "clob";
+    if (m.includes("execution") || m.includes("trade") || m.includes("execute")) return "execution";
+    if (m.includes("automation") || m.includes("tp") || m.includes("sl")) return "automation";
+    if (m.includes("binance"))              return "price-feed";
+    if (m.includes("coinbase"))             return "price-feed";
+    if (m.includes("discovery"))            return "market-discovery";
+    if (m.includes("stream") || m.includes("websocket")) return "stream";
+    if (m.includes("balance"))              return "balance";
+    if (m.includes("mongo"))               return "database";
+    return "bot";
+  }
+
+  // Structured error logger for catch blocks — captures step + error detail
+  const botError = (step: string, context: string, err: unknown) => {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const detail = err instanceof Error && err.stack ? err.stack.split("\n").slice(0, 3).join(" | ") : undefined;
+    const msg = `[${step.toUpperCase()}] ${context}: ${errMsg}`;
+    console.error(`[BOT:ERR] ${msg}`, err);
+    const entry: ErrorLogEntry = { ts: ts(), level: "ERR", step, msg, detail };
+    rawLog.unshift({ ts: entry.ts, level: "ERR", msg: entry.msg });
+    if (rawLog.length > 500) rawLog.pop();
+    errorLog.unshift(entry);
+    if (errorLog.length > 200) errorLog.pop();
+    pushSSE("log", { ts: entry.ts, level: "ERR", msg: entry.msg });
+    pushSSE("error-log", entry);
   };
 
   // ── Win / Loss result checker ─────────────────────────────────────────────
@@ -4326,9 +4496,34 @@ async function startServer() {
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
         await Promise.all(ENABLED_ASSETS.map(async (asset) => {
           try {
-            const priceData = await getAssetPrice(asset, true);
-            const numericPrice = priceData?.price ? Number(priceData.price) : null;
-            const snapshot = updatePriceToBeatState(asset, currentWindowStart, numericPrice, priceData?.source || null, "proxy");
+            // For BTC: prefer Chainlink (same source Polymarket uses for resolution)
+            // For ETH/SOL: fall back to spot — Chainlink feed available but BTC is what resolves binary markets
+            let numericPrice: number | null = null;
+            let priceSource: string = "unknown";
+            let priceMode: "proxy" | "chainlink" = "proxy";
+
+            if (asset === "BTC") {
+              const chainlinkData = await getChainlinkBtcPrice(true);
+              if (chainlinkData?.price) {
+                numericPrice = chainlinkData.price;
+                priceSource = "chainlink";
+                priceMode = "chainlink";
+                botPrint("INFO", `[BTC] Chainlink anchor: $${chainlinkData.price.toLocaleString("en-US", { maximumFractionDigits: 2 })} (updated ${chainlinkData.updatedAt.toISOString()})`);
+              }
+            }
+
+            // Fallback to spot if Chainlink unavailable or non-BTC asset
+            if (!numericPrice) {
+              const priceData = await getAssetPrice(asset, true);
+              numericPrice = priceData?.price ? Number(priceData.price) : null;
+              priceSource = priceData?.source || "spot";
+              priceMode = "proxy";
+              if (asset === "BTC" && numericPrice) {
+                botPrint("WARN", `[BTC] Chainlink unavailable — falling back to spot ($${numericPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })})`);
+              }
+            }
+
+            const snapshot = updatePriceToBeatState(asset, currentWindowStart, numericPrice, priceSource, priceMode);
             if (snapshot && asset === "BTC") {
               botPrint(
                 "INFO",
@@ -4336,7 +4531,7 @@ async function startServer() {
               );
             }
           } catch (error: any) {
-            botPrint("WARN", `[${asset}] Failed to anchor price to beat: ${error?.message || "unknown error"}`);
+            botError("chainlink", `[${asset}] Failed to anchor price to beat at window open`, error);
           }
         }));
       }
@@ -4367,7 +4562,7 @@ async function startServer() {
             marketsByAsset.set(asset, markets);
           }
         } catch (error: any) {
-          botPrint("ERR", `[${asset}] Failed to fetch market for slug: ${slug} (${error?.message || "unknown error"})`);
+          botError("market-discovery", `[${asset}] Failed to fetch market for slug: ${slug}`, error);
         }
       }));
 
@@ -4426,14 +4621,18 @@ async function startServer() {
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
 
-            const liveAssetPrice = btcPriceData?.price ? Number(btcPriceData.price) : null;
-            priceToBeat = updatePriceToBeatState(
-              currentAsset,
-              currentWindowStart,
-              liveAssetPrice,
-              btcPriceData?.source || null,
-              "proxy"
-            );
+            // For BTC: update price-to-beat tracking using Chainlink (resolution source)
+            // For ETH/SOL: use spot price as usual
+            if (currentAsset === "BTC") {
+              const chainlinkLive = await getChainlinkBtcPrice();
+              const livePrice = chainlinkLive?.price ?? (btcPriceData?.price ? Number(btcPriceData.price) : null);
+              const liveSource = chainlinkLive ? "chainlink" : (btcPriceData?.source || "spot");
+              const liveMode: "proxy" | "chainlink" = chainlinkLive ? "chainlink" : "proxy";
+              priceToBeat = updatePriceToBeatState(currentAsset, currentWindowStart, livePrice, liveSource, liveMode);
+            } else {
+              const liveAssetPrice = btcPriceData?.price ? Number(btcPriceData.price) : null;
+              priceToBeat = updatePriceToBeatState(currentAsset, currentWindowStart, liveAssetPrice, btcPriceData?.source || null, "proxy");
+            }
             if (currentAsset === "BTC" && priceToBeat) {
               const beatSign = priceToBeat.distanceUsd >= 0 ? "+" : "";
               botPrint(
@@ -4648,8 +4847,8 @@ async function startServer() {
           }
           if (_hist.length >= 5) {
             const recent5 = _hist.slice(-5);
-            const up5 = recent5.filter(c => c.close > c.open).length;
-            const dn5 = recent5.filter(c => c.close < c.open).length;
+            const up5 = recent5.filter((c: BtcCandle) => Number(c.close) > Number(c.open)).length;
+            const dn5 = recent5.filter((c: BtcCandle) => Number(c.close) < Number(c.open)).length;
             if (up5 >= 3) _localBullish++; else if (dn5 >= 3) _localBearish++;
           }
           if (_hist.length >= 2) {
@@ -4968,6 +5167,42 @@ async function startServer() {
             botPrint("INFO", `Pressure check: direction=${rec.direction} | YES book=${yesSignal} ✓`);
           }
 
+          // ── DOWN trade quality filter ─────────────────────────────────────────
+          // Historical data: DOWN WR=39.5% vs UP WR=52.4%. Two recurring lessons:
+          //   1. RSI oversold (<30) on DOWN → reversal risk, limited downside room
+          //   2. signalScore > -2 on DOWN → weak bearish signal, not enough conviction
+          // Both gates only apply to DOWN — UP trades are already performing well.
+          if (qualifies && rec.direction === "DOWN") {
+            const rsi = btcIndicatorsData?.rsi ?? null;
+            const signalScore = btcIndicatorsData?.signalScore ?? null;
+            const downFilterReasons: string[] = [];
+
+            if (rsi !== null && rsi < 30) {
+              downFilterReasons.push(`RSI oversold (${rsi.toFixed(1)}) — reversal risk on DOWN`);
+            }
+            if (signalScore !== null && signalScore > -2) {
+              downFilterReasons.push(`signalScore=${signalScore} weak for DOWN (need ≤-2)`);
+            }
+
+            if (downFilterReasons.length > 0) {
+              botPrint("SKIP", `DOWN filter: ${downFilterReasons.join(" | ")} — re-check next cycle`);
+              captureDecisionSnapshot({
+                decision: "TRADE",
+                action: "FILTERED",
+                direction: rec.direction,
+                confidence: rec.confidence,
+                edge: rec.estimatedEdge,
+                riskLevel: rec.riskLevel,
+                reasoning: rec.reasoning,
+                filterReasons: downFilterReasons,
+              });
+              analyzedThisWindow.delete(market.id);
+              pushSSE("cycle", { ts: new Date().toISOString() });
+              continue;
+            }
+            botPrint("INFO", `DOWN filter: RSI=${rsi?.toFixed(1) ?? "?"} signalScore=${signalScore ?? "?"} ✓`);
+          }
+
           const logEntry: BotLogEntry = {
             timestamp: new Date().toISOString(),
             market: market.question || market.id,
@@ -4985,7 +5220,7 @@ async function startServer() {
             const client = await getClobClient();
             if (!client) {
               logEntry.error = "CLOB client not ready — trade skipped.";
-              botPrint("ERR", "CLOB client not initialized. Check POLYGON_PRIVATE_KEY.");
+              botError("clob", "CLOB client not initialized — trade skipped. Check POLYGON_PRIVATE_KEY.", new Error("CLOB unavailable"));
               captureDecisionSnapshot({
                 decision: "TRADE",
                 action: "FILTERED",
@@ -5014,8 +5249,8 @@ async function startServer() {
                 currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
                 lastKnownBalance = currentBalance; // keep fast path in sync
                 balanceFresh = true;
-              } catch {
-                botPrint("WARN", `Balance fetch failed — using last known: $${currentBalance.toFixed(2)} USDC`);
+              } catch (balErr) {
+                botError("balance", `Balance fetch failed — using last known: $${currentBalance.toFixed(2)} USDC`, balErr);
               }
 
               botPrint("INFO", `Balance: $${currentBalance.toFixed(2)} USDC${balanceFresh ? " (live)" : " (cached)"} | Session start: $${botSessionStartBalance?.toFixed(2) ?? "?"}`);
@@ -5283,7 +5518,7 @@ async function startServer() {
                   } catch (tradeErr: any) {
                     markTradeExecutionFinished(currentAsset, market.id, false);
                     logEntry.error = tradeErr?.message || String(tradeErr);
-                    botPrint("ERR", `Trade execution failed: ${logEntry.error}`);
+                    botError("execution", `Trade execution failed for ${rec.direction} ${currentAsset}`, tradeErr);
                     captureDecisionSnapshot({
                       decision: "TRADE",
                       action: "FILTERED",
@@ -5319,8 +5554,8 @@ async function startServer() {
           if (botLog.length > 100) botLog.pop();
           pushSSE("cycle", { ts: new Date().toISOString() });
         } catch (err: any) {
-          botPrint("ERR", `Analysis error: ${err?.message || String(err)}`);
-          analyzedThisWindow.delete(market.id); // transient fetch/AI errors should not lock the market for the rest of the window
+            botError("analysis", `Market analysis failed for ${currentAsset} market ${market.id?.slice(0,12) ?? "?"}`, err);
+          analyzedThisWindow.delete(market.id);
         }
       } // end for (market of markets)
       } // end for (currentAsset of ENABLED_ASSETS)
@@ -5449,6 +5684,10 @@ async function startServer() {
 
   app.get("/api/bot/rawlog", (_req, res) => {
     res.json({ log: rawLog });
+  });
+
+  app.get("/api/bot/errorlog", (_req, res) => {
+    res.json({ log: errorLog, total: errorLog.length });
   });
 
   // ── Ping / latency probe endpoint ──────────────────────────────────────────
