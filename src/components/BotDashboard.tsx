@@ -273,6 +273,7 @@ export default function BotDashboard() {
   const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configSaved, setConfigSaved] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [momentumHistory, setMomentumHistory] = useState<MomentumPoint[]>([]);
   const [notifStatus, setNotifStatus] = useState<{ telegram: boolean; discord: boolean } | null>(null);
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null);
@@ -441,9 +442,11 @@ export default function BotDashboard() {
     ) {
       return;
     }
+    setConfigError(null);
+    setConfigSaved(false);
     setConfigSaving(true);
     try {
-      await fetch("/api/bot/config", {
+      const response = await fetch("/api/bot/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -452,10 +455,37 @@ export default function BotDashboard() {
           ...(fixedTradeUsdc !== null && { fixedTradeUsdc }),
         }),
       });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(payload?.error || "Failed to update bot config.");
+      }
+      if (
+        fixedTradeUsdc !== null &&
+        Number(payload?.config?.fixedTradeUsdc) !== fixedTradeUsdc
+      ) {
+        throw new Error(
+          `Config mismatch: expected $${fixedTradeUsdc.toFixed(2)}, got $${Number(payload?.config?.fixedTradeUsdc || 0).toFixed(2)}.`
+        );
+      }
+      if (payload?.config) {
+        setStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                config: {
+                  ...prev.config,
+                  ...payload.config,
+                },
+              }
+            : prev
+        );
+      }
       setFixedTradeInput(null);
       setConfigSaved(true);
       setTimeout(() => setConfigSaved(false), 2000);
       await fetchAll();
+    } catch (error: any) {
+      setConfigError(error?.message || "Failed to update bot config.");
     } finally {
       setConfigSaving(false);
     }
@@ -1390,6 +1420,9 @@ export default function BotDashboard() {
               </div>
               <div className="text-[9px] text-zinc-600">
                 Nominal buy per trade. Default awal tetap diambil dari `.env`, tapi pilihan ini override runtime.
+                {fixedTradeInput !== null && fixedTradeInput !== (status?.config.fixedTradeUsdc ?? 1)
+                  ? ` Klik Apply untuk aktifkan $${fixedTradeInput.toFixed(2)}.`
+                  : ""}
               </div>
             </div>
             {/* EV preview */}
@@ -1411,6 +1444,9 @@ export default function BotDashboard() {
             >
               {configSaving ? "Saving…" : configSaved ? "✓ Saved" : "Apply"}
             </button>
+            {configError && (
+              <div className="text-[10px] text-red-400">{configError}</div>
+            )}
           </div>
         </div>
 
