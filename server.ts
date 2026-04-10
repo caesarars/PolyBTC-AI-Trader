@@ -3825,8 +3825,8 @@ async function startServer() {
     }
     if (fixedTradeUsdc !== undefined) {
       const val = Number(fixedTradeUsdc);
-      if (isNaN(val) || !Number.isInteger(val) || val < 1 || val > 5) {
-        return res.status(400).json({ error: "fixedTradeUsdc must be an integer 1–5" });
+      if (isNaN(val) || !Number.isInteger(val) || val < 1 || val > 15) {
+        return res.status(400).json({ error: "fixedTradeUsdc must be an integer 1–15" });
       }
       aggressiveFixedTradeUsdc = val;
     }
