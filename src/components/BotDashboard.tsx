@@ -1358,7 +1358,7 @@ export default function BotDashboard() {
                 </span>
               </div>
               <div className="grid grid-cols-5 gap-1.5">
-                {[1, 2, 3, 4, 5].map((amount) => {
+                {[1, 2, 3, 4, 5, 10 , 12 ,15].map((amount) => {
                   const selected = (fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1) === amount;
                   return (
                     <button
