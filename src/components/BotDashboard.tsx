@@ -143,6 +143,34 @@ interface ClosedPosition {
   timestamp: number;
   endDate: string;
   eventSlug: string;
+  orderId?: string | null;
+  orderIds?: string[];
+  matched?: boolean;
+  matchedTradeTs?: string | null;
+  matchedBy?: "asset" | "market_outcome" | null;
+}
+
+interface SessionHistoryPoint {
+  index: number;
+  timestamp: number;
+  market: string;
+  outcome: string;
+  trade: number;
+  cumulative: number;
+  decision: "WIN" | "LOSS" | "FLAT";
+  orderId?: string | null;
+  orderIds?: string[];
+  matched?: boolean;
+  matchedTradeTs?: string | null;
+}
+
+interface PerformanceData {
+  summary: PerformanceSummary;
+  openPositions: OpenPosition[];
+  closedPositions: ClosedPosition[];
+  history?: SessionHistoryPoint[];
+  sessionHistory?: SessionHistoryPoint[];
+  sessionWindowDays?: number;
 }
 
 interface Automation {
@@ -259,7 +287,7 @@ interface PingState {
 export default function BotDashboard() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [log, setLog] = useState<BotLogEntry[]>([]);
-  const [performance, setPerformance] = useState<{ summary: PerformanceSummary; openPositions: OpenPosition[]; closedPositions: ClosedPosition[] } | null>(null);
+  const [performance, setPerformance] = useState<PerformanceData | null>(null);
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [balance, setBalance] = useState<string>("—");
   const [controlLoading, setControlLoading] = useState(false);
@@ -564,8 +592,39 @@ export default function BotDashboard() {
 
   const armedCount = automations.filter((a) => a.armed).length;
 
-  // Build cumulative PnL series from WIN/LOSS log entries
+  // Prefer the server-side history synced to Closed Positions; fall back to trade log when unavailable.
   const pnlHistory = useMemo(() => {
+    const syncedHistory = performance?.sessionHistory?.length
+      ? performance.sessionHistory
+      : performance?.history?.length
+        ? performance.history
+        : null;
+
+    if (syncedHistory?.length) {
+      return syncedHistory.map((entry, i) => {
+        const labelTime = entry.matchedTradeTs
+          ? new Date(entry.matchedTradeTs)
+          : entry.timestamp
+            ? new Date(entry.timestamp * 1000)
+            : null;
+        return {
+          label: `#${i + 1}`,
+          time: labelTime
+            ? labelTime.toLocaleString("en-US", {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+              })
+            : `#${i + 1}`,
+          trade: entry.trade,
+          cumulative: entry.cumulative,
+          decision: entry.decision,
+        };
+      });
+    }
+
     const results = [...(sessionTradeLog?.entries ?? [])]
       .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 
@@ -587,9 +646,13 @@ export default function BotDashboard() {
         decision: entry.result,
       };
     });
-  }, [sessionTradeLog]);
+  }, [performance?.history, performance?.sessionHistory, sessionTradeLog]);
 
   const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
+  const sessionWindowDays = performance?.sessionWindowDays ?? 7;
+  const sessionPnlSubtitle = performance?.sessionHistory?.length || performance?.history?.length
+    ? `last ${sessionWindowDays} days · synced with Closed Positions · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`
+    : `last ${sessionWindowDays} days · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`;
 
   return (
     <div className="space-y-6">
@@ -861,7 +924,7 @@ export default function BotDashboard() {
             <LineChartIcon className="w-4 h-4" />
             Session PnL
             <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
-              last 7 days · {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
+              {sessionPnlSubtitle}
             </span>
           </h3>
           {pnlHistory.length > 0 && (
@@ -877,7 +940,7 @@ export default function BotDashboard() {
         {pnlHistory.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
             <BarChart3 className="w-8 h-8 opacity-30" />
-            <p className="text-xs">No resolved trades in the last 7 days</p>
+            <p className="text-xs">No resolved trades available yet</p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={180}>
@@ -934,13 +997,14 @@ export default function BotDashboard() {
                 dot={(props: any) => {
                   const { cx, cy, payload } = props;
                   const isWin = payload.decision === "WIN";
+                  const isFlat = payload.decision === "FLAT";
                   return (
                     <circle
                       key={`dot-${cx}-${cy}`}
                       cx={cx}
                       cy={cy}
                       r={4.5}
-                      fill={isWin ? "#22c55e" : "#ef4444"}
+                      fill={isFlat ? "#a1a1aa" : isWin ? "#22c55e" : "#ef4444"}
                       stroke="#09090b"
                       strokeWidth={1.5}
                     />
@@ -1808,7 +1872,9 @@ export default function BotDashboard() {
           <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-zinc-500" />
             Closed Positions
-            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">({performance.closedPositions.length} recent)</span>
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
+              ({performance.closedPositions.length} in last {sessionWindowDays}d)
+            </span>
           </h3>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">

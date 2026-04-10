@@ -42,6 +42,203 @@ interface TradeLogEntry {
   orderId: string | null;
 }
 
+type ResolvedOrderMeta = {
+  assetId: string | null;
+  market: string | null;
+  outcome: string | null;
+  createdAtMs: number | null;
+};
+
+const resolvedOrderMetaCache = new Map<string, Promise<ResolvedOrderMeta | null>>();
+
+function normalizeLookupText(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeOutcome(value: unknown): string {
+  const normalized = normalizeLookupText(value);
+  if (!normalized) return "";
+  if (normalized === "yes" || normalized === "up") return "up";
+  if (normalized === "no" || normalized === "down") return "down";
+  return normalized;
+}
+
+function directionToOutcome(direction: TradeLogEntry["direction"]): string {
+  return direction === "UP" ? "up" : direction === "DOWN" ? "down" : "";
+}
+
+function buildMarketOutcomeKey(market: unknown, outcome: unknown): string {
+  return `${normalizeLookupText(market)}::${normalizeOutcome(outcome)}`;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1_000_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function roundPnl(value: number): number {
+  return Number(value.toFixed(4));
+}
+
+async function loadPersistedTradeLog(): Promise<TradeLogEntry[]> {
+  try {
+    const collection = await getTradesCollection();
+    if (collection) {
+      const docs = await collection
+        .find({}, { projection: { _id: 0 } })
+        .sort({ ts: -1 })
+        .limit(2000)
+        .toArray();
+
+      if (docs.length > 0) {
+        return docs
+          .reverse()
+          .map((doc) => ({
+            ts: doc.ts,
+            market: doc.market,
+            direction: doc.direction,
+            confidence: Number(doc.confidence ?? 0),
+            edge: Number(doc.edge ?? 0),
+            betAmount: Number(doc.betAmount ?? 0),
+            entryPrice: Number(doc.entryPrice ?? 0),
+            pnl: Number(doc.pnl ?? 0),
+            result: doc.result === "WIN" ? "WIN" : "LOSS",
+            rsi: doc.rsi,
+            emaCross: doc.emaCross,
+            signalScore: doc.signalScore,
+            imbalanceSignal: doc.imbalanceSignal,
+            divergenceDirection: doc.divergenceDirection,
+            divergenceStrength: doc.divergenceStrength,
+            btcDelta30s: doc.btcDelta30s,
+            yesDelta30s: doc.yesDelta30s,
+            windowElapsedSeconds: Number(doc.windowElapsedSeconds ?? 0),
+            orderId: doc.orderId ?? null,
+          }));
+      }
+    }
+  } catch (error: any) {
+    console.warn("Failed to load persisted trades from MongoDB. Falling back to local trade log.", error?.message || error);
+  }
+
+  return loadTradeLog();
+}
+
+async function resolveOrderMeta(orderId: string | null | undefined): Promise<ResolvedOrderMeta | null> {
+  if (!orderId) return null;
+  const cached = resolvedOrderMetaCache.get(orderId);
+  if (cached) return cached;
+
+  const task = (async () => {
+    try {
+      const client = await getClobClient();
+      if (!client) return null;
+
+      const order = await client.getOrder(orderId);
+      return {
+        assetId: order?.asset_id ? String(order.asset_id) : null,
+        market: order?.market ? String(order.market) : null,
+        outcome: order?.outcome ? String(order.outcome) : null,
+        createdAtMs: parseTimestampMs(order?.created_at ?? null),
+      };
+    } catch (error: any) {
+      console.warn(`Failed to resolve CLOB order metadata for ${orderId}:`, error?.message || error);
+      return null;
+    }
+  })();
+
+  resolvedOrderMetaCache.set(orderId, task);
+  return task;
+}
+
+async function matchClosedPositionsToPersistedTrades(closedPositionsRaw: any[]) {
+  const trades = await loadPersistedTradeLog();
+  if (!closedPositionsRaw.length || !trades.length) {
+    return closedPositionsRaw.map((position) => ({
+      ...position,
+      orderId: null,
+      orderIds: [] as string[],
+      matchedTradeTs: null,
+      matchedBy: null as "asset" | "market_outcome" | null,
+    }));
+  }
+
+  const closedMarketKeys = new Set(
+    closedPositionsRaw
+      .map((position) => buildMarketOutcomeKey(position.title, position.outcome))
+      .filter((key) => key !== "::")
+  );
+  const likelyMatchingTrades = closedMarketKeys.size > 0
+    ? trades.filter((entry) => closedMarketKeys.has(buildMarketOutcomeKey(entry.market, directionToOutcome(entry.direction))))
+    : trades;
+  const tradesToMatch = likelyMatchingTrades.length > 0 ? likelyMatchingTrades : trades;
+
+  const resolvedTrades = await Promise.all(
+    tradesToMatch.map(async (entry) => {
+      const orderMeta = await resolveOrderMeta(entry.orderId);
+      return {
+        entry,
+        orderId: entry.orderId ?? null,
+        assetId: orderMeta?.assetId ?? null,
+        marketKey: buildMarketOutcomeKey(entry.market, orderMeta?.outcome ?? directionToOutcome(entry.direction)),
+        tsMs: parseTimestampMs(entry.ts),
+      };
+    })
+  );
+
+  const tradesByAsset = new Map<string, typeof resolvedTrades>();
+  const tradesByMarketOutcome = new Map<string, typeof resolvedTrades>();
+
+  for (const trade of resolvedTrades) {
+    if (trade.assetId) {
+      const bucket = tradesByAsset.get(trade.assetId) ?? [];
+      bucket.push(trade);
+      tradesByAsset.set(trade.assetId, bucket);
+    }
+
+    if (trade.marketKey !== "::") {
+      const bucket = tradesByMarketOutcome.get(trade.marketKey) ?? [];
+      bucket.push(trade);
+      tradesByMarketOutcome.set(trade.marketKey, bucket);
+    }
+  }
+
+  return closedPositionsRaw.map((position) => {
+    const assetMatches = tradesByAsset.get(String(position.asset ?? "")) ?? [];
+    const fallbackMatches = assetMatches.length
+      ? []
+      : (tradesByMarketOutcome.get(buildMarketOutcomeKey(position.title, position.outcome)) ?? []);
+
+    const closedTsMs = parseTimestampMs(position.timestamp);
+    const matches = (assetMatches.length ? assetMatches : fallbackMatches)
+      .slice()
+      .sort((a, b) => {
+        const aDist = a.tsMs != null && closedTsMs != null ? Math.abs(a.tsMs - closedTsMs) : Number.MAX_SAFE_INTEGER;
+        const bDist = b.tsMs != null && closedTsMs != null ? Math.abs(b.tsMs - closedTsMs) : Number.MAX_SAFE_INTEGER;
+        return aDist - bDist;
+      });
+
+    const orderIds = [...new Set(matches.map((match) => match.orderId).filter((value): value is string => Boolean(value)))];
+    const primaryMatch = matches[0];
+
+    return {
+      ...position,
+      orderId: orderIds[0] ?? null,
+      orderIds,
+      matchedTradeTs: primaryMatch?.entry.ts ?? null,
+      matchedBy: assetMatches.length ? "asset" : fallbackMatches.length ? "market_outcome" : null,
+    };
+  });
+}
+
 
 function saveTradeLog(entry: TradeLogEntry): void {
   // 1. Local file (fast, always)
@@ -293,6 +490,7 @@ const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
 const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_000);
 const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 3_000);
+const SESSION_PNL_LOOKBACK_DAYS = 7;
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
@@ -713,6 +911,7 @@ async function ensureMongoCollections() {
     const priceSnapshots = db.collection(MONGODB_PRICE_SNAPSHOTS_COLLECTION);
     const candles = db.collection(MONGODB_CHART_COLLECTION);
     const automations = db.collection(MONGODB_POSITION_AUTOMATION_COLLECTION);
+    const trades = db.collection(MONGODB_TRADES_COLLECTION);
 
     await Promise.all([
       marketCache.createIndex({ fetchedAt: -1 }),
@@ -730,6 +929,8 @@ async function ensureMongoCollections() {
       ),
       automations.createIndex({ assetId: 1 }, { unique: true }),
       automations.createIndex({ armed: 1, updatedAt: -1 }),
+      trades.createIndex({ ts: -1 }),
+      trades.createIndex({ orderId: 1 }, { sparse: true }),
     ]);
   } catch (error: any) {
     console.warn("MongoDB index initialization failed:", error?.message || error);
@@ -3867,8 +4068,8 @@ async function startServer() {
     res.json({ ok: true, baseMinConfidence: BOT_MIN_CONFIDENCE, adaptiveConfidenceByAsset: Object.fromEntries(adaptiveConfidenceByAsset) });
   });
 
-  app.get("/api/bot/trade-log", (req, res) => {
-    const all = loadTradeLog();
+  app.get("/api/bot/trade-log", async (req, res) => {
+    const all = await loadPersistedTradeLog();
     const days = Number.parseInt(String(req.query.days || ""), 10);
     const filtered = filterTradeLogByDays(all, days);
     const limit = Math.min(parseInt(String(req.query.limit || "200"), 10), 1000);
@@ -4102,13 +4303,19 @@ async function startServer() {
           timeout: 10000,
         }),
         axios.get("https://data-api.polymarket.com/closed-positions", {
-          params: { user: userAddress, limit: 50, sortBy: "TIMESTAMP", sortDirection: "DESC" },
+          params: { user: userAddress, limit: 500, sortBy: "TIMESTAMP", sortDirection: "DESC" },
           timeout: 10000,
         }),
       ]);
 
       const openPositionsRaw: any[] = openRes.status === "fulfilled" ? (openRes.value.data ?? []) : [];
       const closedPositionsRaw: any[] = closedRes.status === "fulfilled" ? (closedRes.value.data ?? []) : [];
+      const matchedClosedPositionsRaw = await matchClosedPositionsToPersistedTrades(closedPositionsRaw);
+      const sessionCutoffMs = Date.now() - SESSION_PNL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+      const sessionClosedPositionsRaw = matchedClosedPositionsRaw.filter((position) => {
+        const closedAtMs = parseTimestampMs(position.timestamp);
+        return closedAtMs != null && closedAtMs >= sessionCutoffMs;
+      });
 
       // Aggregate stats from closed positions
       const winCount  = closedPositionsRaw.filter((p) => p.realizedPnl > 0).length;
@@ -4116,6 +4323,27 @@ async function startServer() {
       const closedTrades = closedPositionsRaw.length;
       const winRate = closedTrades > 0 ? (winCount / closedTrades) * 100 : 0;
       const realizedPnl = closedPositionsRaw.reduce((sum, p) => sum + (p.realizedPnl ?? 0), 0);
+      let cumulativeSessionPnl = 0;
+      const sessionHistory = sessionClosedPositionsRaw
+        .slice()
+        .sort((a, b) => Number(a.timestamp ?? 0) - Number(b.timestamp ?? 0))
+        .map((position, index) => {
+          const tradePnl = roundPnl(Number(position.realizedPnl ?? 0));
+          cumulativeSessionPnl = roundPnl(cumulativeSessionPnl + tradePnl);
+          return {
+            index: index + 1,
+            timestamp: Number(position.timestamp ?? 0),
+            market: position.title ?? "",
+            outcome: position.outcome ?? "",
+            trade: tradePnl,
+            cumulative: cumulativeSessionPnl,
+            decision: tradePnl > 0 ? "WIN" : tradePnl < 0 ? "LOSS" : "FLAT",
+            orderId: position.orderId ?? null,
+            orderIds: position.orderIds ?? [],
+            matched: Array.isArray(position.orderIds) && position.orderIds.length > 0,
+            matchedTradeTs: position.matchedTradeTs ?? null,
+          };
+        });
 
       // Open exposure = sum of current market value of open positions
       const openExposure = openPositionsRaw.reduce((sum, p) => sum + (p.currentValue ?? p.initialValue ?? 0), 0);
@@ -4146,7 +4374,7 @@ async function startServer() {
           openExposure: openExposure.toFixed(4),
         },
         openPositions,
-        closedPositions: closedPositionsRaw.map((p) => ({
+        closedPositions: sessionClosedPositionsRaw.map((p) => ({
           assetId:     p.asset,
           market:      p.title,
           outcome:     p.outcome,
@@ -4157,8 +4385,15 @@ async function startServer() {
           timestamp:   p.timestamp,
           endDate:     p.endDate,
           eventSlug:   p.eventSlug,
+          orderId:     p.orderId ?? null,
+          orderIds:    p.orderIds ?? [],
+          matched:     Array.isArray(p.orderIds) && p.orderIds.length > 0,
+          matchedTradeTs: p.matchedTradeTs ?? null,
+          matchedBy:   p.matchedBy ?? null,
         })),
-        history: [], // legacy field kept for App.tsx compatibility
+        history: sessionHistory, // legacy field kept for App.tsx compatibility
+        sessionHistory,
+        sessionWindowDays: SESSION_PNL_LOOKBACK_DAYS,
         user: userAddress,
       });
     } catch (error: any) {
