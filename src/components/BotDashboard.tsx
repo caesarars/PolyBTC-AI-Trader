@@ -40,6 +40,10 @@ function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(" ");
 }
 
+const FIXED_TRADE_OPTIONS = [1, 2, 3, 4, 5, 10, 12, 15] as const;
+const MIN_FIXED_TRADE_USDC = FIXED_TRADE_OPTIONS[0];
+const MAX_FIXED_TRADE_USDC = FIXED_TRADE_OPTIONS[FIXED_TRADE_OPTIONS.length - 1];
+
 interface EntrySnapshot {
   market: string;
   windowStart: number;
@@ -429,7 +433,14 @@ export default function BotDashboard() {
     const fixedTradeUsdc = fixedTradeInput;
     if (conf !== null && (isNaN(conf) || conf < 50 || conf > 99)) return;
     if (edge !== null && (isNaN(edge) || edge < 0.01 || edge > 0.50)) return;
-    if (fixedTradeUsdc !== null && (!Number.isInteger(fixedTradeUsdc) || fixedTradeUsdc < 1 || fixedTradeUsdc > 5)) return;
+    if (
+      fixedTradeUsdc !== null &&
+      (!Number.isInteger(fixedTradeUsdc) ||
+        fixedTradeUsdc < MIN_FIXED_TRADE_USDC ||
+        fixedTradeUsdc > MAX_FIXED_TRADE_USDC)
+    ) {
+      return;
+    }
     setConfigSaving(true);
     try {
       await fetch("/api/bot/config", {
@@ -1358,7 +1369,7 @@ export default function BotDashboard() {
                 </span>
               </div>
               <div className="grid grid-cols-5 gap-1.5">
-                {[1, 2, 3, 4, 5, 10 , 12 ,15].map((amount) => {
+                {FIXED_TRADE_OPTIONS.map((amount) => {
                   const selected = (fixedTradeInput ?? status?.config.fixedTradeUsdc ?? 1) === amount;
                   return (
                     <button
