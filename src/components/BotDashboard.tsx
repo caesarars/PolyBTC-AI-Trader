@@ -593,6 +593,9 @@ export default function BotDashboard() {
   const armedCount = automations.filter((a) => a.armed).length;
 
   // Prefer the server-side history synced to Closed Positions; fall back to trade log when unavailable.
+  const [pnlDateFrom, setPnlDateFrom] = useState<string>("");
+  const [pnlDateTo, setPnlDateTo] = useState<string>("");
+
   const pnlHistory = useMemo(() => {
     const syncedHistory = performance?.sessionHistory?.length
       ? performance.sessionHistory
@@ -618,6 +621,7 @@ export default function BotDashboard() {
                 hour12: false,
               })
             : `#${i + 1}`,
+          tsMs: labelTime ? labelTime.getTime() : null,
           trade: entry.trade,
           cumulative: entry.cumulative,
           decision: entry.decision,
@@ -641,6 +645,7 @@ export default function BotDashboard() {
           minute: "2-digit",
           hour12: false,
         }),
+        tsMs: new Date(entry.ts).getTime(),
         trade: tradePnl,
         cumulative,
         decision: entry.result,
@@ -648,11 +653,32 @@ export default function BotDashboard() {
     });
   }, [performance?.history, performance?.sessionHistory, sessionTradeLog]);
 
-  const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
+  const filteredPnlHistory = useMemo(() => {
+    const fromMs = pnlDateFrom ? new Date(pnlDateFrom).getTime() : null;
+    const toMs   = pnlDateTo   ? new Date(pnlDateTo).getTime() + 86400_000 - 1 : null; // inclusive end of day
+    if (!fromMs && !toMs) return pnlHistory;
+    const filtered = pnlHistory.filter((e) => {
+      if (e.tsMs == null) return true;
+      if (fromMs && e.tsMs < fromMs) return false;
+      if (toMs   && e.tsMs > toMs)   return false;
+      return true;
+    });
+    // recompute cumulative for the filtered window
+    let cum = 0;
+    return filtered.map((e, i) => {
+      cum = parseFloat((cum + e.trade).toFixed(2));
+      return { ...e, label: `#${i + 1}`, cumulative: cum };
+    });
+  }, [pnlHistory, pnlDateFrom, pnlDateTo]);
+
+  const lastCumulative = filteredPnlHistory.length > 0 ? filteredPnlHistory[filteredPnlHistory.length - 1].cumulative : 0;
   const sessionWindowDays = performance?.sessionWindowDays ?? 7;
-  const sessionPnlSubtitle = performance?.sessionHistory?.length || performance?.history?.length
-    ? `last ${sessionWindowDays} days · synced with Closed Positions · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`
-    : `last ${sessionWindowDays} days · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`;
+  const isDateFiltered = pnlDateFrom || pnlDateTo;
+  const sessionPnlSubtitle = isDateFiltered
+    ? `${filteredPnlHistory.length} trade${filteredPnlHistory.length !== 1 ? "s" : ""} in range`
+    : performance?.sessionHistory?.length || performance?.history?.length
+      ? `last ${sessionWindowDays} days · synced with Closed Positions · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`
+      : `last ${sessionWindowDays} days · ${pnlHistory.length} resolved trade${pnlHistory.length !== 1 ? "s" : ""}`;
 
   return (
     <div className="space-y-6">
@@ -927,24 +953,55 @@ export default function BotDashboard() {
               {sessionPnlSubtitle}
             </span>
           </h3>
-          {pnlHistory.length > 0 && (
-            <span className={cn(
-              "text-sm font-mono font-bold",
-              lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
-            )}>
-              {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
-            </span>
+          <div className="flex items-center gap-2">
+            {filteredPnlHistory.length > 0 && (
+              <span className={cn(
+                "text-sm font-mono font-bold",
+                lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
+              )}>
+                {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* ── Date range filter ── */}
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Filter:</span>
+          <input
+            type="date"
+            title="From date"
+            value={pnlDateFrom}
+            onChange={(e) => setPnlDateFrom(e.target.value)}
+            className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500"
+          />
+          <span className="text-zinc-600 text-xs">→</span>
+          <input
+            type="date"
+            title="To date"
+            value={pnlDateTo}
+            onChange={(e) => setPnlDateTo(e.target.value)}
+            className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500"
+          />
+          {isDateFiltered && (
+            <button
+              type="button"
+              onClick={() => { setPnlDateFrom(""); setPnlDateTo(""); }}
+              className="text-[10px] text-zinc-500 hover:text-zinc-300 underline transition-colors"
+            >
+              reset
+            </button>
           )}
         </div>
 
-        {pnlHistory.length === 0 ? (
+        {filteredPnlHistory.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
             <BarChart3 className="w-8 h-8 opacity-30" />
-            <p className="text-xs">No resolved trades available yet</p>
+            <p className="text-xs">{isDateFiltered ? "No trades in selected range" : "No resolved trades available yet"}</p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={180}>
-            <AreaChart data={pnlHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+            <AreaChart data={filteredPnlHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="pnlGradientUp" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%"  stopColor="#22c55e" stopOpacity={0.25} />
