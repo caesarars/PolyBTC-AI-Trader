@@ -514,7 +514,7 @@ function getActiveConfig() {
     fixedTradeUsdc:   aggressiveFixedTradeUsdc,
     balanceCap:       0.25,
     entryWindowStart: 10,
-    entryWindowEnd:   220,
+    entryWindowEnd:   250,
   };
 }
 
@@ -1928,12 +1928,15 @@ function startDivergenceTracker() {
       // ── FAST PATH TRIGGER ─────────────────────────────────────────────────
       // Fire immediately on STRONG divergence — don't wait for next bot cycle.
       // Cooldown: 30s to prevent thrashing on the same divergence event.
+      // BTC-only: ETH/SOL divergence uses BTC price delta vs ETH/SOL thresholds
+      // (shared ring buffer bug) → produces false signals. Restrict to BTC only.
       if (
         strength === "STRONG" &&
         (direction === "UP" || direction === "DOWN") &&
         botEnabled &&
         now - lastDivergenceFastTradeAt > 30 &&
-        onStrongDivergence
+        onStrongDivergence &&
+        currentDivergenceAsset === "BTC"
       ) {
         onStrongDivergence(direction, { yesAsk, noAsk, btcDelta: btcDelta30s });
       }
@@ -2214,12 +2217,18 @@ async function startServer() {
 
   // ── Divergence Fast-Path Trade implementation ─────────────────────────────
   // Wired to onStrongDivergence so the tracker can call it directly without
-  // waiting for the next bot cycle (saves the ~2-3s Gemini round-trip).
+  // waiting for the next bot cycle (saves the ~2-3s round-trip).
   onStrongDivergence = (
     direction: "UP" | "DOWN",
     snapshot: { yesAsk: number | null; noAsk: number | null; btcDelta: number }
   ) => {
     const fastAsset = currentDivergenceAsset;
+    // Divergence fast path is BTC-only — ETH/SOL use a shared ring buffer that
+    // compares BTC price deltas against ETH/SOL thresholds, causing false signals.
+    if (fastAsset !== "BTC") {
+      botPrint("SKIP", `[DIV FAST][${fastAsset}] Divergence fast path restricted to BTC only — skipping`);
+      return;
+    }
     // Capture the market for this specific asset atomically before any async work
     const _fastMarket = activeBotMarketByAsset.get(fastAsset) ?? null;
     if (divergenceFastTradeRunning || !botEnabled || !_fastMarket) return;
@@ -2299,7 +2308,7 @@ async function startServer() {
           return;
         }
 
-        botPrint("TRADE", `⚡ DIVERGENCE FAST PATH ⚡ STRONG BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} (30s) → ${direction} | ask=${(bestAsk * 100).toFixed(0)}¢ | $${betAmount.toFixed(2)} USDC | Gemini skipped`);
+        botPrint("TRADE", `⚡ DIVERGENCE FAST PATH ⚡ STRONG BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} (30s) → ${direction} | ask=${(bestAsk * 100).toFixed(0)}¢ | $${betAmount.toFixed(2)} USDC`);
 
         // Mark handled before async execute — prevents race with bot cycle
         divAssetSet.add(market.id);
@@ -2313,14 +2322,14 @@ async function startServer() {
           confidence,
           estimatedEdge,
           riskLevel: "MEDIUM",
-          reasoning: `[DIV FAST PATH] STRONG divergence: BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} in 30s, YES lagging. Gemini skipped.`,
+          reasoning: `[DIV FAST PATH] STRONG divergence: BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} in 30s, YES lagging.`,
           candlePatterns: [],
           dataMode: "FULL_DATA" as const,
           reversalProbability: 30,
           oppositePressureProbability: 25,
           reversalReasoning: "Strong structural price lag",
         };
-        // Cache so the next bot cycle doesn't call Gemini again for this window
+        // Cache so the next bot cycle reuses this result for the window
         currentWindowAiCache.set(fastAsset, { windowStart: nowWindowStart, marketId: market.id, rec: fastRec });
 
         const tradeResult = await executePolymarketTrade({
@@ -2336,7 +2345,7 @@ async function startServer() {
         botSessionTradesCount++;
         botPrint("OK", `⚡ FAST PATH EXECUTED ✓ | ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
         void sendNotification(
-          `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(Gemini bypassed — STRONG divergence)`
+          `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(STRONG divergence)`
         );
 
         const levels = recommendAutomationLevels(bestAsk);
@@ -3197,23 +3206,14 @@ async function startServer() {
             }
           }
 
-          // ── FastLoop pre-filter: skip AI when no momentum and no divergence ──
-          const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK";
-          if (fastMomWeak && (!div || div.strength === "NONE")) {
-            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} (min=MODERATE) + no divergence — skipping AI | re-check enabled`);
-            analyzedThisWindow.delete(market.id); // allow re-check when momentum/divergence appears later in the same window
-            continue;
-          }
-
-          // ── FAST PATH: bypass Gemini when signals are overwhelmingly clear ────
+          // ── FAST PATH: synthesize directly when signals are overwhelmingly clear ────
           // Conditions (ALL must be true):
           //   1. FastLoop STRONG and directional
           //   2. Multi-TF alignment 4/5 or 5/5 in same direction
           //   3. Divergence STRONG or MODERATE in same direction (or no conflict)
           //   4. No recent loss pattern match (avoid repeating bad setups)
-          // When triggered: synthesize rec directly, skip ~3s Gemini latency.
 
-          // Compute local alignment score (mirrors computeMultiTimeframeAlignment in gemini.ts)
+          // Compute local alignment score
           // Signals: 60m bias, 5m confirmation, 1m trigger, technical score, FastLoop
           const _hist = btcHistoryResult?.history ?? [];
           const _ind = btcIndicatorsData;
@@ -3245,6 +3245,17 @@ async function startServer() {
           }
           const localAlignment = { bullish: _localBullish, bearish: _localBearish };
 
+          // ── FastLoop pre-filter: skip only when momentum flat AND alignment too weak ──
+          // Relaxed: WEAK FastLoop no longer blocks if ≥2 technical signals agree.
+          // This allows SYNTH to run when e.g. EMA + signalScore align even without strong momentum.
+          const fastMomWeak = !fastMom || fastMom.direction === "NEUTRAL" || fastMom.strength === "WEAK";
+          const techAlignScore = Math.max(localAlignment.bullish, localAlignment.bearish);
+          if (fastMomWeak && (!div || div.strength === "NONE") && techAlignScore < 2) {
+            botPrint("SKIP", `FastLoop pre-filter: ${fastMom ? `${fastMom.direction} ${fastMom.strength}` : "no data"} + no divergence + align=${techAlignScore}/5 — skipping | re-check enabled`);
+            analyzedThisWindow.delete(market.id);
+            continue;
+          }
+
           let rec: any;
           const fastPathDir = fastMom?.strength === "STRONG" && fastMom.direction !== "NEUTRAL"
             ? fastMom.direction : null;
@@ -3273,17 +3284,17 @@ async function startServer() {
               confidence: fastConf,
               estimatedEdge: fastEdge,
               candlePatterns: [],
-              reasoning: `[FAST PATH] ${alignmentScore}/5 signals aligned ${fastPathDir} | FastLoop STRONG vw=${fastMom!.volumeWeighted.toFixed(3)}% accel=${fastMom!.acceleration.toFixed(3)}%${div && div.strength !== "NONE" ? ` | Divergence ${div.strength} ${div.direction}` : ""} | Gemini skipped`,
+              reasoning: `[FAST PATH] ${alignmentScore}/5 signals aligned ${fastPathDir} | FastLoop STRONG vw=${fastMom!.volumeWeighted.toFixed(3)}% accel=${fastMom!.acceleration.toFixed(3)}%${div && div.strength !== "NONE" ? ` | Divergence ${div.strength} ${div.direction}` : ""}`,
               riskLevel: alignmentScore === 5 ? "LOW" : "MEDIUM",
               dataMode: "FULL_DATA" as const,
               reversalProbability: alignmentScore === 5 ? 20 : 30,
               oppositePressureProbability: 25,
               reversalReasoning: "Fast path — strong multi-signal consensus",
             };
-            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢ | Gemini skipped`);
+            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢`);
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
 
-          // ── NORMAL PATH: price-lag signal synthesizer (Gemini removed) ───────
+          // ── NORMAL PATH: price-lag signal synthesizer ───────
           } else if (currentWindowAiCache.get(currentAsset)?.windowStart === currentWindowStart && currentWindowAiCache.get(currentAsset)?.marketId === market.id) {
             rec = currentWindowAiCache.get(currentAsset)!.rec;
             botPrint("OK", `Reusing signal (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}%`);
@@ -3305,13 +3316,14 @@ async function startServer() {
             } else {
               const alignScore = synthDir === "UP" ? localAlignment.bullish : localAlignment.bearish;
               const divBoost   = div && div.strength === "STRONG" ? 10 : div && div.strength === "MODERATE" ? 5 : 0;
-              const momBoost   = fastMom?.strength === "STRONG" ? 8 : fastMom?.strength === "MODERATE" ? 4 : 0;
-              const techBoost  = btcIndicatorsData?.signalScore != null ? Math.min(6, Math.abs(btcIndicatorsData.signalScore) * 2) : 0;
+              const momBoost   = fastMom?.strength === "STRONG" ? 10 : fastMom?.strength === "MODERATE" ? 5 : 0;
+              const techBoost  = btcIndicatorsData?.signalScore != null ? Math.min(8, Math.abs(btcIndicatorsData.signalScore) * 2) : 0;
               const lossStreak = assetLossMemory.filter(l => l.direction === synthDir).length;
               const streakPenalty = lossStreak >= 2 ? lossStreak * 3 : 0;
 
-              let synthConf = 55 + alignScore * 4 + divBoost + momBoost + techBoost - streakPenalty;
-              synthConf = Math.max(55, Math.min(88, Math.round(synthConf)));
+              // Base 60 (was 55) + align weight ×5 (was ×4) → 3/5 align + MODERATE FastLoop = 60+15+5=80%
+              let synthConf = 60 + alignScore * 5 + divBoost + momBoost + techBoost - streakPenalty;
+              synthConf = Math.max(55, Math.min(90, Math.round(synthConf)));
 
               const riskLevel: "LOW" | "MEDIUM" | "HIGH" =
                 synthConf >= 75 && alignScore >= 3 ? "LOW"
@@ -3342,10 +3354,16 @@ async function startServer() {
           }
 
           // ── Apply divergence overrides AFTER AI decision ────────────────
+          // STRONG force-override is BTC-only — ETH/SOL divergence uses shared BTC
+          // ring buffer vs ETH/SOL thresholds, producing false signals.
           if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
             if (div.strength === "STRONG" && rec.decision !== "TRADE") {
-              // Force trade only if enough time remains — flash moves revert quickly
-              if (windowRemaining < 120) {
+              if (currentAsset !== "BTC") {
+                botPrint("SKIP",
+                  `DIVERGENCE OVERRIDE skipped for ${currentAsset} — STRONG override restricted to BTC only (shared ring buffer)`
+                );
+              } else if (windowRemaining < 120) {
+                // Force trade only if enough time remains — flash moves revert quickly
                 botPrint("SKIP",
                   `DIVERGENCE OVERRIDE skipped — only ${windowRemaining}s remaining (min 120s). Flash move likely to revert.`
                 );
@@ -3682,7 +3700,7 @@ async function startServer() {
           } else if (rec.decision === "NO_TRADE") {
             botPrint("SKIP", `No trade — conditions not met, will re-check next cycle`);
             // Remove from analyzed set so next cycle re-evaluates if conditions change.
-            // Keep AI cache so Gemini is not re-called — only re-check divergence/price/filters.
+            // Keep signal cache — only re-check divergence/price/filters.
             analyzedThisWindow.delete(market.id);
           }
 
