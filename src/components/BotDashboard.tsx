@@ -35,6 +35,7 @@ import {
   ReferenceLine,
   CartesianGrid,
 } from "recharts";
+import PaperTradeWidget from "./PaperTradeWidget";
 
 function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(" ");
@@ -1788,6 +1789,13 @@ export default function BotDashboard() {
             <div className="text-xs text-zinc-500 mt-1">{performance?.openPositions.length ?? 0} open positions</div>
           </div>
           <div className="text-[10px] text-zinc-600">{armedCount} automations armed</div>
+        </div>
+      </div>
+
+      {/* ── Paper Trade Widget ── */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="md:col-span-1">
+          <PaperTradeWidget />
         </div>
       </div>
 
