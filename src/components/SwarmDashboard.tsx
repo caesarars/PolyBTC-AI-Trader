@@ -414,7 +414,9 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
         <div className="glass-card p-4">
           <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold mb-1">Top Bot</div>
           <div className="text-sm font-bold truncate">{leaderboard[0]?.name ?? "—"}</div>
-          <div className="text-xs text-emerald-400 font-mono">{(leaderboard[0]?.accuracy * 100).toFixed(1)}%</div>
+          <div className="text-xs text-emerald-400 font-mono">
+            {leaderboard[0]?.accuracy != null ? `${(leaderboard[0].accuracy * 100).toFixed(1)}%` : "—"}
+          </div>
         </div>
       </div>
 
@@ -462,14 +464,15 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
               <div className="mt-4 pt-4 border-t border-zinc-800">
                 <div className="text-[10px] uppercase tracking-wider text-zinc-600 font-bold mb-2">Top 5 Confident Bots</div>
                 <div className="grid grid-cols-5 gap-2">
-                  {latest.topBots.map((bot) => (
+                  {(latest.topBots ?? []).map((bot) => (
                     <button
                       key={bot.id}
+                      type="button"
                       onClick={() => setSelectedBot(leaderboard.find((b) => b.id === bot.id) || null)}
                       className={`p-2 rounded-lg border text-center transition-all hover:scale-105 ${bot.direction === "UP" ? "bg-green-950/30 border-green-800/50" : bot.direction === "DOWN" ? "bg-red-950/30 border-red-800/50" : "bg-zinc-900 border-zinc-800"}`}
                     >
-                      <div className="text-[9px] text-zinc-500 truncate">{bot.name.slice(0, 8)}</div>
-                      <div className={`text-xs font-bold ${bot.direction === "UP" ? "text-green-400" : bot.direction === "DOWN" ? "text-red-400" : "text-zinc-400"}`}>{bot.confidence}%</div>
+                      <div className="text-[9px] text-zinc-500 truncate">{(bot.name ?? "?").slice(0, 8)}</div>
+                      <div className={`text-xs font-bold ${bot.direction === "UP" ? "text-green-400" : bot.direction === "DOWN" ? "text-red-400" : "text-zinc-400"}`}>{bot.confidence ?? 0}%</div>
                     </button>
                   ))}
                 </div>
@@ -639,23 +642,27 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
               Leaderboard
             </h2>
             <div className="space-y-2">
-              {leaderboard.slice(0, 15).map((bot, i) => (
-                <button
-                  key={bot.id}
-                  onClick={() => setSelectedBot(bot)}
-                  className="w-full flex items-center gap-2 p-2 rounded-lg hover:bg-zinc-800/50 transition-colors text-left"
-                >
-                  <span className={`text-xs font-mono w-5 ${i < 3 ? "text-amber-400 font-bold" : "text-zinc-600"}`}>{i + 1}</span>
-                  <Bot className="w-3 h-3 text-zinc-500" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs font-bold truncate">{bot.name}</div>
-                    <div className="text-[9px] text-zinc-600">{bot.totalPredictions} trades · streak {bot.streak > 0 ? "+" : ""}{bot.streak}</div>
-                  </div>
-                  <div className={`text-xs font-mono font-bold ${bot.accuracy >= 0.55 ? "text-green-400" : "text-red-400"}`}>
-                    {(bot.accuracy * 100).toFixed(1)}%
-                  </div>
-                </button>
-              ))}
+              {leaderboard.slice(0, 15).map((bot, i) => {
+                const acc = typeof bot.accuracy === "number" ? bot.accuracy : 0;
+                return (
+                  <button
+                    key={bot.id}
+                    type="button"
+                    onClick={() => setSelectedBot(bot)}
+                    className="w-full flex items-center gap-2 p-2 rounded-lg hover:bg-zinc-800/50 transition-colors text-left"
+                  >
+                    <span className={`text-xs font-mono w-5 ${i < 3 ? "text-amber-400 font-bold" : "text-zinc-600"}`}>{i + 1}</span>
+                    <Bot className="w-3 h-3 text-zinc-500" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold truncate">{bot.name ?? "?"}</div>
+                      <div className="text-[9px] text-zinc-600">{bot.totalPredictions ?? 0} trades · streak {(bot.streak ?? 0) > 0 ? "+" : ""}{bot.streak ?? 0}</div>
+                    </div>
+                    <div className={`text-xs font-mono font-bold ${acc >= 0.55 ? "text-green-400" : "text-red-400"}`}>
+                      {(acc * 100).toFixed(1)}%
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -744,21 +751,21 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
               <button onClick={() => setSelectedBot(null)} className="text-zinc-500 hover:text-white">✕</button>
             </div>
             <div className="space-y-3 text-sm">
-              <div className="text-zinc-400 text-xs leading-relaxed">{selectedBot.strategy}</div>
+              <div className="text-zinc-400 text-xs leading-relaxed">{selectedBot.strategy ?? "—"}</div>
               <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="bg-zinc-900 p-2 rounded">Accuracy: <span className="font-mono font-bold text-white">{(selectedBot.accuracy * 100).toFixed(1)}%</span></div>
-                <div className="bg-zinc-900 p-2 rounded">Trades: <span className="font-mono font-bold text-white">{selectedBot.totalPredictions}</span></div>
-                <div className="bg-zinc-900 p-2 rounded">Wins: <span className="font-mono font-bold text-green-400">{selectedBot.correctPredictions}</span></div>
-                <div className="bg-zinc-900 p-2 rounded">Streak: <span className={`font-mono font-bold ${selectedBot.streak >= 0 ? "text-green-400" : "text-red-400"}`}>{selectedBot.streak > 0 ? "+" : ""}{selectedBot.streak}</span></div>
+                <div className="bg-zinc-900 p-2 rounded">Accuracy: <span className="font-mono font-bold text-white">{((selectedBot.accuracy ?? 0) * 100).toFixed(1)}%</span></div>
+                <div className="bg-zinc-900 p-2 rounded">Trades: <span className="font-mono font-bold text-white">{selectedBot.totalPredictions ?? 0}</span></div>
+                <div className="bg-zinc-900 p-2 rounded">Wins: <span className="font-mono font-bold text-green-400">{selectedBot.correctPredictions ?? 0}</span></div>
+                <div className="bg-zinc-900 p-2 rounded">Streak: <span className={`font-mono font-bold ${(selectedBot.streak ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>{(selectedBot.streak ?? 0) > 0 ? "+" : ""}{selectedBot.streak ?? 0}</span></div>
               </div>
               <div className="text-[10px] text-zinc-600 uppercase tracking-wider font-bold mt-2">Parameters</div>
               <div className="grid grid-cols-2 gap-1 text-xs text-zinc-500">
-                <div>FastLoop: {selectedBot.parameters.fastLoopWeight}x</div>
-                <div>Divergence: {selectedBot.parameters.divergenceWeight}x</div>
-                <div>Heat: {selectedBot.parameters.heatWeight}x</div>
-                <div>Technical: {selectedBot.parameters.technicalWeight}x</div>
-                <div>Risk: {(selectedBot.parameters.riskTolerance * 100).toFixed(0)}%</div>
-                <div>Style: {selectedBot.confidenceStyle}</div>
+                <div>FastLoop: {selectedBot.parameters?.fastLoopWeight ?? "—"}x</div>
+                <div>Divergence: {selectedBot.parameters?.divergenceWeight ?? "—"}x</div>
+                <div>Heat: {selectedBot.parameters?.heatWeight ?? "—"}x</div>
+                <div>Technical: {selectedBot.parameters?.technicalWeight ?? "—"}x</div>
+                <div>Risk: {selectedBot.parameters?.riskTolerance != null ? `${(selectedBot.parameters.riskTolerance * 100).toFixed(0)}%` : "—"}</div>
+                <div>Style: {selectedBot.confidenceStyle ?? "—"}</div>
               </div>
             </div>
           </div>
