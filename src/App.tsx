@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { BTCPrice, SentimentData } from "./types";
-import { RefreshCw, Activity, DollarSign, Clock, Smile } from "lucide-react";
+import { RefreshCw, Activity, DollarSign, Clock, Smile, Eye } from "lucide-react";
 import BotDashboard from "./components/BotDashboard";
 import BotLogSidebar from "./components/BotLogSidebar";
+import PaperTradeVisual from "./components/PaperTradeVisual";
 
 // ── Window countdown (seconds left in current 5-min session) ────────────────
 function useWindowCountdown(): number {
@@ -33,6 +34,8 @@ export default function App() {
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
   const [balance, setBalance] = useState<BalanceState | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [view, setView] = useState<"dashboard" | "visual">("dashboard");
 
   const countdown = useWindowCountdown();
   const countdownColor = countdown <= 30 ? "text-red-400" : countdown <= 60 ? "text-yellow-400" : "text-green-400";
@@ -65,6 +68,10 @@ export default function App() {
     const interval = setInterval(fetchData, 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
+
+  if (view === "visual") {
+    return <PaperTradeVisual onBack={() => setView("dashboard")} />;
+  }
 
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-6xl mx-auto">
@@ -131,6 +138,16 @@ export default function App() {
         </div>
       </header>
 
+      <div className="flex justify-end mb-4">
+        <button
+          onClick={() => setView("visual")}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900/80 border border-zinc-800 hover:bg-zinc-800 hover:border-zinc-700 transition-all text-sm font-medium group"
+        >
+          <Eye className="w-4 h-4 text-purple-400 group-hover:text-purple-300" />
+          <span>Paper Trade Visualizer</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 font-bold">LIVE</span>
+        </button>
+      </div>
       <BotDashboard />
 
       <footer className="mt-20 pt-8 border-t border-zinc-900 text-center text-zinc-600 text-sm">
