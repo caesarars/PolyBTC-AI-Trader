@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { BTCPrice, SentimentData } from "./types";
-import { RefreshCw, Activity, DollarSign, Clock, Smile, Eye } from "lucide-react";
+import { RefreshCw, Activity, DollarSign, Clock, Smile, Eye, Zap } from "lucide-react";
 import BotDashboard from "./components/BotDashboard";
 import BotLogSidebar from "./components/BotLogSidebar";
 import PaperTradeVisual from "./components/PaperTradeVisual";
+import SwarmDashboard from "./components/SwarmDashboard";
 
 // ── Window countdown (seconds left in current 5-min session) ────────────────
 function useWindowCountdown(): number {
@@ -35,7 +36,7 @@ export default function App() {
   const [balance, setBalance] = useState<BalanceState | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [view, setView] = useState<"dashboard" | "visual">("dashboard");
+  const [view, setView] = useState<"dashboard" | "visual" | "swarm">("dashboard");
 
   const countdown = useWindowCountdown();
   const countdownColor = countdown <= 30 ? "text-red-400" : countdown <= 60 ? "text-yellow-400" : "text-green-400";
@@ -71,6 +72,10 @@ export default function App() {
 
   if (view === "visual") {
     return <PaperTradeVisual onBack={() => setView("dashboard")} />;
+  }
+
+  if (view === "swarm") {
+    return <SwarmDashboard onBack={() => setView("dashboard")} />;
   }
 
   return (
@@ -138,7 +143,15 @@ export default function App() {
         </div>
       </header>
 
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-end gap-3 mb-4">
+        <button
+          onClick={() => setView("swarm")}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900/80 border border-zinc-800 hover:bg-zinc-800 hover:border-zinc-700 transition-all text-sm font-medium group"
+        >
+          <Zap className="w-4 h-4 text-amber-400 group-hover:text-amber-300" />
+          <span>100-Bot Swarm</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 font-bold">AI</span>
+        </button>
         <button
           onClick={() => setView("visual")}
           className="flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900/80 border border-zinc-800 hover:bg-zinc-800 hover:border-zinc-700 transition-all text-sm font-medium group"

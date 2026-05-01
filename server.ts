@@ -9,6 +9,9 @@ import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 import { MongoClient, Db, Collection } from "mongodb";
+import { getBotProfiles, updateBotAccuracy, generateBotProfiles, BotProfile } from "./src/services/bot-personality.ts";
+import { askDeepSeek, batchPredict, MarketContext } from "./src/services/deepseek.ts";
+import { runSwarmPrediction, resolveSwarmWindow, getPredictionsForWindow, getAllEnsembles, getLeaderboard, getBotDetail, getSwarmStats, isSwarmEnabled, clearSwarmMemory } from "./src/services/swarm.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -577,6 +580,7 @@ let botInterval: NodeJS.Timeout | null = null;
 let botSessionStartBalance: number | null = null;
 let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
+let lastSwarmWindowStart = 0;
 // Per-asset analyzed-this-window tracking (keyed by asset → Set of market IDs)
 const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
   (["BTC"] as TradingAsset[]).map(a => [a, new Set<string>()])
@@ -3213,6 +3217,39 @@ async function startServer() {
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"} | Heat: ${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
 
+            // ── Swarm Prediction (100 AI bots) ───────────────────────────────
+            if (isSwarmEnabled() && currentWindowStart !== lastSwarmWindowStart) {
+              lastSwarmWindowStart = currentWindowStart;
+              setTimeout(async () => {
+                try {
+                  const fastMom = btcHistoryResult?.history?.length
+                    ? computeFastLoopMomentum(btcHistoryResult.history)
+                    : null;
+                  const context: MarketContext = {
+                    btcPrice: btcPriceData?.price ? parseFloat(btcPriceData.price) : 0,
+                    priceChange5m: fastMom?.raw ?? 0,
+                    priceChange1h: btcHistoryResult?.history?.length
+                      ? ((btcHistoryResult.history[btcHistoryResult.history.length - 1].close - btcHistoryResult.history[0].close) / btcHistoryResult.history[0].close) * 100
+                      : 0,
+                    fastLoopDirection: fastMom?.direction ?? "NEUTRAL",
+                    fastLoopStrength: fastMom?.strength ?? "WEAK",
+                    fastLoopVW: fastMom?.volumeWeighted ?? 0,
+                    rsi: btcIndicatorsData?.rsi,
+                    emaCross: btcIndicatorsData?.emaCross,
+                    fundingRate: heatData?.fundingRate,
+                    longShortRatio: heatData?.longShortRatio,
+                    heatSignal: heatData?.heatSignal,
+                    windowElapsedSeconds: windowElapsedSeconds,
+                  };
+                  const { ensemble, predictions } = await runSwarmPrediction(currentWindowStart, context);
+                  botPrint("INFO", `[Swarm] ${predictions}/100 bots → ${ensemble.consensusDirection} (${ensemble.consensusConfidence}%) | UP:${ensemble.upVotes} DOWN:${ensemble.downVotes} NEUTRAL:${ensemble.neutralVotes}`);
+                  pushSSE("swarm", { windowStart: currentWindowStart, ensemble, predictions });
+                } catch (err: any) {
+                  botPrint("ERR", `[Swarm] Prediction failed: ${err?.message || String(err)}`);
+                }
+              }, 500);
+            }
+
             // ── Strike price vs current price analysis ──────────────────────
             // Parse strike from question e.g. "Will BTC be above $95,500 at 12:05?"
             const _strikeMatch = (market.question ?? "").match(/\$([0-9,]+(?:\.[0-9]+)?)/);
@@ -3952,6 +3989,122 @@ async function startServer() {
     paperMode = enabled;
     botPrint("OK", `Paper mode ${enabled ? "ENABLED" : "DISABLED"}`);
     res.json({ ok: true, paperMode });
+  });
+
+  // ── Swarm API Endpoints ─────────────────────────────────────────────────────
+  app.get("/api/swarm/status", (_req, res) => {
+    res.json({
+      enabled: isSwarmEnabled(),
+      botCount: 100,
+      stats: getSwarmStats(),
+    });
+  });
+
+  app.get("/api/swarm/bots", (_req, res) => {
+    const profiles = getBotProfiles();
+    res.json({ bots: profiles });
+  });
+
+  app.get("/api/swarm/bots/:id", (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid bot ID" });
+    const detail = getBotDetail(id);
+    if (!detail.profile) return res.status(404).json({ error: "Bot not found" });
+    res.json(detail);
+  });
+
+  app.get("/api/swarm/leaderboard", (_req, res) => {
+    res.json({ leaderboard: getLeaderboard().slice(0, 20) });
+  });
+
+  app.get("/api/swarm/ensembles", (_req, res) => {
+    res.json({ ensembles: getAllEnsembles().slice(0, 50) });
+  });
+
+  app.get("/api/swarm/ensemble/:windowStart", (req, res) => {
+    const ws = parseInt(req.params.windowStart, 10);
+    if (isNaN(ws)) return res.status(400).json({ error: "Invalid window start" });
+    const predictions = getPredictionsForWindow(ws);
+    res.json({ windowStart: ws, predictions, count: predictions.length });
+  });
+
+  app.get("/api/swarm/analytics", (_req, res) => {
+    const ensembles = getAllEnsembles();
+    const resolved = ensembles.filter((e: any) => e.actual !== null);
+    const consensusCorrect = resolved.filter((e: any) => e.correct === true).length;
+
+    // Direction breakdown
+    const upWins = resolved.filter((e: any) => e.actual === "UP" && e.correct).length;
+    const upTotal = resolved.filter((e: any) => e.actual === "UP").length;
+    const downWins = resolved.filter((e: any) => e.actual === "DOWN" && e.correct).length;
+    const downTotal = resolved.filter((e: any) => e.actual === "DOWN").length;
+
+    res.json({
+      totalWindows: ensembles.length,
+      resolvedWindows: resolved.length,
+      consensusAccuracy: resolved.length > 0 ? parseFloat(((consensusCorrect / resolved.length) * 100).toFixed(1)) : 0,
+      upAccuracy: upTotal > 0 ? parseFloat(((upWins / upTotal) * 100).toFixed(1)) : 0,
+      downAccuracy: downTotal > 0 ? parseFloat(((downWins / downTotal) * 100).toFixed(1)) : 0,
+      avgBotsPerWindow: ensembles.length > 0
+        ? parseFloat((ensembles.reduce((s: number, e: any) => s + e.upVotes + e.downVotes + e.neutralVotes, 0) / ensembles.length).toFixed(1))
+        : 0,
+      topBots: getLeaderboard().slice(0, 10),
+    });
+  });
+
+  app.post("/api/swarm/trigger", async (_req, res) => {
+    if (!isSwarmEnabled()) {
+      return res.status(400).json({ error: "Swarm is not enabled. Set SWARM_ENABLED=true in .env" });
+    }
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const windowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+
+      // Gather market context fresh
+      const [history, indicators, heatData] = await Promise.all([
+        getBtcHistory(),
+        getBtcIndicators(),
+        getAssetHeatData("BTC", false),
+      ]);
+      const fastMom = history?.history?.length ? computeFastLoopMomentum(history.history) : null;
+
+      const context: MarketContext = {
+        btcPrice: history?.history?.length ? history.history[history.history.length - 1].close : 0,
+        priceChange5m: fastMom?.raw ?? 0,
+        priceChange1h: history?.history?.length
+          ? ((history.history[history.history.length - 1].close - history.history[0].close) / history.history[0].close) * 100
+          : 0,
+        fastLoopDirection: fastMom?.direction ?? "NEUTRAL",
+        fastLoopStrength: fastMom?.strength ?? "WEAK",
+        fastLoopVW: fastMom?.volumeWeighted ?? 0,
+        rsi: indicators?.rsi,
+        emaCross: indicators?.emaCross,
+        fundingRate: heatData?.fundingRate,
+        longShortRatio: heatData?.longShortRatio,
+        heatSignal: heatData?.heatSignal,
+        windowElapsedSeconds: now - windowStart,
+      };
+
+      const { ensemble, predictions } = await runSwarmPrediction(windowStart, context);
+      res.json({ ok: true, ensemble, predictions, windowStart });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Swarm prediction failed" });
+    }
+  });
+
+  app.post("/api/swarm/resolve", async (req, res) => {
+    const { windowStart, actual } = req.body || {};
+    if (!windowStart || !actual || !["UP", "DOWN"].includes(actual)) {
+      return res.status(400).json({ error: "windowStart and actual (UP/DOWN) required" });
+    }
+    await resolveSwarmWindow(windowStart, actual);
+    res.json({ ok: true, windowStart, actual });
+  });
+
+  app.post("/api/swarm/reset", (_req, res) => {
+    clearSwarmMemory();
+    botPrint("INFO", "[Swarm] Memory cleared");
+    res.json({ ok: true });
   });
 
   app.get("/api/bot/log", (req, res) => {
