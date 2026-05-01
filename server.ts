@@ -2174,6 +2174,37 @@ async function startServer() {
     return { error: message, detail: message, context };
   };
 
+  // ── Retry helper for transient CLOB/network errors ─────────────────────────
+  // Retries: timeout, connection reset, rate-limit (429), server errors (5xx).
+  // Does NOT retry: permanent errors (insufficient balance, invalid params, auth).
+  async function withRetry<T>(
+    fn: () => Promise<T>,
+    opts: { maxRetries?: number; baseDelayMs?: number; label?: string } = {}
+  ): Promise<T> {
+    const { maxRetries = 3, baseDelayMs = 500, label = "operation" } = opts;
+    let lastErr: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || err?.error || "");
+        const isTransient =
+          /timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket|network|rate limit|too many requests|429|5\d\d|temporarily unavailable|service unavailable/i.test(msg) ||
+          err?.code === "ECONNRESET" ||
+          err?.code === "ETIMEDOUT" ||
+          err?.code === "ECONNREFUSED";
+
+        if (!isTransient || attempt === maxRetries) throw err;
+
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        botPrint("WARN", `[Retry] ${label} failed (attempt ${attempt + 1}/${maxRetries + 1}): ${msg.slice(0, 80)} — retrying in ${delay}ms…`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
+  }
+
   const executePolymarketTrade = async ({
     tokenID,
     amount,
@@ -2227,7 +2258,7 @@ async function startServer() {
       throw new Error("Trade amount must be greater than 0.");
     }
 
-    const orderbook = await client.getOrderBook(tokenID);
+    const orderbook = await withRetry(() => client.getOrderBook(tokenID), { label: "getOrderBook" });
     const bestBid = Number(orderbook?.bids?.[0]?.price || "0");
     const bestAsk = Number(orderbook?.asks?.[0]?.price || "0");
 
@@ -2255,12 +2286,12 @@ async function startServer() {
     }
 
     const [tickSize, negRisk] = await Promise.all([
-      client.getTickSize(tokenID),
-      client.getNegRisk(tokenID),
+      withRetry(() => client.getTickSize(tokenID), { label: "getTickSize" }),
+      withRetry(() => client.getNegRisk(tokenID), { label: "getNegRisk" }),
     ]);
 
     if (parsedSide === Side.BUY && normalizedAmountMode === "SPEND") {
-      const allowance = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+      const allowance = await withRetry(() => client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }), { label: "getBalanceAllowance" });
       const allowanceResponse = allowance as any;
       const allowanceValues = [
         allowanceResponse.allowance,
@@ -2285,15 +2316,18 @@ async function startServer() {
       }
     }
 
-    const order = await client.createAndPostOrder(
-      {
-        tokenID,
-        size: Number(orderSize.toFixed(6)),
-        side: parsedSide,
-        price: parsedPrice,
-      },
-      { tickSize, negRisk },
-      OrderType.GTC
+    const order = await withRetry(
+      () => client.createAndPostOrder(
+        {
+          tokenID,
+          size: Number(orderSize.toFixed(6)),
+          side: parsedSide,
+          price: parsedPrice,
+        },
+        { tickSize, negRisk },
+        OrderType.GTC
+      ),
+      { label: "createAndPostOrder", maxRetries: 3 }
     );
 
     if (order?.success === false) {
