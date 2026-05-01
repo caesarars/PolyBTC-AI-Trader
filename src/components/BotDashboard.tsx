@@ -78,6 +78,8 @@ interface BotStatus {
     maxBetUsdc: number;
     fixedTradeUsdc?: number;
     sessionLossLimit: number;
+    entryWindowStart?: number;
+    entryWindowEnd?: number;
     scanIntervalMs: number;
   };
 }
@@ -316,6 +318,8 @@ export default function BotDashboard() {
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
+  const [winStartInput, setWinStartInput] = useState<string>("");
+  const [winEndInput, setWinEndInput] = useState<string>("");
   const [configSaving, setConfigSaving] = useState(false);
   const [configSaved, setConfigSaved] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -461,6 +465,8 @@ export default function BotDashboard() {
     const conf = confInput !== "" ? Number(confInput) : null;
     const edge = edgeInput !== "" ? Number(edgeInput) : null;
     const fixedTradeUsdc = fixedTradeInput;
+    const winStart = winStartInput !== "" ? Number(winStartInput) : null;
+    const winEnd = winEndInput !== "" ? Number(winEndInput) : null;
     if (conf !== null && (isNaN(conf) || conf < 50 || conf > 99)) return;
     if (edge !== null && (isNaN(edge) || edge < 0.01 || edge > 0.50)) return;
     if (
@@ -471,6 +477,8 @@ export default function BotDashboard() {
     ) {
       return;
     }
+    if (winStart !== null && (isNaN(winStart) || winStart < 0 || winStart > 120)) return;
+    if (winEnd !== null && (isNaN(winEnd) || winEnd < 180 || winEnd > 295)) return;
     setConfigError(null);
     setConfigSaved(false);
     setConfigSaving(true);
@@ -482,6 +490,8 @@ export default function BotDashboard() {
           ...(conf !== null && { minConfidence: conf }),
           ...(edge !== null && { minEdge: edge }),
           ...(fixedTradeUsdc !== null && { fixedTradeUsdc }),
+          ...(winStart !== null && { entryWindowStart: winStart }),
+          ...(winEnd !== null && { entryWindowEnd: winEnd }),
         }),
       });
       const payload = await response.json().catch(() => null);
@@ -584,7 +594,7 @@ export default function BotDashboard() {
   const windowSeconds = status?.windowElapsedSeconds ?? 0;
   const windowRemaining = 300 - windowSeconds;
   const windowColor = windowRemaining <= 30 ? "text-red-400" : windowRemaining <= 60 ? "text-yellow-400" : "text-green-400";
-  const entryZone = windowSeconds >= 30 && windowSeconds <= 270;
+  const entryZone = windowSeconds >= (status?.config.entryWindowStart ?? 10) && windowSeconds <= (status?.config.entryWindowEnd ?? 280);
 
   const sessionPnl =
     status?.sessionStartBalance != null
@@ -1515,7 +1525,7 @@ export default function BotDashboard() {
           </div>
           <div className="text-[10px] text-zinc-600 space-y-0.5">
             <div className="flex items-center gap-2">
-              <span>Conf ≥{status?.config.minConfidence ?? 70}% | Edge ≥{status?.config.minEdge ?? 10}¢</span>
+              <span>Conf ≥{status?.config.minConfidence ?? 70}% | Edge ≥{status?.config.minEdge ?? 10}¢ | Window {status?.config.entryWindowStart ?? 10}s–{status?.config.entryWindowEnd ?? 280}s</span>
               <button
                 type="button"
                 onClick={handleResetConfidence}
@@ -1656,6 +1666,45 @@ export default function BotDashboard() {
                   : ""}
               </div>
             </div>
+            {/* Entry Window */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-zinc-400">Entry Window</span>
+                <span className="font-mono text-purple-400">
+                  {winStartInput !== "" || winEndInput !== ""
+                    ? `${winStartInput !== "" ? winStartInput : status?.config.entryWindowStart ?? 10}s–${winEndInput !== "" ? winEndInput : status?.config.entryWindowEnd ?? 280}s`
+                    : `${status?.config.entryWindowStart ?? 10}s–${status?.config.entryWindowEnd ?? 280}s (aktif)`}
+                </span>
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className="text-[9px] text-zinc-600 block mb-1">Start</label>
+                  <input
+                    type="range"
+                    min={0} max={120} step={5}
+                    value={winStartInput !== "" ? Number(winStartInput) : (status?.config.entryWindowStart ?? 10)}
+                    onChange={(e) => setWinStartInput(e.target.value)}
+                    className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-purple-500 bg-zinc-700"
+                  />
+                  <div className="flex justify-between text-[9px] text-zinc-600 font-mono mt-1">
+                    <span>0s</span><span>60s</span><span>120s</span>
+                  </div>
+                </div>
+                <div className="flex-1">
+                  <label className="text-[9px] text-zinc-600 block mb-1">End</label>
+                  <input
+                    type="range"
+                    min={180} max={295} step={5}
+                    value={winEndInput !== "" ? Number(winEndInput) : (status?.config.entryWindowEnd ?? 280)}
+                    onChange={(e) => setWinEndInput(e.target.value)}
+                    className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-purple-500 bg-zinc-700"
+                  />
+                  <div className="flex justify-between text-[9px] text-zinc-600 font-mono mt-1">
+                    <span>180s</span><span>240s</span><span>295s</span>
+                  </div>
+                </div>
+              </div>
+            </div>
             {/* EV preview */}
             {confInput !== "" && edgeInput !== "" && (() => {
               const conf = Number(confInput) / 100;
@@ -1670,7 +1719,7 @@ export default function BotDashboard() {
             <button
               type="button"
               onClick={handleSaveConfig}
-              disabled={configSaving || (confInput === "" && edgeInput === "" && fixedTradeInput === null)}
+              disabled={configSaving || (confInput === "" && edgeInput === "" && fixedTradeInput === null && winStartInput === "" && winEndInput === "")}
               className="w-full py-1.5 rounded-lg text-xs font-bold transition-all bg-zinc-700 text-zinc-300 hover:bg-emerald-600 hover:text-white disabled:opacity-40 disabled:cursor-default"
             >
               {configSaving ? "Saving…" : configSaved ? "✓ Saved" : "Apply"}

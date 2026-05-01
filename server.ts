@@ -531,6 +531,8 @@ const BOT_FIXED_TRADE_USDC = Number(process.env.BOT_FIXED_TRADE_USDC || 1);
 let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
 let aggressiveMinEdge       = BOT_MIN_EDGE;
 let aggressiveFixedTradeUsdc = BOT_FIXED_TRADE_USDC;
+let aggressiveEntryWindowStart = 10;
+let aggressiveEntryWindowEnd   = 280;
 
 function getActiveConfig() {
   return {
@@ -540,8 +542,8 @@ function getActiveConfig() {
     maxBetUsdc:       BOT_MAX_BET_USDC,
     fixedTradeUsdc:   aggressiveFixedTradeUsdc,
     balanceCap:       0.25,
-    entryWindowStart: 10,
-    entryWindowEnd:   280,
+    entryWindowStart: aggressiveEntryWindowStart,
+    entryWindowEnd:   aggressiveEntryWindowEnd,
   };
 }
 
@@ -3883,6 +3885,8 @@ async function startServer() {
         kellyFraction: getActiveConfig().kellyFraction,
         maxBetUsdc: getActiveConfig().maxBetUsdc,
         fixedTradeUsdc: getActiveConfig().fixedTradeUsdc,
+        entryWindowStart: getActiveConfig().entryWindowStart,
+        entryWindowEnd: getActiveConfig().entryWindowEnd,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
     });
@@ -4118,7 +4122,7 @@ async function startServer() {
   });
 
   app.post("/api/bot/config", (req, res) => {
-    const { minConfidence, minEdge, fixedTradeUsdc } = req.body || {};
+    const { minConfidence, minEdge, fixedTradeUsdc, entryWindowStart, entryWindowEnd } = req.body || {};
     if (minConfidence !== undefined) {
       const val = Number(minConfidence);
       if (isNaN(val) || val < 50 || val > 99) return res.status(400).json({ error: "minConfidence must be 50–99" });
@@ -4136,9 +4140,19 @@ async function startServer() {
       }
       aggressiveFixedTradeUsdc = val;
     }
+    if (entryWindowStart !== undefined) {
+      const val = Number(entryWindowStart);
+      if (isNaN(val) || val < 0 || val > 120) return res.status(400).json({ error: "entryWindowStart must be 0–120" });
+      aggressiveEntryWindowStart = val;
+    }
+    if (entryWindowEnd !== undefined) {
+      const val = Number(entryWindowEnd);
+      if (isNaN(val) || val < 180 || val > 295) return res.status(400).json({ error: "entryWindowEnd must be 180–295" });
+      aggressiveEntryWindowEnd = val;
+    }
     const cfg = getActiveConfig();
-    botPrint("INFO", `Config updated (AGGRESSIVE): conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢ fixed=$${aggressiveFixedTradeUsdc.toFixed(2)}`);
-    res.json({ ok: true, aggressiveMinConfidence, aggressiveMinEdge, aggressiveFixedTradeUsdc, config: cfg });
+    botPrint("INFO", `Config updated: conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢ fixed=$${aggressiveFixedTradeUsdc.toFixed(2)} win=[${aggressiveEntryWindowStart}s–${aggressiveEntryWindowEnd}s]`);
+    res.json({ ok: true, config: cfg });
   });
 
   // ── Active market assets ──────────────────────────────────────────────────
