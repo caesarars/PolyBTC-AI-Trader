@@ -787,6 +787,7 @@ const winMemory: WinMemory[] = [];
 const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0]]);
 const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0]]);
 const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0]]);
+const resolvedSwarmWindows = new Set<number>(); // Track which windows have been resolved by swarm
 // Global aliases kept for persistence (sum/avg not needed — persist per entry in lossMemory)
 let adaptiveLossPenaltyEnabled = true;
 
@@ -2928,6 +2929,22 @@ async function startServer() {
           botPrint("INFO", `Result pending (${waitedMin}min elapsed) — retrying next cycle`);
         }
         continue;
+      }
+
+      // ── Resolve Swarm for this window (once per window) ────────────────────
+      if (getSwarmEnabled() && !resolvedSwarmWindows.has(pending.windowEnd)) {
+        try {
+          // Determine actual direction from market result
+          // ourTokenPrice >= 0.90 means we won → our direction was correct
+          const actualDir = ourTokenPrice >= 0.90 ? pending.direction : (pending.direction === "UP" ? "DOWN" : "UP");
+          if (actualDir === "UP" || actualDir === "DOWN") {
+            await resolveSwarmWindow(pending.windowEnd, actualDir as "UP" | "DOWN");
+            resolvedSwarmWindows.add(pending.windowEnd);
+            botPrint("INFO", `[Swarm] Window ${pending.windowEnd} resolved → ${actualDir} (from market result)`);
+          }
+        } catch (err: any) {
+          botPrint("WARN", `[Swarm] Failed to resolve window ${pending.windowEnd}: ${err?.message || String(err)}`);
+        }
       }
 
       // ── Determine WIN / LOSS ───────────────────────────────────────────────
