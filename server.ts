@@ -41,6 +41,7 @@ interface TradeLogEntry {
   yesDelta30s?: number;
   windowElapsedSeconds: number;
   orderId: string | null;
+  isPaperTrade?: boolean;
 }
 
 type ResolvedOrderMeta = {
@@ -281,7 +282,7 @@ function loadTradeLog(): TradeLogEntry[] {
 
 function savePaperTradeLog(entry: TradeLogEntry): void {
   try {
-    fs.appendFileSync(PAPER_TRADE_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
+    fs.appendFileSync(PAPER_TRADE_LOG_FILE, JSON.stringify({ ...entry, isPaperTrade: true }) + "\n", "utf8");
   } catch (e: any) {
     console.error("[Persist] Failed to write paper_trade_log.jsonl:", e.message);
   }
@@ -4212,7 +4213,11 @@ async function startServer() {
   app.get("/api/bot/trade-log", async (req, res) => {
     const all = await loadPersistedTradeLog();
     const days = Number.parseInt(String(req.query.days || ""), 10);
-    const filtered = filterTradeLogByDays(all, days);
+    let filtered = filterTradeLogByDays(all, days);
+    const paperOnly = String(req.query.paperOnly || "").toLowerCase() === "true" || String(req.query.paperOnly || "").toLowerCase() === "1";
+    const realOnly = String(req.query.realOnly || "").toLowerCase() === "true" || String(req.query.realOnly || "").toLowerCase() === "1";
+    if (paperOnly) filtered = filtered.filter((e) => e.isPaperTrade);
+    if (realOnly) filtered = filtered.filter((e) => !e.isPaperTrade);
     const limit = Math.min(parseInt(String(req.query.limit || "200"), 10), 1000);
     const offset = parseInt(String(req.query.offset || "0"), 10);
     const entries = filtered.slice().reverse().slice(offset, offset + limit);
@@ -4227,6 +4232,18 @@ async function startServer() {
       total: filtered.length, wins, losses, winRate, totalPnl,
       divergence: { trades: divTrades.length, wins: divWins, winRate: divWinRate },
       entries,
+    });
+  });
+
+  app.get("/api/bot/paper-trade-stats", async (_req, res) => {
+    const paper = loadPaperTradeLog();
+    const wins = paper.filter((e) => e.result === "WIN").length;
+    const losses = paper.filter((e) => e.result === "LOSS").length;
+    const totalPnl = parseFloat(paper.reduce((s, e) => s + e.pnl, 0).toFixed(2));
+    const winRate = paper.length > 0 ? parseFloat(((wins / paper.length) * 100).toFixed(1)) : 0;
+    res.json({
+      total: paper.length, wins, losses, winRate, totalPnl,
+      lastTrade: paper[paper.length - 1] || null,
     });
   });
 

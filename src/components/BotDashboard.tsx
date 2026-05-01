@@ -315,6 +315,7 @@ export default function BotDashboard() {
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
+  const [paperStats, setPaperStats] = useState<{ total: number; wins: number; losses: number; winRate: number; totalPnl: number } | null>(null);
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
@@ -343,7 +344,7 @@ export default function BotDashboard() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes, heatRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, paperStatsRes, momRes, notifRes, analyticsRes, calibRes, learningRes, heatRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -351,6 +352,7 @@ export default function BotDashboard() {
         fetch("/api/polymarket/balance").then((r) => r.json()),
         fetch("/api/bot/trade-log?limit=50").then((r) => r.json()),
         fetch("/api/bot/trade-log?days=7&limit=1000").then((r) => r.json()),
+        fetch("/api/bot/paper-trade-stats").then((r) => r.json()),
         fetch("/api/bot/momentum-history").then((r) => r.json()),
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
@@ -370,6 +372,7 @@ export default function BotDashboard() {
       if (autoRes.status === "fulfilled") setAutomations((autoRes.value as any).automations || []);
       if (tradeLogRes.status === "fulfilled") setTradeLog(tradeLogRes.value as TradeLogStats);
       if (sessionTradeLogRes.status === "fulfilled") setSessionTradeLog(sessionTradeLogRes.value as TradeLogStats);
+      if (paperStatsRes.status === "fulfilled") setPaperStats(paperStatsRes.value as any);
       if (balRes.status === "fulfilled" && !(balRes.value as any).error) {
         setBalance((balRes.value as any).balance || "—");
       }
@@ -1583,6 +1586,16 @@ export default function BotDashboard() {
                 {status?.paperMode ? "Disable" : "Enable"}
               </button>
             </div>
+            {paperStats && paperStats.total > 0 && (
+              <div className="flex items-center gap-2 text-[10px]">
+                <span className="text-zinc-500">Paper trades:</span>
+                <span className="font-mono font-bold text-amber-400">{paperStats.wins}W / {paperStats.losses}L</span>
+                <span className="text-zinc-600">|</span>
+                <span className={cn("font-mono font-bold", paperStats.winRate >= 55 ? "text-green-400" : "text-red-400")}>{paperStats.winRate}% WR</span>
+                <span className="text-zinc-600">|</span>
+                <span className={cn("font-mono font-bold", paperStats.totalPnl >= 0 ? "text-green-400" : "text-red-400")}>{paperStats.totalPnl >= 0 ? "+" : ""}${paperStats.totalPnl.toFixed(2)}</span>
+              </div>
+            )}
           </div>
         </div>
 
