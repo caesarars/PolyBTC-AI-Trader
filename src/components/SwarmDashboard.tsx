@@ -19,6 +19,10 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
+  Terminal,
+  Wifi,
+  WifiOff,
+  Filter,
 } from "lucide-react";
 
 interface SwarmEnsemble {
@@ -88,8 +92,16 @@ interface WindowSnapshot {
   updatedAt: number;
 }
 
+interface RawLogEntry {
+  ts: string;
+  level: string;
+  msg: string;
+}
+
 export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
-  const [status, setStatus] = useState<{ enabled: boolean; botCount: number; stats: any } | null>(null);
+  const [status, setStatus] = useState<{ enabled: boolean; botCount: number; stats: any; apiKeyConfigured?: boolean; botRunning?: boolean; botEnabled?: boolean } | null>(null);
+  const [toggling, setToggling] = useState(false);
+  const [toggleError, setToggleError] = useState<string | null>(null);
   const [ensembles, setEnsembles] = useState<SwarmEnsemble[]>([]);
   const [leaderboard, setLeaderboard] = useState<BotProfile[]>([]);
   const [analytics, setAnalytics] = useState<any>(null);
@@ -98,6 +110,10 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
   const [selectedBot, setSelectedBot] = useState<BotProfile | null>(null);
   const [nowTick, setNowTick] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [rawLog, setRawLog] = useState<RawLogEntry[]>([]);
+  const [logConnected, setLogConnected] = useState(false);
+  const [logFilter, setLogFilter] = useState<string>("ALL");
+  const logBottomRef = useRef<HTMLDivElement>(null);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -129,6 +145,18 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
 
     const es = new EventSource("/api/bot/events");
     es.addEventListener("swarm", () => fetchAll());
+    es.addEventListener("snapshot", (e: MessageEvent) => {
+      const data = JSON.parse(e.data);
+      setRawLog(data.log || []);
+      setLogConnected(true);
+    });
+    es.addEventListener("log", (e: MessageEvent) => {
+      const entry: RawLogEntry = JSON.parse(e.data);
+      setRawLog((prev) => [entry, ...prev].slice(0, 500));
+      setLogConnected(true);
+    });
+    es.onerror = () => setLogConnected(false);
+
     return () => {
       clearInterval(id);
       if (timerRef.current) clearInterval(timerRef.current);
@@ -144,15 +172,30 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
   };
 
   const toggleSwarm = async () => {
+    if (toggling) return;
     const next = !status?.enabled;
+    setToggling(true);
+    setToggleError(null);
     try {
-      await fetch("/api/swarm/toggle", {
+      const res = await fetch("/api/swarm/toggle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: next }),
       });
-      setStatus((s) => (s ? { ...s, enabled: next } : null));
-    } catch {}
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setToggleError(data?.error || `Toggle failed (HTTP ${res.status})`);
+        // Pull authoritative state from server in case it differs
+        fetchAll();
+        return;
+      }
+      const serverEnabled = typeof data?.enabled === "boolean" ? data.enabled : next;
+      setStatus((s) => (s ? { ...s, enabled: serverEnabled } : null));
+    } catch (err: any) {
+      setToggleError(err?.message || "Network error toggling swarm");
+    } finally {
+      setToggling(false);
+    }
   };
 
   // Compute live remaining time from snapshot base
@@ -207,21 +250,52 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
         </div>
         <div className="flex items-center gap-3">
           <button
+            type="button"
             onClick={toggleSwarm}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all border ${
+            disabled={toggling}
+            title={status?.enabled ? "Click to disable swarm" : "Click to enable 100-bot swarm"}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all border disabled:opacity-60 disabled:cursor-not-allowed ${
               status?.enabled
                 ? "bg-green-500/15 border-green-500/30 text-green-400 hover:bg-green-500/25"
                 : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700 hover:text-white"
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${status?.enabled ? "bg-green-400 animate-pulse" : "bg-zinc-600"}`} />
-            {status?.enabled ? "SWARM ON" : "SWARM OFF"}
+            {toggling ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <span className={`w-2 h-2 rounded-full ${status?.enabled ? "bg-green-400 animate-pulse" : "bg-zinc-600"}`} />
+            )}
+            {toggling ? "TOGGLING…" : status?.enabled ? "SWARM ON" : "SWARM OFF"}
           </button>
-          <button onClick={triggerSwarm} disabled={!status?.enabled} className="px-3 py-2 rounded-lg bg-amber-600 text-white text-xs font-bold hover:bg-amber-500 disabled:opacity-40">
+          <button type="button" onClick={triggerSwarm} disabled={!status?.enabled} className="px-3 py-2 rounded-lg bg-amber-600 text-white text-xs font-bold hover:bg-amber-500 disabled:opacity-40 disabled:cursor-not-allowed">
             Trigger Now
           </button>
         </div>
       </div>
+
+      {toggleError && (
+        <div className="mb-4 p-3 rounded-lg bg-red-950/40 border border-red-700/50 text-red-300 text-xs flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <XCircle className="w-4 h-4 flex-shrink-0" />
+            <span>{toggleError}</span>
+          </div>
+          <button type="button" onClick={() => setToggleError(null)} className="text-red-400 hover:text-red-200">✕</button>
+        </div>
+      )}
+
+      {status && status.apiKeyConfigured === false && (
+        <div className="mb-4 p-3 rounded-lg bg-amber-950/30 border border-amber-700/40 text-amber-300 text-xs flex items-center gap-2">
+          <span className="text-base">⚠</span>
+          <span><strong>DEEPSEEK_API_KEY</strong> belum di-set di .env — swarm tidak bisa di-enable sampai key tersedia.</span>
+        </div>
+      )}
+
+      {status?.enabled && status.botEnabled === false && (
+        <div className="mb-4 p-3 rounded-lg bg-blue-950/30 border border-blue-700/40 text-blue-300 text-xs flex items-center gap-2">
+          <span className="text-base">ℹ</span>
+          <span>Swarm aktif, tapi <strong>bot trading masih OFF</strong>. Auto-prediksi tiap window butuh bot running. Klik <em>Trigger Now</em> untuk jalanin manual.</span>
+        </div>
+      )}
 
       {!status?.enabled && (
         <div className="mb-6 p-4 rounded-lg bg-amber-950/30 border border-amber-700/40 text-amber-300 text-sm flex items-center gap-3">
@@ -587,6 +661,77 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
         </div>
       </div>
 
+      {/* ── BOT ACTIVITY LOG ──────────────────────────────────────────────── */}
+      <div className="glass-card p-5 mt-6 border border-zinc-800/60">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+          <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-blue-400" />
+            Bot Activity Log
+            <span className="text-[10px] text-zinc-600 font-mono normal-case">
+              {rawLog.length} entries
+            </span>
+          </h2>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5 text-[10px]">
+              {logConnected ? (
+                <>
+                  <Wifi className="w-3 h-3 text-green-400" />
+                  <span className="text-green-400 font-bold">LIVE</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3 h-3 text-red-400" />
+                  <span className="text-red-400 font-bold">OFFLINE</span>
+                </>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Filter className="w-3 h-3 text-zinc-500" />
+              <select
+                aria-label="Filter log entries by level"
+                title="Filter log entries by level"
+                value={logFilter}
+                onChange={(e) => setLogFilter(e.target.value)}
+                className="bg-zinc-900 border border-zinc-800 text-xs text-zinc-300 rounded px-2 py-1 focus:outline-none focus:border-blue-500/50"
+              >
+                <option value="ALL">All Levels</option>
+                <option value="TRADE">Trade</option>
+                <option value="OK">OK</option>
+                <option value="WARN">Warn</option>
+                <option value="ERR">Error</option>
+                <option value="SKIP">Skip</option>
+                <option value="INFO">Info</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-black/40 rounded-lg border border-zinc-900 max-h-[420px] overflow-y-auto px-2 py-2 font-mono">
+          {(() => {
+            const filtered = logFilter === "ALL"
+              ? rawLog
+              : rawLog.filter((e) => e.level === logFilter);
+            if (filtered.length === 0) {
+              return (
+                <div className="flex flex-col items-center justify-center h-32 gap-2 text-zinc-600">
+                  <Terminal className="w-6 h-6 opacity-20" />
+                  <p className="text-xs">
+                    {rawLog.length === 0 ? "Waiting for bot activity…" : `No ${logFilter} entries.`}
+                  </p>
+                </div>
+              );
+            }
+            return (
+              <div ref={logBottomRef} className="space-y-0.5">
+                {filtered.map((entry, i) => (
+                  <SwarmLogLine key={`${entry.ts}-${i}`} entry={entry} />
+                ))}
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+
       {/* Bot Detail Modal */}
       {selectedBot && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4" onClick={() => setSelectedBot(null)}>
@@ -619,6 +764,29 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+const LOG_LEVEL_STYLES: Record<string, { bar: string; text: string; label: string }> = {
+  TRADE: { bar: "bg-yellow-400", text: "text-yellow-300", label: "bg-yellow-400/20 text-yellow-300" },
+  OK:    { bar: "bg-green-500",  text: "text-green-400",  label: "bg-green-500/20 text-green-400"   },
+  WARN:  { bar: "bg-orange-400", text: "text-orange-300", label: "bg-orange-400/20 text-orange-300" },
+  ERR:   { bar: "bg-red-500",    text: "text-red-400",    label: "bg-red-500/20 text-red-400"       },
+  SKIP:  { bar: "bg-zinc-600",   text: "text-zinc-500",   label: "bg-zinc-700 text-zinc-500"        },
+  INFO:  { bar: "bg-blue-600",   text: "text-zinc-300",   label: "bg-blue-900/40 text-blue-400"     },
+};
+
+function SwarmLogLine({ entry }: { entry: RawLogEntry }) {
+  const style = LOG_LEVEL_STYLES[entry.level] ?? LOG_LEVEL_STYLES.INFO;
+  return (
+    <div className="flex items-start gap-2 px-1 py-[3px] rounded hover:bg-zinc-900/60 group">
+      <div className={`w-0.5 self-stretch rounded-full mt-0.5 flex-shrink-0 ${style.bar}`} />
+      <span className="text-zinc-600 text-[9px] font-mono flex-shrink-0 mt-[1px] w-[52px]">{entry.ts}</span>
+      <span className={`text-[9px] font-bold px-1 py-0.5 rounded flex-shrink-0 leading-none ${style.label}`}>
+        {entry.level}
+      </span>
+      <span className={`text-[10px] leading-relaxed break-all ${style.text}`}>{entry.msg}</span>
     </div>
   );
 }

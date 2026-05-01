@@ -4089,6 +4089,9 @@ async function startServer() {
       enabled: getSwarmEnabled(),
       botCount: 100,
       stats: getSwarmStats(),
+      apiKeyConfigured: Boolean(process.env.DEEPSEEK_API_KEY),
+      botRunning: botRunning,
+      botEnabled: botEnabled,
     });
   });
 
@@ -4125,6 +4128,12 @@ async function startServer() {
     const { enabled } = req.body || {};
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ error: "enabled (boolean) is required." });
+    }
+    if (enabled && !process.env.DEEPSEEK_API_KEY) {
+      return res.status(400).json({
+        error: "DEEPSEEK_API_KEY is not configured. Add it to your .env file before enabling the swarm.",
+        enabled: getSwarmEnabled(),
+      });
     }
     setSwarmEnabled(enabled);
     botPrint("OK", `Swarm mode ${enabled ? "ENABLED" : "DISABLED"}`);
