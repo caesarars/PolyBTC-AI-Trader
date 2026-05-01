@@ -3389,9 +3389,15 @@ async function startServer() {
             botPrint("OK", `Reusing signal (price re-check): ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}%`);
           } else {
             // Synthesize rec from FastLoop + divergence + alignment — no external AI call.
+            // Fallback: if FastLoop is NEUTRAL, use alignment majority direction.
+            const alignDir: "UP" | "DOWN" | "NONE" =
+              localAlignment.bullish > localAlignment.bearish ? "UP"
+              : localAlignment.bearish > localAlignment.bullish ? "DOWN"
+              : "NONE";
             const synthDir: "UP" | "DOWN" | "NONE" =
               fastMom && fastMom.direction !== "NEUTRAL" ? fastMom.direction
               : div && div.strength !== "NONE" && div.direction !== "NEUTRAL" ? div.direction as "UP" | "DOWN"
+              : alignDir !== "NONE" ? alignDir
               : "NONE";
 
             if (synthDir === "NONE") {
