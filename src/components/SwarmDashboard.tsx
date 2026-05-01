@@ -1,5 +1,25 @@
-import { useState, useEffect, useCallback } from "react";
-import { Bot, TrendingUp, TrendingDown, Activity, Minus, Trophy, BarChart3, Zap } from "lucide-react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Bot,
+  TrendingUp,
+  TrendingDown,
+  Activity,
+  Minus,
+  Trophy,
+  BarChart3,
+  Zap,
+  Clock,
+  Target,
+  Flame,
+  Thermometer,
+  Scan,
+  ChevronRight,
+  ArrowUpRight,
+  ArrowDownRight,
+  CheckCircle2,
+  XCircle,
+  Loader2,
+} from "lucide-react";
 
 interface SwarmEnsemble {
   windowStart: number;
@@ -36,26 +56,63 @@ interface BotProfile {
   };
 }
 
+interface WindowSnapshot {
+  windowStart: number;
+  windowEnd: number;
+  elapsedSeconds: number;
+  remainingSeconds: number;
+  progressPct: number;
+  btcPrice: number;
+  priceChange5m: number;
+  priceChange1h: number;
+  fastLoopDirection: string;
+  fastLoopStrength: string;
+  fastLoopVW: number;
+  rsi?: number;
+  emaCross?: string;
+  fundingRate?: number;
+  longShortRatio?: number;
+  heatSignal?: string;
+  squeezeRisk?: string;
+  sentiment?: string;
+  swarmPredicted: boolean;
+  swarmPrediction?: {
+    consensusDirection: string;
+    consensusConfidence: number;
+    upVotes: number;
+    downVotes: number;
+    neutralVotes: number;
+    predictionsCount: number;
+  };
+  isStale?: boolean;
+  updatedAt: number;
+}
+
 export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
   const [status, setStatus] = useState<{ enabled: boolean; botCount: number; stats: any } | null>(null);
   const [ensembles, setEnsembles] = useState<SwarmEnsemble[]>([]);
   const [leaderboard, setLeaderboard] = useState<BotProfile[]>([]);
   const [analytics, setAnalytics] = useState<any>(null);
+  const [currentWindow, setCurrentWindow] = useState<WindowSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedBot, setSelectedBot] = useState<BotProfile | null>(null);
+  const [nowTick, setNowTick] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, ensemblesRes, leaderboardRes, analyticsRes] = await Promise.all([
+      const [statusRes, ensemblesRes, leaderboardRes, analyticsRes, windowRes] = await Promise.all([
         fetch("/api/swarm/status").then((r) => r.json()),
         fetch("/api/swarm/ensembles").then((r) => r.json()),
         fetch("/api/swarm/leaderboard").then((r) => r.json()),
         fetch("/api/swarm/analytics").then((r) => r.json()),
+        fetch("/api/swarm/current-window").then((r) => r.json()),
       ]);
       setStatus(statusRes);
       setEnsembles(ensemblesRes.ensembles || []);
       setLeaderboard(leaderboardRes.leaderboard || []);
       setAnalytics(analyticsRes);
+      setCurrentWindow(windowRes);
     } catch (err) {
       console.error("Swarm fetch error:", err);
     } finally {
@@ -65,12 +122,16 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
 
   useEffect(() => {
     fetchAll();
-    const id = setInterval(fetchAll, 10000);
+    const id = setInterval(fetchAll, 5000);
+
+    // Live countdown ticker
+    timerRef.current = setInterval(() => setNowTick((t) => t + 1), 1000);
 
     const es = new EventSource("/api/bot/events");
     es.addEventListener("swarm", () => fetchAll());
     return () => {
       clearInterval(id);
+      if (timerRef.current) clearInterval(timerRef.current);
       es.close();
     };
   }, [fetchAll]);
@@ -94,6 +155,22 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
     } catch {}
   };
 
+  // Compute live remaining time from snapshot base
+  const liveWindow = useCallback((): WindowSnapshot | null => {
+    if (!currentWindow) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const elapsed = now - currentWindow.windowStart;
+    const remaining = Math.max(0, 300 - elapsed);
+    return {
+      ...currentWindow,
+      elapsedSeconds: elapsed,
+      remainingSeconds: remaining,
+      progressPct: parseFloat(((elapsed / 300) * 100).toFixed(1)),
+    };
+  }, [currentWindow, nowTick]);
+
+  const w = liveWindow();
+
   if (loading) {
     return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center">
@@ -108,10 +185,19 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
     ? parseFloat(((resolvedEnsembles.filter((e) => e.correct).length / resolvedEnsembles.length) * 100).toFixed(1))
     : 0;
 
+  const fmtTime = (ts: number) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const fmtMmSs = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+  const fmtPrice = (p: number) => p > 0 ? `$${p.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—";
+  const fmtPct = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+
   return (
     <div className="min-h-screen bg-black text-white p-4 md:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <button onClick={onBack} className="px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs hover:bg-zinc-800">← Back</button>
           <h1 className="text-2xl font-bold flex items-center gap-2">
@@ -120,7 +206,6 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          {/* Toggle Button */}
           <button
             onClick={toggleSwarm}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all border ${
@@ -148,6 +233,96 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
         </div>
       )}
 
+      {/* ── CURRENT WINDOW PANEL ───────────────────────────────────────────── */}
+      {w && (
+        <div className="glass-card p-5 mb-6 border border-zinc-800/60">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-center">
+                <Clock className="w-5 h-5 text-zinc-400" />
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Current Window</div>
+                <div className="text-sm font-mono text-zinc-300">
+                  {fmtTime(w.windowStart)} <ChevronRight className="inline w-3 h-3 text-zinc-600" /> {fmtTime(w.windowEnd)}
+                </div>
+              </div>
+            </div>
+
+            {/* Countdown */}
+            <div className="flex items-center gap-4">
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Remaining</div>
+                <div className={`text-xl font-mono font-bold ${w.remainingSeconds < 60 ? "text-red-400" : w.remainingSeconds < 120 ? "text-amber-400" : "text-zinc-200"}`}>
+                  {fmtMmSs(w.remainingSeconds)}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">BTC Price</div>
+                <div className="text-xl font-mono font-bold text-white">{fmtPrice(w.btcPrice)}</div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">5m Change</div>
+                <div className={`text-sm font-mono font-bold flex items-center justify-end gap-1 ${w.priceChange5m >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {w.priceChange5m >= 0 ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
+                  {fmtPct(w.priceChange5m)}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Progress Bar */}
+          <div className="mb-4">
+            <div className="flex justify-between text-[10px] text-zinc-600 mb-1">
+              <span>Elapsed: {w.elapsedSeconds}s</span>
+              <span>Total: 300s</span>
+            </div>
+            <div className="h-2 bg-zinc-900 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-1000 ${
+                  w.progressPct < 33 ? "bg-green-500" : w.progressPct < 66 ? "bg-amber-500" : "bg-red-500"
+                }`}
+                style={{ width: `${Math.min(100, w.progressPct)}%` }}
+              />
+            </div>
+          </div>
+
+          {/* Scanning Status */}
+          <div className="flex flex-wrap items-center gap-3">
+            {w.isStale ? (
+              <span className="flex items-center gap-1.5 text-xs text-zinc-500">
+                <Scan className="w-3.5 h-3.5" /> Waiting for bot cycle to scan market data…
+              </span>
+            ) : w.swarmPredicted && w.swarmPrediction ? (
+              <span className="flex items-center gap-2">
+                <span className="flex items-center gap-1.5 text-xs text-green-400 bg-green-950/40 border border-green-800/50 px-2.5 py-1 rounded-md">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> Swarm scanned
+                </span>
+                <span className="text-xs text-zinc-500">
+                  {w.swarmPrediction.predictionsCount}/100 bots →
+                </span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                  w.swarmPrediction.consensusDirection === "UP" ? "bg-green-950 text-green-400" :
+                  w.swarmPrediction.consensusDirection === "DOWN" ? "bg-red-950 text-red-400" :
+                  "bg-zinc-800 text-zinc-400"
+                }`}>
+                  {w.swarmPrediction.consensusDirection}
+                </span>
+                <span className="text-xs font-mono text-zinc-400">{w.swarmPrediction.consensusConfidence}% conf</span>
+              </span>
+            ) : status?.enabled ? (
+              <span className="flex items-center gap-1.5 text-xs text-amber-400 bg-amber-950/30 border border-amber-800/40 px-2.5 py-1 rounded-md">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Scanning window… bots analyzing
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-xs text-zinc-500 bg-zinc-900 border border-zinc-800 px-2.5 py-1 rounded-md">
+                <Scan className="w-3.5 h-3.5" /> Swarm offline — no active scan
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Stats Row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <div className="glass-card p-4">
@@ -171,13 +346,14 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
 
       {/* Main Content */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        {/* Current Ensemble */}
+        {/* Left Column: Consensus + History */}
         <div className="md:col-span-2 space-y-6">
+          {/* Current Ensemble */}
           {latest && (
             <div className="glass-card p-5">
               <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
                 <Activity className="w-4 h-4" />
-                Current Window Consensus
+                Latest Consensus
                 <span className="text-[10px] text-zinc-600 font-mono">
                   {new Date(latest.windowStart * 1000).toLocaleTimeString()}
                 </span>
@@ -191,7 +367,7 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
               </div>
 
               {/* Consensus Badge */}
-              <div className="flex items-center gap-4">
+              <div className="flex flex-wrap items-center gap-4">
                 <div className={`px-4 py-2 rounded-lg border text-sm font-bold ${latest.consensusDirection === "UP" ? "bg-green-950/50 border-green-700 text-green-400" : latest.consensusDirection === "DOWN" ? "bg-red-950/50 border-red-700 text-red-400" : "bg-zinc-900 border-zinc-700 text-zinc-400"}`}>
                   {latest.consensusDirection === "UP" ? "▲" : latest.consensusDirection === "DOWN" ? "▼" : "—"} {latest.consensusDirection}
                 </div>
@@ -241,8 +417,9 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
                     <th className="text-left py-2 px-2">Consensus</th>
                     <th className="text-right py-2 px-2">UP</th>
                     <th className="text-right py-2 px-2">DOWN</th>
-                    <th className="text-right py-2 px-2">NEUTRAL</th>
+                    <th className="text-right py-2 px-2">NEU</th>
                     <th className="text-right py-2 px-2">Conf</th>
+                    <th className="text-center py-2 px-2">Actual</th>
                     <th className="text-center py-2 px-2">Result</th>
                   </tr>
                 </thead>
@@ -260,9 +437,16 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
                       <td className="py-2 px-2 text-right text-zinc-600">{e.neutralVotes}</td>
                       <td className="py-2 px-2 text-right font-mono">{e.consensusConfidence}%</td>
                       <td className="py-2 px-2 text-center">
+                        {e.actual ? (
+                          <span className={e.actual === "UP" ? "text-green-400" : "text-red-400"}>{e.actual}</span>
+                        ) : (
+                          <span className="text-zinc-600">—</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-2 text-center">
                         {e.correct === true && <span className="text-emerald-400 font-bold">✓</span>}
                         {e.correct === false && <span className="text-red-400 font-bold">✗</span>}
-                        {e.correct === null && <span className="text-zinc-600">—</span>}
+                        {e.correct === null && <span className="text-zinc-600">⏳</span>}
                       </td>
                     </tr>
                   ))}
@@ -272,8 +456,109 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
           </div>
         </div>
 
-        {/* Sidebar: Leaderboard */}
+        {/* Right Column: Leaderboard + Market Snapshot */}
         <div className="space-y-6">
+          {/* Market Snapshot */}
+          {w && !w.isStale && (
+            <div className="glass-card p-5">
+              <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
+                <Target className="w-4 h-4 text-cyan-400" />
+                Market Snapshot
+              </h2>
+              <div className="space-y-3">
+                {/* FastLoop */}
+                <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                  <div className="flex items-center gap-2 text-xs text-zinc-500">
+                    <Activity className="w-3.5 h-3.5" /> FastLoop
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-bold ${w.fastLoopDirection === "UP" ? "text-green-400" : w.fastLoopDirection === "DOWN" ? "text-red-400" : "text-zinc-400"}`}>
+                      {w.fastLoopDirection}
+                    </span>
+                    <span className="text-[10px] text-zinc-600 bg-zinc-800 px-1.5 py-0.5 rounded">{w.fastLoopStrength}</span>
+                  </div>
+                </div>
+
+                {/* Heat Signal */}
+                {w.heatSignal && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-xs text-zinc-500">
+                      <Flame className="w-3.5 h-3.5" /> Heat
+                    </div>
+                    <span className={`text-xs font-bold ${
+                      w.heatSignal.includes("LONG") ? "text-red-400" :
+                      w.heatSignal.includes("SHORT") ? "text-green-400" :
+                      "text-zinc-400"
+                    }`}>
+                      {w.heatSignal}
+                    </span>
+                  </div>
+                )}
+
+                {/* Funding Rate */}
+                {typeof w.fundingRate === "number" && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-xs text-zinc-500">
+                      <Thermometer className="w-3.5 h-3.5" /> Funding
+                    </div>
+                    <span className={`text-xs font-mono font-bold ${w.fundingRate > 0.0005 ? "text-red-400" : w.fundingRate < -0.0005 ? "text-green-400" : "text-zinc-300"}`}>
+                      {(w.fundingRate * 100).toFixed(4)}%
+                    </span>
+                  </div>
+                )}
+
+                {/* Long/Short */}
+                {w.longShortRatio && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-xs text-zinc-500">
+                      <BarChart3 className="w-3.5 h-3.5" /> L/S Ratio
+                    </div>
+                    <span className="text-xs font-mono font-bold text-zinc-300">{w.longShortRatio.toFixed(2)}</span>
+                  </div>
+                )}
+
+                {/* RSI */}
+                {typeof w.rsi === "number" && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-xs text-zinc-500">RSI</div>
+                    <span className={`text-xs font-mono font-bold ${w.rsi > 70 ? "text-red-400" : w.rsi < 30 ? "text-green-400" : "text-zinc-300"}`}>
+                      {w.rsi.toFixed(1)}
+                    </span>
+                  </div>
+                )}
+
+                {/* EMA Cross */}
+                {w.emaCross && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-xs text-zinc-500">EMA</div>
+                    <span className={`text-xs font-bold ${w.emaCross === "BULLISH" ? "text-green-400" : "text-red-400"}`}>
+                      {w.emaCross}
+                    </span>
+                  </div>
+                )}
+
+                {/* 1h Change */}
+                <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
+                  <div className="flex items-center gap-2 text-xs text-zinc-500">1h Change</div>
+                  <span className={`text-xs font-mono font-bold ${w.priceChange1h >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {fmtPct(w.priceChange1h)}
+                  </span>
+                </div>
+
+                {/* Squeeze Risk */}
+                {w.squeezeRisk && w.squeezeRisk !== "NONE" && (
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-red-950/20 border border-red-800/40">
+                    <div className="flex items-center gap-2 text-xs text-red-400">
+                      <Zap className="w-3.5 h-3.5" /> Squeeze Risk
+                    </div>
+                    <span className="text-xs font-bold text-red-400">{w.squeezeRisk}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Leaderboard */}
           <div className="glass-card p-5">
             <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
               <Trophy className="w-4 h-4 text-amber-400" />

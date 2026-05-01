@@ -581,6 +581,40 @@ let botSessionStartBalance: number | null = null;
 let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
 let lastSwarmWindowStart = 0;
+
+// ── Swarm current window snapshot (for dashboard) ────────────────────────────
+interface SwarmWindowSnapshot {
+  windowStart: number;
+  windowEnd: number;
+  elapsedSeconds: number;
+  remainingSeconds: number;
+  progressPct: number;
+  btcPrice: number;
+  priceChange5m: number;
+  priceChange1h: number;
+  fastLoopDirection: string;
+  fastLoopStrength: string;
+  fastLoopVW: number;
+  rsi?: number;
+  emaCross?: string;
+  fundingRate?: number;
+  longShortRatio?: number;
+  heatSignal?: string;
+  squeezeRisk?: string;
+  sentiment?: string;
+  swarmPredicted: boolean;
+  swarmPrediction?: {
+    consensusDirection: string;
+    consensusConfidence: number;
+    upVotes: number;
+    downVotes: number;
+    neutralVotes: number;
+    predictionsCount: number;
+  };
+  updatedAt: number;
+}
+let latestSwarmWindowSnapshot: SwarmWindowSnapshot | null = null;
+
 // Per-asset analyzed-this-window tracking (keyed by asset → Set of market IDs)
 const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
   (["BTC"] as TradingAsset[]).map(a => [a, new Set<string>()])
@@ -3234,6 +3268,35 @@ async function startServer() {
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"} | Heat: ${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
 
+            // ── Update swarm window snapshot for dashboard ──────────────────
+            const _fastMomSnapshot = btcHistoryResult?.history?.length
+              ? computeFastLoopMomentum(btcHistoryResult.history)
+              : null;
+            latestSwarmWindowSnapshot = {
+              windowStart: currentWindowStart,
+              windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
+              elapsedSeconds: windowElapsedSeconds,
+              remainingSeconds: windowRemaining,
+              progressPct: parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1)),
+              btcPrice: btcPriceData?.price ? parseFloat(btcPriceData.price) : 0,
+              priceChange5m: _fastMomSnapshot?.raw ?? 0,
+              priceChange1h: btcHistoryResult?.history?.length
+                ? ((btcHistoryResult.history[btcHistoryResult.history.length - 1].close - btcHistoryResult.history[0].close) / btcHistoryResult.history[0].close) * 100
+                : 0,
+              fastLoopDirection: _fastMomSnapshot?.direction ?? "NEUTRAL",
+              fastLoopStrength: _fastMomSnapshot?.strength ?? "WEAK",
+              fastLoopVW: _fastMomSnapshot?.volumeWeighted ?? 0,
+              rsi: btcIndicatorsData?.rsi,
+              emaCross: btcIndicatorsData?.emaCross,
+              fundingRate: heatData?.fundingRate,
+              longShortRatio: heatData?.longShortRatio,
+              heatSignal: heatData?.heatSignal,
+              squeezeRisk: heatData?.squeezeRisk,
+              sentiment: sentimentData?.value_classification,
+              swarmPredicted: lastSwarmWindowStart === currentWindowStart,
+              updatedAt: Date.now(),
+            };
+
             // ── Swarm Prediction (100 AI bots) ───────────────────────────────
             if (getSwarmEnabled() && currentWindowStart !== lastSwarmWindowStart) {
               lastSwarmWindowStart = currentWindowStart;
@@ -3261,6 +3324,18 @@ async function startServer() {
                   const { ensemble, predictions } = await runSwarmPrediction(currentWindowStart, context);
                   botPrint("INFO", `[Swarm] ${predictions}/100 bots → ${ensemble.consensusDirection} (${ensemble.consensusConfidence}%) | UP:${ensemble.upVotes} DOWN:${ensemble.downVotes} NEUTRAL:${ensemble.neutralVotes}`);
                   pushSSE("swarm", { windowStart: currentWindowStart, ensemble, predictions });
+                  // Update snapshot with prediction result
+                  if (latestSwarmWindowSnapshot && latestSwarmWindowSnapshot.windowStart === currentWindowStart) {
+                    latestSwarmWindowSnapshot.swarmPredicted = true;
+                    latestSwarmWindowSnapshot.swarmPrediction = {
+                      consensusDirection: ensemble.consensusDirection,
+                      consensusConfidence: ensemble.consensusConfidence,
+                      upVotes: ensemble.upVotes,
+                      downVotes: ensemble.downVotes,
+                      neutralVotes: ensemble.neutralVotes,
+                      predictionsCount: predictions,
+                    };
+                  }
                 } catch (err: any) {
                   botPrint("ERR", `[Swarm] Prediction failed: ${err?.message || String(err)}`);
                 }
@@ -4015,6 +4090,35 @@ async function startServer() {
       botCount: 100,
       stats: getSwarmStats(),
     });
+  });
+
+  app.get("/api/swarm/current-window", (_req, res) => {
+    const nowUtcSeconds = Math.floor(Date.now() / 1000);
+    const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+    const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
+    const windowRemaining = MARKET_SESSION_SECONDS - windowElapsedSeconds;
+
+    // If snapshot is stale (different window), return fresh computed values without market data
+    if (!latestSwarmWindowSnapshot || latestSwarmWindowSnapshot.windowStart !== currentWindowStart) {
+      return res.json({
+        windowStart: currentWindowStart,
+        windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
+        elapsedSeconds: windowElapsedSeconds,
+        remainingSeconds: windowRemaining,
+        progressPct: parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1)),
+        btcPrice: 0,
+        swarmPredicted: false,
+        isStale: true,
+        updatedAt: Date.now(),
+      });
+    }
+
+    // Update elapsed/remaining in real-time from snapshot base
+    const snapshot = { ...latestSwarmWindowSnapshot };
+    snapshot.elapsedSeconds = windowElapsedSeconds;
+    snapshot.remainingSeconds = windowRemaining;
+    snapshot.progressPct = parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1));
+    res.json(snapshot);
   });
 
   app.post("/api/swarm/toggle", (req, res) => {
