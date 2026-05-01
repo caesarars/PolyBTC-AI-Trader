@@ -64,6 +64,7 @@ interface EntrySnapshot {
 interface BotStatus {
   enabled: boolean;
   running: boolean;
+  paperMode: boolean;
   sessionStartBalance: number | null;
   sessionTradesCount: number;
   windowElapsedSeconds: number;
@@ -1546,6 +1547,32 @@ export default function BotDashboard() {
               </button>
             </div>
             <div>Fixed ${status?.config.fixedTradeUsdc ?? 1} per trade | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
+            <div className="flex items-center gap-2">
+              <span className={cn("text-[10px] font-bold uppercase tracking-wide", status?.paperMode ? "text-amber-400" : "text-zinc-500")}>
+                {status?.paperMode ? "📄 Paper Mode ON" : "Paper Mode OFF"}
+              </span>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await fetch("/api/bot/paper-mode", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ enabled: !status?.paperMode }),
+                    });
+                    await fetchAll();
+                  } catch {}
+                }}
+                className={cn(
+                  "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide transition-colors",
+                  status?.paperMode
+                    ? "bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+                    : "bg-zinc-700 text-zinc-400 hover:bg-zinc-600 hover:text-white"
+                )}
+              >
+                {status?.paperMode ? "Disable" : "Enable"}
+              </button>
+            </div>
           </div>
         </div>
 

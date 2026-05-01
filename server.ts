@@ -17,6 +17,7 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
 const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
+const PAPER_TRADE_LOG_FILE = path.join(DATA_DIR, "paper_trade_log.jsonl");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -90,6 +91,7 @@ function roundPnl(value: number): number {
 }
 
 async function loadPersistedTradeLog(): Promise<TradeLogEntry[]> {
+  let trades: TradeLogEntry[] = [];
   try {
     const collection = await getTradesCollection();
     if (collection) {
@@ -100,7 +102,7 @@ async function loadPersistedTradeLog(): Promise<TradeLogEntry[]> {
         .toArray();
 
       if (docs.length > 0) {
-        return docs
+        trades = docs
           .reverse()
           .map((doc) => ({
             ts: doc.ts,
@@ -129,7 +131,15 @@ async function loadPersistedTradeLog(): Promise<TradeLogEntry[]> {
     console.warn("Failed to load persisted trades from MongoDB. Falling back to local trade log.", error?.message || error);
   }
 
-  return loadTradeLog();
+  if (trades.length === 0) trades = loadTradeLog();
+
+  // Merge paper trades
+  const paperTrades = loadPaperTradeLog();
+  if (paperTrades.length > 0) {
+    trades = trades.concat(paperTrades);
+    trades.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+  }
+  return trades;
 }
 
 async function resolveOrderMeta(orderId: string | null | undefined): Promise<ResolvedOrderMeta | null> {
@@ -265,6 +275,27 @@ function loadTradeLog(): TradeLogEntry[] {
       .map((line) => JSON.parse(line) as TradeLogEntry);
   } catch (e: any) {
     console.error("[Persist] Failed to read trade_log.jsonl:", e.message);
+    return [];
+  }
+}
+
+function savePaperTradeLog(entry: TradeLogEntry): void {
+  try {
+    fs.appendFileSync(PAPER_TRADE_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
+  } catch (e: any) {
+    console.error("[Persist] Failed to write paper_trade_log.jsonl:", e.message);
+  }
+}
+
+function loadPaperTradeLog(): TradeLogEntry[] {
+  try {
+    if (!fs.existsSync(PAPER_TRADE_LOG_FILE)) return [];
+    return fs.readFileSync(PAPER_TRADE_LOG_FILE, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as TradeLogEntry);
+  } catch (e: any) {
+    console.error("[Persist] Failed to read paper_trade_log.jsonl:", e.message);
     return [];
   }
 }
@@ -538,6 +569,7 @@ function dynamicKellyFraction(confidence: number): number {
 // ── Bot runtime state ────────────────────────────────────────────────────────
 let botEnabled = process.env.BOT_AUTO_START === "true";
 let botRunning = false;
+let paperMode = process.env.PAPER_MODE === "true";
 let botInterval: NodeJS.Timeout | null = null;
 let botSessionStartBalance: number | null = null;
 let botSessionTradesCount = 0;
@@ -701,6 +733,7 @@ interface PendingResult {
   signalScore?: number;
   imbalanceSignal?: string;
   asset?: TradingAsset;
+  isPaperTrade?: boolean;
 }
 const pendingResults = new Map<string, PendingResult>();
 
@@ -2154,6 +2187,32 @@ async function startServer() {
     executionMode?: "MANUAL" | "PASSIVE" | "AGGRESSIVE";
     amountMode?: "SPEND" | "SIZE";
   }) => {
+    if (paperMode) {
+      const parsedAmount = Number(amount);
+      const parsedSide = String(side || "BUY").toUpperCase() as Side;
+      const parsedPrice = Number(price) || 0.5;
+      const normalizedAmountMode = amountMode || (parsedSide === Side.BUY ? "SPEND" : "SIZE");
+      const orderSize = normalizedAmountMode === "SIZE"
+        ? parsedAmount
+        : parsedSide === Side.BUY
+          ? parsedAmount / parsedPrice
+          : parsedAmount;
+      return {
+        success: true,
+        orderID: `PAPER-${Date.now()}`,
+        status: "PENDING",
+        tickSize: 0.01,
+        negRisk: false,
+        orderSize: Number(orderSize.toFixed(6)),
+        spendingAmount: normalizedAmountMode === "SPEND" ? parsedAmount : Number((parsedAmount * parsedPrice).toFixed(6)),
+        executionMode: String(executionMode || "MANUAL").toUpperCase(),
+        amountMode: normalizedAmountMode,
+        limitPriceUsed: parsedPrice,
+        marketSnapshot: { bestBid: null, bestAsk: null, spread: null, distanceToMarket: 0 },
+        raw: null,
+      };
+    }
+
     const client = await getClobClient();
     if (!client) {
       throw new Error("CLOB client not initialized. Check credentials.");
@@ -2342,6 +2401,11 @@ async function startServer() {
     direction: "UP" | "DOWN",
     snapshot: { yesAsk: number | null; noAsk: number | null; btcDelta: number }
   ) => {
+    // DISABLED: divergence fast path bypasses rules engine. Trade data shows 0% WR on divergence-only trades.
+    // Divergence now serves ONLY as a signal input to the main rules engine.
+    botPrint("SKIP", `[DIV FAST] Divergence fast path DISABLED. STRONG divergence logged as signal only.`);
+    return;
+
     const fastAsset = currentDivergenceAsset;
     // Divergence fast path is BTC-only — ETH/SOL use a shared ring buffer that
     // compares BTC price deltas against ETH/SOL thresholds, causing false signals.
@@ -2498,6 +2562,7 @@ async function startServer() {
           reasoning: fastRec.reasoning,
           windowElapsedSeconds: now - nowWindowStart,
           asset: fastAsset,
+          isPaperTrade: paperMode,
         });
         botPrint("INFO", `Result tracker armed — checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
 
@@ -2836,20 +2901,23 @@ async function startServer() {
       botPrint("INFO", `Result resolved via [${resolvedSource}] → ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
 
       if (won_final) {
-        // ── WIN: relax adaptive threshold (per-asset) ──────────────────────
-        const pendingAsset = pending.asset ?? "BTC";
-        const cWins  = (consecutiveWinsByAsset.get(pendingAsset)  ?? 0) + 1;
-        const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
-        consecutiveWinsByAsset.set(pendingAsset, cWins);
-        consecutiveLossesByAsset.set(pendingAsset, 0);
-        if (cWins >= 2 && cBoost > 0) {
-          const newBoost = Math.max(cBoost - 3, 0);
-          adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-          botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
+        if (!pending.isPaperTrade) {
+          // ── WIN: relax adaptive threshold (per-asset) ──────────────────────
+          const pendingAsset = pending.asset ?? "BTC";
+          const cWins  = (consecutiveWinsByAsset.get(pendingAsset)  ?? 0) + 1;
+          const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
+          consecutiveWinsByAsset.set(pendingAsset, cWins);
+          consecutiveLossesByAsset.set(pendingAsset, 0);
+          if (cWins >= 2 && cBoost > 0) {
+            const newBoost = Math.max(cBoost - 3, 0);
+            adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
+            botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
+          }
         }
-        botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        const paperTag = pending.isPaperTrade ? " [PAPER]" : "";
+        botPrint("OK", `━━━ 🏆 WIN${paperTag} ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         const winLesson = generateWinLesson(pending);
-        winMemory.unshift({
+        if (!pending.isPaperTrade) winMemory.unshift({
           timestamp: new Date().toISOString(),
           market: pending.market,
           asset: pending.asset,
@@ -2866,10 +2934,10 @@ async function startServer() {
           imbalanceSignal: pending.imbalanceSignal,
           lesson: winLesson,
         });
-        if (winMemory.length > 20) winMemory.pop();
+        if (!pending.isPaperTrade && winMemory.length > 20) winMemory.pop();
         botPrint("INFO", `Win pattern recorded: ${winLesson}`);
-        saveLearning();
-        saveTradeLog({
+        if (!pending.isPaperTrade) saveLearning();
+        (pending.isPaperTrade ? savePaperTradeLog : saveTradeLog)({
           ts: new Date().toISOString(),
           market: pending.market,
           direction: pending.direction as "UP" | "DOWN",
@@ -2893,42 +2961,46 @@ async function startServer() {
       } else {
         // ── LOSS: record memory, tighten adaptive threshold (per-asset) ────
         const pendingAsset = pending.asset ?? "BTC";
-        const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
-        consecutiveLossesByAsset.set(pendingAsset, cLosses);
-        consecutiveWinsByAsset.set(pendingAsset, 0);
         const lesson = generateLesson(pending);
 
-        lossMemory.unshift({
-          timestamp: new Date().toISOString(),
-          market: pending.market,
-          asset: pending.asset,
-          direction: pending.direction,
-          confidence: pending.confidence,
-          edge: pending.edge,
-          entryPrice: pending.entryPrice,
-          betAmount: pending.betAmount,
-          pnl,
-          windowElapsedSeconds: pending.windowElapsedSeconds,
-          rsi: pending.rsi,
-          emaCross: pending.emaCross,
-          signalScore: pending.signalScore,
-          imbalanceSignal: pending.imbalanceSignal,
-          reasoning: pending.reasoning,
-          lesson,
-        });
-        if (lossMemory.length > 20) lossMemory.pop();
+        if (!pending.isPaperTrade) {
+          const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
+          consecutiveLossesByAsset.set(pendingAsset, cLosses);
+          consecutiveWinsByAsset.set(pendingAsset, 0);
 
-        if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
-          const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
-          adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-          botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
-        } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
-          botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
+          lossMemory.unshift({
+            timestamp: new Date().toISOString(),
+            market: pending.market,
+            asset: pending.asset,
+            direction: pending.direction,
+            confidence: pending.confidence,
+            edge: pending.edge,
+            entryPrice: pending.entryPrice,
+            betAmount: pending.betAmount,
+            pnl,
+            windowElapsedSeconds: pending.windowElapsedSeconds,
+            rsi: pending.rsi,
+            emaCross: pending.emaCross,
+            signalScore: pending.signalScore,
+            imbalanceSignal: pending.imbalanceSignal,
+            reasoning: pending.reasoning,
+            lesson,
+          });
+          if (lossMemory.length > 20) lossMemory.pop();
+
+          if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
+            const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
+            adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
+            botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
+          } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
+            botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
+          }
         }
-        botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        const paperTagLoss = pending.isPaperTrade ? " [PAPER]" : "";
+        botPrint("WARN", `━━━ ✗ LOSS${paperTagLoss} ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         botPrint("INFO", `Lesson recorded: ${lesson}`);
-        saveLearning();
-        saveTradeLog({
+        if (!pending.isPaperTrade) saveLearning();
+        (pending.isPaperTrade ? savePaperTradeLog : saveTradeLog)({
           ts: new Date().toISOString(),
           market: pending.market,
           direction: pending.direction as "UP" | "DOWN",
@@ -2959,7 +3031,7 @@ async function startServer() {
         confidence: 0,
         edge: 0,
         riskLevel: "LOW",
-        reasoning: `Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
+        reasoning: `${pending.isPaperTrade ? "[PAPER] " : ""}Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
         tradeExecuted: false,
         tradeAmount: pending.betAmount,
         tradePrice: pending.entryPrice,
@@ -3380,45 +3452,12 @@ async function startServer() {
           }
 
           // ── Apply divergence overrides AFTER AI decision ────────────────
-          // STRONG force-override for BTC divergence.
-          if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
-            if (div.strength === "STRONG" && rec.decision !== "TRADE") {
-              if (currentAsset !== "BTC") {
-                botPrint("SKIP",
-                  `DIVERGENCE OVERRIDE skipped for ${currentAsset} — STRONG override restricted to BTC only (shared ring buffer)`
-                );
-              } else if (windowRemaining < 120) {
-                // Force trade only if enough time remains — flash moves revert quickly
-                botPrint("SKIP",
-                  `DIVERGENCE OVERRIDE skipped — only ${windowRemaining}s remaining (min 120s). Flash move likely to revert.`
-                );
-              } else {
-              // Force trade in divergence direction — market is clearly lagging BTC
-              botPrint("TRADE",
-                `DIVERGENCE OVERRIDE ✦ BTC +$${Math.abs(div.btcDelta30s).toFixed(0)} in 30s, YES only ${div.yesDelta30s.toFixed(2)}¢ — forcing ${div.direction} trade`
-              );
-              rec = { ...rec, decision: "TRADE", direction: div.direction, confidence: Math.max(rec.confidence, 72), riskLevel: "MEDIUM" };
-              }
-            } else if (div.strength === "MODERATE" && rec.decision === "TRADE" && rec.direction === div.direction) {
-              // Same direction — boost confidence
-              const boosted = Math.min(rec.confidence + 10, 95);
-              botPrint("OK", `Divergence CONFIRMS AI direction (${div.direction}) — confidence boosted ${rec.confidence}% → ${boosted}%`);
-              rec = { ...rec, confidence: boosted };
-            } else if (div.strength === "STRONG" && rec.decision === "TRADE" && rec.direction !== div.direction) {
-              // STRONG conflict — structural divergence wins, block the AI trade
-              botPrint("WARN",
-                `DIVERGENCE CONFLICT ✦ AI says ${rec.direction} but BTC divergence says ${div.direction} (STRONG) — trade blocked`
-              );
-              rec = { ...rec, decision: "NO_TRADE", reasoning: rec.reasoning + ` | BLOCKED: strong divergence conflict (BTC ${div.direction} vs AI ${rec.direction})` };
-            } else if (div.strength === "MODERATE" && rec.decision === "TRADE" && rec.direction !== div.direction) {
-              // MODERATE conflict — penalise confidence but don't block; data windows differ
-              const penalised = Math.max(rec.confidence - 15, 50);
-              botPrint("WARN",
-                `DIVERGENCE FRICTION ✦ AI says ${rec.direction} but divergence says ${div.direction} (MODERATE) — confidence penalised ${rec.confidence}% → ${penalised}%`
-              );
-              rec = { ...rec, confidence: penalised, reasoning: rec.reasoning + ` | Confidence penalised: moderate divergence friction (BTC ${div.direction})` };
-            }
-          }
+          // DISABLED: divergence overrides removed. Divergence now serves ONLY as a signal
+          // input (via divBoost in synthConf and alignment scoring). Trade data showed
+          // divergence-only trades at 0% WR while non-divergence trades hit 66%.
+          // if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
+          //   ... override logic removed ...
+          // }
 
           // Log AI result
           const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
@@ -3712,6 +3751,7 @@ async function startServer() {
                       signalScore: btcIndicatorsData?.signalScore,
                       imbalanceSignal: orderBooks[tokenId]?.imbalanceSignal,
                       asset: currentAsset,
+                      isPaperTrade: paperMode,
                     });
                     botPrint("INFO", `Result tracker armed — checking after ${new Date((currentWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
                   } catch (tradeErr: any) {
@@ -3819,6 +3859,7 @@ async function startServer() {
     res.json({
       enabled: botEnabled,
       running: botRunning,
+      paperMode,
       sessionStartBalance: botSessionStartBalance,
       sessionTradesCount: botSessionTradesCount,
       windowElapsedSeconds,
@@ -3851,6 +3892,16 @@ async function startServer() {
       stopBot();
       res.json({ enabled: false, message: "Bot stopped." });
     }
+  });
+
+  app.post("/api/bot/paper-mode", (req, res) => {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled (boolean) is required." });
+    }
+    paperMode = enabled;
+    botPrint("OK", `Paper mode ${enabled ? "ENABLED" : "DISABLED"}`);
+    res.json({ ok: true, paperMode });
   });
 
   app.get("/api/bot/log", (req, res) => {
@@ -4015,9 +4066,9 @@ async function startServer() {
     }
   });
 
-  app.get("/api/analytics", (_req, res) => {
+  app.get("/api/analytics", async (_req, res) => {
     try {
-      const trades = loadTradeLog();
+      const trades = await loadPersistedTradeLog();
       if (trades.length === 0) return res.json({ total: 0, byHour: [], byDivergence: [], byDirection: [] });
       const byHourMap: Record<number, { wins: number; losses: number; pnl: number }> = {};
       const divMap: Record<string, { wins: number; losses: number; pnl: number }> = {
