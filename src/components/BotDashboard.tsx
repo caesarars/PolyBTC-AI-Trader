@@ -55,7 +55,7 @@ interface EntrySnapshot {
   riskLevel: string | null;
   estimatedBet: number | null;
   btcPrice: number | null;
-  asset?: string; // "BTC" | "ETH" | "SOL"
+  asset?: string; // always "BTC"
   divergence: { direction: string; strength: string; btcDelta30s: number; yesDelta30s: number; } | null;
   fastLoopMomentum: { direction: string; strength: string; vw: number; } | null;
   updatedAt: string;
@@ -69,7 +69,7 @@ interface BotStatus {
   windowElapsedSeconds: number;
   analyzedThisWindow: number;
   entrySnapshot: EntrySnapshot | null;
-  enabledAssets: string[];
+
   config: {
     minConfidence: number;
     minEdge: number;
@@ -259,6 +259,22 @@ interface AnalyticsData {
   byDirection: Array<{ label: string; wins: number; losses: number; total: number; winRate: number | null; pnl: number }>;
 }
 
+interface MarketHeatData {
+  asset: string;
+  fundingRate: number;
+  fundingAnnualized: number;
+  nextFundingTime: number;
+  takerBuySellRatio: number;
+  takerBuyVol: number;
+  takerSellVol: number;
+  longShortRatio: number;
+  longAccount: number;
+  shortAccount: number;
+  heatSignal: "EXTREME_LONG" | "LONG_HEAVY" | "NEUTRAL" | "SHORT_HEAVY" | "EXTREME_SHORT";
+  squeezeRisk: "LONG_SQUEEZE" | "SHORT_SQUEEZE" | "NONE";
+  updatedAt: number;
+}
+
 interface PingProbe {
   key: string;
   label: string;
@@ -311,18 +327,18 @@ export default function BotDashboard() {
   const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
   const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
   const [learning, setLearning] = useState<LearningState | null>(null);
-  const [enabledAssets, setEnabledAssets] = useState<string[]>(["BTC"]);
-  const [assetsLoading, setAssetsLoading] = useState(false);
+  const [assetsLoading] = useState(false);
   const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
   const [ping, setPing] = useState<PingState | null>(null);
   const [pinging, setPinging] = useState(false);
+  const [heatData, setHeatData] = useState<MarketHeatData | null>(null);
   const tradeBellRef = useRef<HTMLAudioElement | null>(null);
   const seenTradeBellKeysRef = useRef<Set<string>>(new Set());
   const tradeBellPrimedRef = useRef(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes, heatRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -335,12 +351,12 @@ export default function BotDashboard() {
         fetch("/api/analytics").then((r) => r.json()),
         fetch("/api/bot/calibration").then((r) => r.json()),
         fetch("/api/bot/learning").then((r) => r.json()),
+        fetch("/api/market-heat/BTC").then((r) => r.ok ? r.json() : null).catch(() => null),
       ]);
 
       if (statusRes.status === "fulfilled") {
         const s = statusRes.value as BotStatus;
         setStatus(s);
-        if (s.enabledAssets?.length) setEnabledAssets(s.enabledAssets);
       }
       if (logRes.status === "fulfilled") setLog((logRes.value as any).log || []);
       if (perfRes.status === "fulfilled" && !(perfRes.value as any).error) {
@@ -359,6 +375,7 @@ export default function BotDashboard() {
       }
       if (calibRes.status === "fulfilled") setCalibration(calibRes.value as any);
       if (learningRes.status === "fulfilled") setLearning(learningRes.value as LearningState);
+      if (heatRes.status === "fulfilled" && heatRes.value) setHeatData(heatRes.value as MarketHeatData);
     } catch {}
   }, []);
 
@@ -412,24 +429,7 @@ export default function BotDashboard() {
     });
   }, [log]);
 
-  const handleToggleAsset = async (asset: string) => {
-    const next = enabledAssets.includes(asset)
-      ? enabledAssets.filter(a => a !== asset)
-      : [...enabledAssets, asset];
-    if (next.length === 0) return; // must keep at least one
-    setAssetsLoading(true);
-    try {
-      const res = await fetch("/api/bot/assets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assets: next }),
-      });
-      const data = await res.json();
-      if (res.ok) setEnabledAssets(data.enabled);
-    } finally {
-      setAssetsLoading(false);
-    }
-  };
+
 
   const handleResetConfidence = async () => {
     setResetConfLoading(true);
@@ -689,7 +689,7 @@ export default function BotDashboard() {
             <Bot className="w-6 h-6 text-blue-400" />
             Bot Control Center
           </h2>
-          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC · ETH · SOL market trading engine</p>
+          <p className="text-zinc-500 text-sm mt-0.5">Automated 5-minute BTC prediction market trading engine</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -942,6 +942,89 @@ export default function BotDashboard() {
       {/* ── DASHBOARD TAB ── */}
       {activeTab === "dashboard" && (
       <div className="space-y-6">
+
+      {/* ── Market Heat ── */}
+      {heatData && (
+        <div className="glass-card p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+              <Flame className="w-4 h-4 text-orange-400" />
+              Market Heat — BTC
+            </h3>
+            <div className="flex items-center gap-2">
+              <span className={cn(
+                "px-2 py-0.5 rounded text-[10px] font-bold border",
+                heatData.heatSignal === "EXTREME_LONG" ? "bg-red-500/10 text-red-400 border-red-500/30" :
+                heatData.heatSignal === "LONG_HEAVY" ? "bg-orange-500/10 text-orange-400 border-orange-500/30" :
+                heatData.heatSignal === "SHORT_HEAVY" ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/30" :
+                heatData.heatSignal === "EXTREME_SHORT" ? "bg-blue-500/10 text-blue-400 border-blue-500/30" :
+                "bg-zinc-700/50 text-zinc-400 border-zinc-600/30"
+              )}>
+                {heatData.heatSignal.replace("_", " ")}
+              </span>
+              {heatData.squeezeRisk !== "NONE" && (
+                <span className={cn(
+                  "px-2 py-0.5 rounded text-[10px] font-bold border animate-pulse",
+                  heatData.squeezeRisk === "LONG_SQUEEZE" ? "bg-green-500/10 text-green-400 border-green-500/30" :
+                  "bg-red-500/10 text-red-400 border-red-500/30"
+                )}>
+                  {heatData.squeezeRisk.replace("_", " ")}
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Funding Rate</div>
+              <div className={cn("text-lg font-mono font-bold", heatData.fundingRate > 0.0003 ? "text-red-400" : heatData.fundingRate < -0.0003 ? "text-cyan-400" : "text-zinc-300")}>
+                {(heatData.fundingRate * 100).toFixed(4)}%
+              </div>
+              <div className="text-[10px] text-zinc-600 mt-0.5">
+                {(heatData.fundingAnnualized * 100).toFixed(1)}% ann.
+              </div>
+            </div>
+            <div className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Taker Buy/Sell</div>
+              <div className={cn("text-lg font-mono font-bold", heatData.takerBuySellRatio > 1.2 ? "text-green-400" : heatData.takerBuySellRatio < 0.8 ? "text-red-400" : "text-zinc-300")}>
+                {heatData.takerBuySellRatio.toFixed(2)}
+              </div>
+              <div className="text-[10px] text-zinc-600 mt-0.5">
+                {(heatData.takerBuyVol / 1000).toFixed(0)}K / {(heatData.takerSellVol / 1000).toFixed(0)}K
+              </div>
+            </div>
+            <div className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Long/Short Ratio</div>
+              <div className={cn("text-lg font-mono font-bold", heatData.longShortRatio > 1.5 ? "text-red-400" : heatData.longShortRatio < 0.67 ? "text-cyan-400" : "text-zinc-300")}>
+                {heatData.longShortRatio.toFixed(2)}
+              </div>
+              <div className="text-[10px] text-zinc-600 mt-0.5">
+                {(heatData.longAccount * 100).toFixed(1)}% long
+              </div>
+            </div>
+            <div className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Signal Impact</div>
+              <div className="text-xs text-zinc-300 leading-relaxed">
+                {heatData.heatSignal === "EXTREME_LONG" ? "Crowd heavily long. Contrarian fade UP." :
+                 heatData.heatSignal === "LONG_HEAVY" ? "More longs than shorts. Capped upside." :
+                 heatData.heatSignal === "EXTREME_SHORT" ? "Crowd heavily short. Contrarian fade DOWN." :
+                 heatData.heatSignal === "SHORT_HEAVY" ? "More shorts than longs. Capped downside." :
+                 "Balanced positioning. No crowd bias."}
+              </div>
+            </div>
+            <div className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Squeeze Risk</div>
+              <div className={cn("text-lg font-mono font-bold", heatData.squeezeRisk !== "NONE" ? "text-yellow-400" : "text-zinc-500")}>
+                {heatData.squeezeRisk === "NONE" ? "None" : heatData.squeezeRisk.replace("_", " ")}
+              </div>
+              <div className="text-[10px] text-zinc-600 mt-0.5">
+                {heatData.squeezeRisk === "LONG_SQUEEZE" ? "Shorts may squeeze longs UP" :
+                 heatData.squeezeRisk === "SHORT_SQUEEZE" ? "Longs may squeeze shorts DOWN" :
+                 "No extreme funding detected"}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Session PnL Chart ── */}
       <div className="glass-card p-4 w-full">
@@ -1571,58 +1654,6 @@ export default function BotDashboard() {
           </div>
         </div>
 
-        {/* ── Active Markets ── */}
-        <div className="glass-card p-4 flex flex-col gap-3">
-          <div className="flex items-center gap-2 text-zinc-500 text-xs font-semibold uppercase tracking-wider">
-            <Activity className="w-3.5 h-3.5" />
-            Active Markets
-          </div>
-          <div className="flex flex-col gap-2">
-            {(["BTC", "ETH", "SOL"] as const).map((asset) => {
-              const active = enabledAssets.includes(asset);
-              const isLast = active && enabledAssets.length === 1;
-              const assetColor: Record<string, string> = { BTC: "orange", ETH: "blue", SOL: "purple" };
-              const color = assetColor[asset];
-              return (
-                <button
-                  key={asset}
-                  type="button"
-                  title={isLast ? "At least one asset must remain active" : `${active ? "Disable" : "Enable"} ${asset}`}
-                  onClick={() => !isLast && handleToggleAsset(asset)}
-                  disabled={assetsLoading || isLast}
-                  className={cn(
-                    "w-full text-left rounded-lg border p-2.5 transition-all",
-                    active
-                      ? color === "orange"
-                        ? "bg-orange-500/15 border-orange-500/50"
-                        : color === "blue"
-                          ? "bg-blue-500/15 border-blue-500/50"
-                          : "bg-purple-500/15 border-purple-500/50"
-                      : "bg-zinc-800/50 border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 opacity-50",
-                    isLast ? "cursor-default" : "cursor-pointer disabled:opacity-40"
-                  )}
-                >
-                  <div className={cn(
-                    "flex items-center gap-1.5 font-bold text-xs",
-                    active
-                      ? color === "orange" ? "text-orange-300" : color === "blue" ? "text-blue-300" : "text-purple-300"
-                      : "text-zinc-500"
-                  )}>
-                    <span className="font-mono">{asset}</span>
-                    {active
-                      ? <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400 font-bold">ON</span>
-                      : <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-zinc-700 text-zinc-500 font-bold">OFF</span>
-                    }
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-          <div className="text-[10px] text-zinc-600">
-            {enabledAssets.length === 1 ? `Scanning ${enabledAssets[0]} only` : `Scanning ${enabledAssets.join(" + ")}`}
-          </div>
-        </div>
-
         {/* Window timer */}
         <div className="glass-card p-4 flex flex-col justify-between">
           <div className="flex items-center gap-2 text-zinc-500 text-xs font-semibold uppercase tracking-wider">
@@ -1701,12 +1732,7 @@ export default function BotDashboard() {
                 {/* Market title + asset badge */}
                 <div className="flex items-center gap-2">
                   {snap.asset && (
-                    <span className={cn(
-                      "text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0",
-                      snap.asset === "BTC" ? "bg-orange-500/15 text-orange-400 border-orange-500/30"
-                        : snap.asset === "ETH" ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
-                        : "bg-purple-500/15 text-purple-400 border-purple-500/30"
-                    )}>{snap.asset}</span>
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0 bg-orange-500/15 text-orange-400 border-orange-500/30">{snap.asset}</span>
                   )}
                   <p className="text-[11px] text-zinc-500 truncate">{snap.market}</p>
                 </div>

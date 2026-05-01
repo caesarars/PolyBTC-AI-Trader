@@ -93,3 +93,19 @@ export interface AIRecommendation {
   oppositePressureProbability?: number;
   reversalReasoning?: string;
 }
+
+export interface MarketHeatData {
+  asset: string;
+  fundingRate: number; // e.g. 0.0001 = 0.01%
+  fundingAnnualized: number; // e.g. 0.1095 = 10.95%
+  nextFundingTime: number; // unix ms
+  takerBuySellRatio: number; // >1 = more buyer aggression
+  takerBuyVol: number;
+  takerSellVol: number;
+  longShortRatio: number; // >1 = more longs than shorts
+  longAccount: number; // % accounts long
+  shortAccount: number; // % accounts short
+  heatSignal: "EXTREME_LONG" | "LONG_HEAVY" | "NEUTRAL" | "SHORT_HEAVY" | "EXTREME_SHORT";
+  squeezeRisk: "LONG_SQUEEZE" | "SHORT_SQUEEZE" | "NONE";
+  updatedAt: number; // unix ms
+}

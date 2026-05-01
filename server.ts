@@ -355,7 +355,7 @@ function loadLearning(): void {
     winMemory.push(...(data.winMemory || []));
     adaptiveLossPenaltyEnabled = data.adaptiveLossPenaltyEnabled ?? true;
     // Load per-asset state — fall back to old scalar if per-asset not present (migration)
-    const assets: TradingAsset[] = ["BTC", "ETH", "SOL"];
+    const assets: TradingAsset[] = ["BTC"];
     if (data.consecutiveLossesByAsset) {
       for (const a of assets) consecutiveLossesByAsset.set(a, data.consecutiveLossesByAsset[a] ?? 0);
     } else {
@@ -435,15 +435,11 @@ type BtcCandle = {
   volume: number;
 };
 
-// ── Multi-asset support: BTC, ETH, SOL ───────────────────────────────────────
-type TradingAsset = "BTC" | "ETH" | "SOL";
-const ALL_ASSETS: TradingAsset[] = ["BTC", "ETH", "SOL"];
-// Runtime-mutable: default BTC only. Override via env ENABLED_ASSETS=BTC,ETH,SOL
-let ENABLED_ASSETS: TradingAsset[] = (
-  (process.env.ENABLED_ASSETS || "BTC").split(",")
-    .map(s => s.trim().toUpperCase())
-    .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset))
-);
+// ── BTC-only market support ────────────────────────────────────────────────
+type TradingAsset = "BTC";
+const ALL_ASSETS: TradingAsset[] = ["BTC"];
+// BTC only — no multi-asset switching
+let ENABLED_ASSETS: TradingAsset[] = ["BTC"];
 const ASSET_CONFIG: Record<TradingAsset, {
   binanceSymbol: string;
   coinbaseProduct: string;
@@ -455,15 +451,14 @@ const ASSET_CONFIG: Record<TradingAsset, {
   divergenceWeak: number;
   label: string;
 }> = {
-  BTC: { binanceSymbol: "BTCUSDT", coinbaseProduct: "BTC-USD", coinGeckoId: "bitcoin",  krakenPair: "XBTUSD",  polySlugPrefix: "btc-updown-5m", divergenceStrong: 200, divergenceMod: 120, divergenceWeak: 60,  label: "Bitcoin" },
-  ETH: { binanceSymbol: "ETHUSDT", coinbaseProduct: "ETH-USD", coinGeckoId: "ethereum", krakenPair: "ETHUSD",  polySlugPrefix: "eth-updown-5m", divergenceStrong: 12,  divergenceMod: 7,   divergenceWeak: 3,   label: "Ethereum" },
-  SOL: { binanceSymbol: "SOLUSDT", coinbaseProduct: "SOL-USD", coinGeckoId: "solana",   krakenPair: "SOLUSD",  polySlugPrefix: "sol-updown-5m", divergenceStrong: 4,   divergenceMod: 2,   divergenceWeak: 0.8, label: "Solana" },
+  BTC: { binanceSymbol: "BTCUSDT", coinbaseProduct: "BTC-USD", coinGeckoId: "bitcoin",  krakenPair: "XBTUSD",  polySlugPrefix: "btc-updown-5m", divergenceStrong: 85, divergenceMod: 50, divergenceWeak: 30,  label: "Bitcoin" },
 };
 
 // Per-asset in-memory caches (BTC uses legacy single vars below for backward compat)
 const assetHistoryCaches = new Map<TradingAsset, { data: BtcCandle[]; expiresAt: number }>();
 const assetPriceCaches   = new Map<TradingAsset, { data: { symbol: string; price: string; source?: string }; expiresAt: number }>();
 const assetIndicatorsCaches = new Map<TradingAsset, { data: any; expiresAt: number }>();
+const assetHeatCaches = new Map<TradingAsset, { data: import("./src/types.js").MarketHeatData; expiresAt: number }>();
 
 let btcHistoryCache: { data: BtcCandle[]; expiresAt: number } | null = null;
 let btcPriceCache: { data: { symbol: string; price: string; source?: string }; expiresAt: number } | null = null;
@@ -486,6 +481,7 @@ const MONGODB_TRADES_COLLECTION = process.env.MONGODB_TRADES_COLLECTION || "trad
 const BTC_PRICE_CACHE_MS = 2_000;
 const BTC_HISTORY_CACHE_MS = 8_000;
 const BTC_INDICATORS_CACHE_MS = 15_000;
+const HEAT_CACHE_MS = 30_000; // Binance funding / taker ratio updates every 5m, 30s cache is safe
 const BTC_PRICE_SNAPSHOT_TTL_SECONDS = Number(process.env.BTC_PRICE_SNAPSHOT_TTL_SECONDS || 60 * 60 * 24 * 14);
 const BTC_CANDLE_TTL_SECONDS = Number(process.env.BTC_CANDLE_TTL_SECONDS || 60 * 60 * 24 * 30);
 const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_000);
@@ -548,16 +544,16 @@ let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
 // Per-asset analyzed-this-window tracking (keyed by asset → Set of market IDs)
 const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
-  (["BTC", "ETH", "SOL"] as TradingAsset[]).map(a => [a, new Set<string>()])
+  (["BTC"] as TradingAsset[]).map(a => [a, new Set<string>()])
 );
 // Per-asset trade execution locks for the current window.
 // `executing` prevents duplicate submits during async races.
 // `executed` blocks any re-analysis/re-entry after a real Polymarket fill attempt succeeded.
 const botExecutingTradesThisWindowByAsset = new Map<TradingAsset, Set<string>>(
-  (["BTC", "ETH", "SOL"] as TradingAsset[]).map(a => [a, new Set<string>()])
+  (["BTC"] as TradingAsset[]).map(a => [a, new Set<string>()])
 );
 const botExecutedTradesThisWindowByAsset = new Map<TradingAsset, Set<string>>(
-  (["BTC", "ETH", "SOL"] as TradingAsset[]).map(a => [a, new Set<string>()])
+  (["BTC"] as TradingAsset[]).map(a => [a, new Set<string>()])
 );
 // Backward-compat alias (used by BTC path until loop refactor is complete)
 const botAnalyzedThisWindow = botAnalyzedThisWindowByAsset.get("BTC")!;
@@ -605,10 +601,10 @@ let divergenceFastTradeRunning = false;   // mutex — prevents concurrent fast-
 // Keyed by asset so BTC/ETH/SOL caches don't overwrite each other.
 const currentWindowAiCache = new Map<TradingAsset, { windowStart: number; marketId: string; rec: any }>();
 
-// ── Divergence tracker (asset price vs YES token lag detector) ───────────────
+// ── Divergence tracker (BTC price vs YES token lag detector) ────────────────
 interface PricePoint { ts: number; price: number; }
-const priceRingBufferByAsset = new Map<TradingAsset, PricePoint[]>([["BTC",[]], ["ETH",[]], ["SOL",[]]]);
-const yesRingBufferByAsset   = new Map<TradingAsset, PricePoint[]>([["BTC",[]], ["ETH",[]], ["SOL",[]]]);
+const priceRingBufferByAsset = new Map<TradingAsset, PricePoint[]>([["BTC",[]]]);
+const yesRingBufferByAsset   = new Map<TradingAsset, PricePoint[]>([["BTC",[]]]);
 const currentWindowYesTokenIdByAsset = new Map<TradingAsset, string | null>();
 const currentWindowNoTokenIdByAsset  = new Map<TradingAsset, string | null>();
 // Convenience accessors used by divergence tracker (always reflects currentDivergenceAsset)
@@ -748,9 +744,9 @@ interface WinMemory {
 }
 const winMemory: WinMemory[] = [];
 
-const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
-const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
-const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0],["ETH",0],["SOL",0]]);
+const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0]]);
+const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0]]);
+const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0]]);
 // Global aliases kept for persistence (sum/avg not needed — persist per entry in lossMemory)
 let adaptiveLossPenaltyEnabled = true;
 
@@ -1209,8 +1205,8 @@ async function fetchBtcHistoryFromBinance() {
   for (const host of binanceHosts) {
     try {
       const response = await axios.get(`${host}/api/v3/klines`, {
-        params: { symbol: "BTCUSDT", interval: "1m", limit: 60 },
-        timeout: 5000,
+        params: { symbol: "BTCUSDT", interval: "1m", limit: 1000 },
+        timeout: 8000,
       });
       const history = response.data.map((k: any) => ({
         time: Math.floor(k[0] / 1000),
@@ -1259,7 +1255,6 @@ async function fetchBtcHistoryFromCoinbase() {
       headers: { Accept: "application/json" },
     });
     const history = (response.data || [])
-      .slice(0, 60)
       .map((k: number[]) => ({
         time: Number(k[0]),
         low: Number(k[1]),
@@ -1276,6 +1271,131 @@ async function fetchBtcHistoryFromCoinbase() {
   } catch {
     return null;
   }
+}
+
+// ── Binance Futures market heat (funding + taker ratio + long/short) ─────────
+async function fetchBinanceFundingRate(symbol: string) {
+  try {
+    const r = await axios.get("https://fapi.binance.com/fapi/v1/premiumIndex", {
+      params: { symbol },
+      timeout: 5000,
+    });
+    const d = r.data;
+    return {
+      fundingRate: parseFloat(d.lastFundingRate || "0"),
+      nextFundingTime: Number(d.nextFundingTime || 0),
+      time: Number(d.time || 0),
+    };
+  } catch { return null; }
+}
+
+async function fetchBinanceTakerRatio(symbol: string, period = "5m") {
+  try {
+    const r = await axios.get("https://fapi.binance.com/futures/data/takerlongshortRatio", {
+      params: { symbol, period },
+      timeout: 5000,
+    });
+    const arr = r.data as Array<{ buySellRatio: string; sellVol: string; buyVol: string; timestamp: number }>;
+    if (!arr?.length) return null;
+    const latest = arr[arr.length - 1];
+    return {
+      buySellRatio: parseFloat(latest.buySellRatio),
+      buyVol: parseFloat(latest.buyVol),
+      sellVol: parseFloat(latest.sellVol),
+      timestamp: Number(latest.timestamp),
+    };
+  } catch { return null; }
+}
+
+async function fetchBinanceLongShortRatio(symbol: string, period = "5m") {
+  try {
+    const r = await axios.get("https://fapi.binance.com/futures/data/globalLongShortAccountRatio", {
+      params: { symbol, period },
+      timeout: 5000,
+    });
+    const arr = r.data as Array<{ longAccount: string; shortAccount: string; longShortRatio: string; timestamp: number }>;
+    if (!arr?.length) return null;
+    const latest = arr[arr.length - 1];
+    return {
+      longAccount: parseFloat(latest.longAccount),
+      shortAccount: parseFloat(latest.shortAccount),
+      longShortRatio: parseFloat(latest.longShortRatio),
+      timestamp: Number(latest.timestamp),
+    };
+  } catch { return null; }
+}
+
+function computeHeatSignal(
+  fundingRate: number,
+  takerRatio: number,
+  lsRatio: number
+): { heatSignal: import("./src/types.js").MarketHeatData["heatSignal"]; squeezeRisk: import("./src/types.js").MarketHeatData["squeezeRisk"] } {
+  // Funding extremes (>0.05% or <-0.05% per 8h = annualized ~22.8%)
+  const fundingExtreme = Math.abs(fundingRate) > 0.0005;
+  const fundingLongHeavy = fundingRate > 0.0003;
+  const fundingShortHeavy = fundingRate < -0.0003;
+
+  // Taker ratio: >1.5 = aggressive buying, <0.67 = aggressive selling
+  const takerBuyHeavy = takerRatio > 1.5;
+  const takerSellHeavy = takerRatio < 0.67;
+
+  // Long/Short ratio: >1.5 = more longs, <0.67 = more shorts
+  const lsLongHeavy = lsRatio > 1.5;
+  const lsShortHeavy = lsRatio < 0.67;
+
+  let heatSignal: import("./src/types.js").MarketHeatData["heatSignal"] = "NEUTRAL";
+  if ((fundingLongHeavy && lsLongHeavy) || (fundingExtreme && fundingRate > 0)) heatSignal = "EXTREME_LONG";
+  else if ((fundingShortHeavy && lsShortHeavy) || (fundingExtreme && fundingRate < 0)) heatSignal = "EXTREME_SHORT";
+  else if (fundingLongHeavy || lsLongHeavy || takerBuyHeavy) heatSignal = "LONG_HEAVY";
+  else if (fundingShortHeavy || lsShortHeavy || takerSellHeavy) heatSignal = "SHORT_HEAVY";
+
+  let squeezeRisk: import("./src/types.js").MarketHeatData["squeezeRisk"] = "NONE";
+  if (fundingExtreme && fundingRate > 0 && lsLongHeavy) squeezeRisk = "LONG_SQUEEZE";
+  if (fundingExtreme && fundingRate < 0 && lsShortHeavy) squeezeRisk = "SHORT_SQUEEZE";
+
+  return { heatSignal, squeezeRisk };
+}
+
+async function getAssetHeatData(asset: TradingAsset, forceRefresh = false): Promise<import("./src/types.js").MarketHeatData | null> {
+  const cached = assetHeatCaches.get(asset);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.data;
+
+  const cfg = ASSET_CONFIG[asset];
+  const symbol = cfg.binanceSymbol;
+
+  const [funding, taker, ls] = await Promise.all([
+    fetchBinanceFundingRate(symbol),
+    fetchBinanceTakerRatio(symbol, "5m"),
+    fetchBinanceLongShortRatio(symbol, "5m"),
+  ]);
+
+  if (!funding && !taker && !ls) {
+    return cached?.data ?? null;
+  }
+
+  const fundingRate = funding?.fundingRate ?? 0;
+  const takerRatio = taker?.buySellRatio ?? 1;
+  const lsRatio = ls?.longShortRatio ?? 1;
+  const { heatSignal, squeezeRisk } = computeHeatSignal(fundingRate, takerRatio, lsRatio);
+
+  const data: import("./src/types.js").MarketHeatData = {
+    asset,
+    fundingRate,
+    fundingAnnualized: fundingRate * 3 * 365, // 3x per day * 365 days
+    nextFundingTime: funding?.nextFundingTime ?? 0,
+    takerBuySellRatio: takerRatio,
+    takerBuyVol: taker?.buyVol ?? 0,
+    takerSellVol: taker?.sellVol ?? 0,
+    longShortRatio: lsRatio,
+    longAccount: ls?.longAccount ?? 0.5,
+    shortAccount: ls?.shortAccount ?? 0.5,
+    heatSignal,
+    squeezeRisk,
+    updatedAt: Date.now(),
+  };
+
+  assetHeatCaches.set(asset, { data, expiresAt: Date.now() + HEAT_CACHE_MS });
+  return data;
 }
 
 // ── Generic multi-asset fetchers (ETH, SOL via Binance/Coinbase) ─────────────
@@ -1928,7 +2048,7 @@ function startDivergenceTracker() {
       // ── FAST PATH TRIGGER ─────────────────────────────────────────────────
       // Fire immediately on STRONG divergence — don't wait for next bot cycle.
       // Cooldown: 30s to prevent thrashing on the same divergence event.
-      // BTC-only: ETH/SOL divergence uses BTC price delta vs ETH/SOL thresholds
+      // BTC-only divergence tracker
       // (shared ring buffer bug) → produces false signals. Restrict to BTC only.
       if (
         strength === "STRONG" &&
@@ -2191,21 +2311,21 @@ async function startServer() {
 
     if (averagePrice < 0.35) {
       tpTarget = Math.min(0.68, averagePrice + 0.18); // was +0.30 — too ambitious
-      slTarget = Math.max(0.01, averagePrice - 0.10);
-      trailingDistance = 0.07;
+      slTarget = Math.max(0.01, averagePrice - 0.08);
+      trailingDistance = 0.06;
     } else if (averagePrice < 0.50) {
       tpTarget = Math.min(0.68, averagePrice + 0.14); // was +0.22
-      slTarget = Math.max(0.01, averagePrice - 0.09);
-      trailingDistance = 0.06;
+      slTarget = Math.max(0.01, averagePrice - 0.07);
+      trailingDistance = 0.05;
     } else if (averagePrice < 0.65) {
       tpTarget = Math.min(0.74, averagePrice + 0.11); // was +0.18
-      slTarget = Math.max(0.01, averagePrice - 0.09);
-      trailingDistance = 0.05;
+      slTarget = Math.max(0.01, averagePrice - 0.07);
+      trailingDistance = 0.04;
     } else {
       // High-price entry: very limited upside
       tpTarget = Math.min(0.84, averagePrice + 0.08); // was +0.10
-      slTarget = Math.max(0.01, averagePrice - 0.07);
-      trailingDistance = 0.04;
+      slTarget = Math.max(0.01, averagePrice - 0.06);
+      trailingDistance = 0.03;
     }
 
     return {
@@ -2281,7 +2401,7 @@ async function startServer() {
         if (bestAsk <= 0) return;
 
         // Entry price gate — STRONG divergence gets the 85¢ override (same as main cycle)
-        const MAX_ENTRY_PRICE = 0.85;
+        const MAX_ENTRY_PRICE = 0.75;
         if (bestAsk > MAX_ENTRY_PRICE) {
           botPrint("SKIP", `[DIV FAST] Price too high: ${(bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ — window closed`);
           return;
@@ -2382,120 +2502,7 @@ async function startServer() {
         botPrint("INFO", `Result tracker armed — checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
 
         // ── Correlated multi-asset entry ──────────────────────────────────────
-        // DISABLED: correlated entries amplify risk without independent signal.
-        // Re-enable only after proving BTC divergence has sustained >55% win rate.
-        const ENABLE_CORRELATED_ENTRY = false;
-        // BTC STRONG divergence historically pulls ETH and SOL Polymarket prices
-        // in the same direction — they often lag BTC by 1-2 cycles. Enter the same
-        // direction at reduced Kelly (70%) since the signal is BTC-derived, not
-        // the asset's own independent divergence.
-        const correlatedAssets = ENABLED_ASSETS.filter(a => a !== fastAsset);
-        if (ENABLE_CORRELATED_ENTRY && correlatedAssets.length > 0) {
-          await Promise.allSettled(correlatedAssets.map(async (corrAsset) => {
-            try {
-              const corrMarket = activeBotMarketByAsset.get(corrAsset);
-              if (!corrMarket) return;
-              const corrMarketId = corrMarket.id;
-
-              const corrTradeWindowStatus = getTradeWindowStatus(corrAsset, corrMarketId);
-              if (corrTradeWindowStatus) {
-                botPrint("SKIP", `[CORR-${corrAsset}] Trade ${corrTradeWindowStatus === "EXECUTED" ? "already executed" : "already submitting"} for this market in the current window — correlated entry cancelled`);
-                return;
-              }
-
-              const corrSet = botAnalyzedThisWindowByAsset.get(corrAsset)!;
-              if (corrSet.has(corrMarketId)) {
-                botPrint("SKIP", `[CORR-${corrAsset}] Analysis already handled for this market in the current window — correlated entry skipped`);
-                return;
-              }
-
-              const corrOutcomeIndex = direction === "UP" ? 0 : 1;
-              const corrTokenId: string = corrMarket.clobTokenIds?.[corrOutcomeIndex];
-              if (!corrTokenId) return;
-
-              // Fetch fresh order book for correlated asset
-              const corrR = await axios.get(
-                `https://clob.polymarket.com/book?token_id=${corrTokenId}`,
-                { timeout: 3000 }
-              );
-              const corrAsks: any[] = corrR.data?.asks ?? [];
-              const corrClobAsk = corrAsks.length > 0 ? parseFloat(corrAsks[0].price) : 0;
-              const corrImplied = parseFloat(corrMarket.outcomePrices?.[corrOutcomeIndex] ?? "0");
-              const corrBestAsk = (corrClobAsk > 0 && corrClobAsk < 0.97) ? corrClobAsk : corrImplied > 0 ? corrImplied : corrClobAsk;
-              if (corrBestAsk <= 0 || corrBestAsk > MAX_ENTRY_PRICE) return;
-
-              // Slightly lower confidence than main asset — signal is BTC-derived
-              const corrConf = 72;
-              const corrEdge = parseFloat((corrConf / 100 - corrBestAsk).toFixed(2));
-              if (corrConf < cfg.minConfidence || corrEdge < cfg.minEdge) return;
-
-              const corrP = corrConf / 100;
-              const corrB = (1 - corrBestAsk) / corrBestAsk;
-              const corrKelly = (corrP * corrB - (1 - corrP)) / corrB;
-              if (corrKelly <= 0) return;
-
-              // 70% of normal dynamic Kelly — correlated signal, not independent divergence
-              const corrBetAmount = getFixedEntryBetAmount(balance);
-              if (corrBetAmount < MIN_BET) {
-                botPrint("SKIP", `[CORR-${corrAsset}] Bet too small: $${corrBetAmount.toFixed(2)}`);
-                return;
-              }
-
-              botPrint("TRADE", `⚡ CORRELATED [${corrAsset}] BTC-driven ${direction} → ask=${(corrBestAsk * 100).toFixed(0)}¢ | $${corrBetAmount.toFixed(2)} USDC | conf=${corrConf}%`);
-              corrSet.add(corrMarketId);
-              markTradeExecutionStarted(corrAsset, corrMarketId);
-
-              const corrResult = await executePolymarketTrade({
-                tokenID: corrTokenId,
-                amount: corrBetAmount,
-                side: Side.BUY,
-                price: corrBestAsk,
-                executionMode: "AGGRESSIVE",
-                amountMode: "SPEND",
-              });
-              markTradeExecutionFinished(corrAsset, corrMarketId, true);
-
-              botSessionTradesCount++;
-              botPrint("OK", `⚡ CORR [${corrAsset}] EXECUTED ✓ | ID: ${corrResult.orderID} | Status: ${corrResult.status}`);
-
-              const corrLevels = recommendAutomationLevels(corrBestAsk);
-              await savePositionAutomation({
-                assetId: corrTokenId,
-                market: corrMarket.question || corrMarket.id,
-                outcome: corrMarket.outcomes?.[corrOutcomeIndex] || direction,
-                averagePrice: corrBestAsk.toFixed(4),
-                size: corrResult.orderSize.toFixed(6),
-                takeProfit: corrLevels.takeProfit,
-                stopLoss: corrLevels.stopLoss,
-                trailingStop: corrLevels.trailingStop,
-                windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
-                armed: true,
-              });
-
-              pendingResults.set(corrTokenId, {
-                eventSlug: `${ASSET_CONFIG[corrAsset].polySlugPrefix}-${nowWindowStart}`,
-                marketId: corrMarket.id,
-                market: corrMarket.question || corrMarket.id,
-                tokenId: corrTokenId,
-                direction,
-                outcome: corrMarket.outcomes?.[corrOutcomeIndex] || direction,
-                entryPrice: corrBestAsk,
-                betAmount: corrBetAmount,
-                orderId: corrResult.orderID,
-                windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
-                confidence: corrConf,
-                edge: corrEdge,
-                reasoning: `[CORRELATED] BTC STRONG divergence +$${snapshot.btcDelta.toFixed(0)} → ${corrAsset} same-direction entry`,
-                windowElapsedSeconds: now - nowWindowStart,
-                asset: corrAsset,
-              });
-            } catch (corrErr: any) {
-              const corrMarketId = activeBotMarketByAsset.get(corrAsset)?.id;
-              if (corrMarketId) markTradeExecutionFinished(corrAsset, corrMarketId, false);
-              botPrint("WARN", `[CORR-${corrAsset}] Entry failed: ${corrErr?.message ?? corrErr}`);
-            }
-          }));
-        }
+        // REMOVED: BTC-only mode. No ETH/SOL correlated entries.
 
       } catch (err: any) {
         markTradeExecutionFinished(fastAsset, _fastMarket?.id ?? "", false);
@@ -3080,20 +3087,22 @@ async function startServer() {
           let btcHistoryResult: any;
           let btcIndicatorsData: any;
           let sentimentData: any;
+          let heatData: import("./src/types.js").MarketHeatData | null = null;
           let orderBooks: Record<string, any>;
           let marketHistory: { t: number; yes: number; no: number }[];
 
           {
             // Fetch all data fresh (no prefetch)
             botPrint("INFO", `[${currentAsset}] Fetching price, history, indicators, sentiment...`);
-            [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData] = await Promise.all([
+            [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData, heatData] = await Promise.all([
               getAssetPrice(currentAsset),
               getAssetHistory(currentAsset),
               getAssetIndicators(currentAsset),
               axios.get("https://api.alternative.me/fng/", { timeout: 5000 })
                 .then((r) => r.data.data[0]).catch(() => null),
+              getAssetHeatData(currentAsset),
             ]);
-            botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+            botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"} | Heat: ${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
 
             // ── Strike price vs current price analysis ──────────────────────
             // Parse strike from question e.g. "Will BTC be above $95,500 at 12:05?"
@@ -3214,7 +3223,7 @@ async function startServer() {
           //   4. No recent loss pattern match (avoid repeating bad setups)
 
           // Compute local alignment score
-          // Signals: 60m bias, 5m confirmation, 1m trigger, technical score, FastLoop
+          // Signals: 60m bias, 5m confirmation, 1m trigger, technical score, FastLoop, Market Heat
           const _hist = btcHistoryResult?.history ?? [];
           const _ind = btcIndicatorsData;
           let _localBullish = 0, _localBearish = 0;
@@ -3242,6 +3251,14 @@ async function startServer() {
           }
           if (fastMom && fastMom.strength !== "WEAK") {
             if (fastMom.direction === "UP") _localBullish++; else if (fastMom.direction === "DOWN") _localBearish++;
+          }
+          // Market heat alignment (contrarian short-term: extreme positioning = fade signal)
+          if (heatData) {
+            if (heatData.heatSignal === "EXTREME_LONG" || heatData.heatSignal === "LONG_HEAVY") {
+              _localBearish++; // crowd already long, fading upside
+            } else if (heatData.heatSignal === "EXTREME_SHORT" || heatData.heatSignal === "SHORT_HEAVY") {
+              _localBullish++; // crowd already short, fading downside
+            }
           }
           const localAlignment = { bullish: _localBullish, bearish: _localBearish };
 
@@ -3284,14 +3301,14 @@ async function startServer() {
               confidence: fastConf,
               estimatedEdge: fastEdge,
               candlePatterns: [],
-              reasoning: `[FAST PATH] ${alignmentScore}/5 signals aligned ${fastPathDir} | FastLoop STRONG vw=${fastMom!.volumeWeighted.toFixed(3)}% accel=${fastMom!.acceleration.toFixed(3)}%${div && div.strength !== "NONE" ? ` | Divergence ${div.strength} ${div.direction}` : ""}`,
+              reasoning: `[FAST PATH] ${alignmentScore}/5 signals aligned ${fastPathDir} | FastLoop STRONG vw=${fastMom!.volumeWeighted.toFixed(3)}% accel=${fastMom!.acceleration.toFixed(3)}%${div && div.strength !== "NONE" ? ` | Divergence ${div.strength} ${div.direction}` : ""}${heatData ? ` | heat=${heatData.heatSignal} squeeze=${heatData.squeezeRisk}` : ""}`,
               riskLevel: alignmentScore === 5 ? "LOW" : "MEDIUM",
               dataMode: "FULL_DATA" as const,
               reversalProbability: alignmentScore === 5 ? 20 : 30,
               oppositePressureProbability: 25,
               reversalReasoning: "Fast path — strong multi-signal consensus",
             };
-            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢`);
+            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢${heatData ? ` | heat=${heatData.heatSignal}` : ""}`);
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
 
           // ── NORMAL PATH: price-lag signal synthesizer ───────
@@ -3321,8 +3338,17 @@ async function startServer() {
               const lossStreak = assetLossMemory.filter(l => l.direction === synthDir).length;
               const streakPenalty = lossStreak >= 2 ? lossStreak * 3 : 0;
 
+              // Market heat squeeze boost: squeeze in same direction = momentum catalyst
+              let heatBoost = 0;
+              if (heatData) {
+                if (heatData.squeezeRisk === "LONG_SQUEEZE" && synthDir === "UP") heatBoost = 4;
+                else if (heatData.squeezeRisk === "SHORT_SQUEEZE" && synthDir === "DOWN") heatBoost = 4;
+                else if (heatData.squeezeRisk === "LONG_SQUEEZE" && synthDir === "DOWN") heatBoost = -3;
+                else if (heatData.squeezeRisk === "SHORT_SQUEEZE" && synthDir === "UP") heatBoost = -3;
+              }
+
               // Base 60 (was 55) + align weight ×5 (was ×4) → 3/5 align + MODERATE FastLoop = 60+15+5=80%
-              let synthConf = 60 + alignScore * 5 + divBoost + momBoost + techBoost - streakPenalty;
+              let synthConf = 60 + alignScore * 5 + divBoost + momBoost + techBoost + heatBoost - streakPenalty;
               synthConf = Math.max(55, Math.min(90, Math.round(synthConf)));
 
               const riskLevel: "LOW" | "MEDIUM" | "HIGH" =
@@ -3341,21 +3367,20 @@ async function startServer() {
                 confidence: synthConf,
                 estimatedEdge: synthEdge,
                 riskLevel,
-                reasoning: `[SYNTH] ${synthDir} | align=${alignScore}/5 | FastLoop=${fastMom?.strength ?? "N/A"} vw=${fastMom?.volumeWeighted?.toFixed(3) ?? "0"}% | div=${div?.strength ?? "NONE"} | tech=${btcIndicatorsData?.signalScore ?? 0} | streak-${synthDir}=${lossStreak}L`,
+                reasoning: `[SYNTH] ${synthDir} | align=${alignScore}/5 | FastLoop=${fastMom?.strength ?? "N/A"} vw=${fastMom?.volumeWeighted?.toFixed(3) ?? "0"}% | div=${div?.strength ?? "NONE"} | tech=${btcIndicatorsData?.signalScore ?? 0} | heat=${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"} | streak-${synthDir}=${lossStreak}L`,
                 candlePatterns: [],
                 dataMode: "FULL_DATA" as const,
                 reversalProbability: Math.max(15, 50 - alignScore * 7),
                 oppositePressureProbability: 30,
                 reversalReasoning: "Synthesized from local signals",
               };
-              botPrint("INFO", `[SYNTH] ${synthDir} conf=${synthConf}% edge=${synthEdge}¢ align=${alignScore}/5 div=${div?.strength ?? "NONE"} mom=${fastMom?.strength ?? "N/A"}`);
+              botPrint("INFO", `[SYNTH] ${synthDir} conf=${synthConf}% edge=${synthEdge}¢ align=${alignScore}/5 div=${div?.strength ?? "NONE"} mom=${fastMom?.strength ?? "N/A"} heat=${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
             }
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
           }
 
           // ── Apply divergence overrides AFTER AI decision ────────────────
-          // STRONG force-override is BTC-only — ETH/SOL divergence uses shared BTC
-          // ring buffer vs ETH/SOL thresholds, producing false signals.
+          // STRONG force-override for BTC divergence.
           if (div && div.strength !== "NONE" && div.direction !== "NEUTRAL") {
             if (div.strength === "STRONG" && rec.decision !== "TRADE") {
               if (currentAsset !== "BTC") {
@@ -3941,7 +3966,7 @@ async function startServer() {
 
   app.post("/api/backtest", async (_req, res) => {
     try {
-      const historyResult = await getBtcHistory();
+      const historyResult = await getBtcHistory(true);
       if (!historyResult?.history?.length) return res.json({ error: "No BTC history available" });
       const history = historyResult.history;
       const minStart = 20;
@@ -4059,24 +4084,12 @@ async function startServer() {
     res.json({ all: ALL_ASSETS, enabled: ENABLED_ASSETS });
   });
 
-  app.post("/api/bot/assets", (req, res) => {
-    const { assets } = req.body || {};
-    if (!Array.isArray(assets) || assets.length === 0) {
-      return res.status(400).json({ error: "assets must be a non-empty array" });
-    }
-    const next = assets
-      .map((s: any) => String(s).trim().toUpperCase())
-      .filter((s): s is TradingAsset => ALL_ASSETS.includes(s as TradingAsset));
-    if (next.length === 0) {
-      return res.status(400).json({ error: "No valid assets provided. Valid: BTC, ETH, SOL" });
-    }
-    ENABLED_ASSETS = next;
-    botPrint("INFO", `Active assets updated: ${ENABLED_ASSETS.join(", ")}`);
-    res.json({ ok: true, enabled: ENABLED_ASSETS });
+  app.post("/api/bot/assets", (_req, res) => {
+    res.status(400).json({ error: "BTC-only mode. Asset switching is disabled." });
   });
 
   app.post("/api/bot/reset-confidence", (_req, res) => {
-    for (const a of ["BTC", "ETH", "SOL"] as const) {
+    for (const a of ["BTC"] as const) {
       adaptiveConfidenceByAsset.set(a, 0);
       consecutiveLossesByAsset.set(a, 0);
       consecutiveWinsByAsset.set(a, 0);
@@ -4107,7 +4120,7 @@ async function startServer() {
     });
   });
 
-  // API Proxy for Polymarket — BTC/ETH/SOL Up/Down 5-Minute Events
+  // API Proxy for Polymarket — BTC Up/Down 5-Minute Events
   app.get("/api/polymarket/markets", async (req, res) => {
     try {
       const nowUtcSeconds = Math.floor(Date.now() / 1000);
@@ -4569,6 +4582,19 @@ async function startServer() {
       res.json(response.data.data[0]);
     } catch (error: any) {
       res.status(500).json({ error: "Failed to fetch sentiment data" });
+    }
+  });
+
+  // Market heat: Binance funding rate + taker ratio + long/short ratio
+  app.get("/api/market-heat/:asset?", async (req, res) => {
+    try {
+      const assetParam = (req.params.asset || "BTC").toUpperCase();
+      const asset = ALL_ASSETS.includes(assetParam as TradingAsset) ? (assetParam as TradingAsset) : "BTC";
+      const data = await getAssetHeatData(asset, true);
+      if (!data) return res.status(503).json({ error: "Market heat data unavailable" });
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: "Failed to fetch market heat data", detail: error?.message });
     }
   });
 
