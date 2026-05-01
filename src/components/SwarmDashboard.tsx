@@ -67,8 +67,8 @@ interface WindowSnapshot {
   remainingSeconds: number;
   progressPct: number;
   btcPrice: number;
-  priceChange5m: number;
-  priceChange1h: number;
+  priceChange5m?: number;
+  priceChange1h?: number;
   fastLoopDirection: string;
   fastLoopStrength: string;
   fastLoopVW: number;
@@ -234,8 +234,14 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
     const s = sec % 60;
     return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
-  const fmtPrice = (p: number) => p > 0 ? `$${p.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—";
-  const fmtPct = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+  const fmtPrice = (p: number | null | undefined) =>
+    typeof p === "number" && p > 0
+      ? `$${p.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+      : "—";
+  const fmtPct = (n: number | null | undefined) => {
+    if (typeof n !== "number" || !isFinite(n)) return "—";
+    return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+  };
 
   return (
     <div className="min-h-screen bg-black text-white p-4 md:p-8">
@@ -337,8 +343,8 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
               </div>
               <div className="text-right">
                 <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">5m Change</div>
-                <div className={`text-sm font-mono font-bold flex items-center justify-end gap-1 ${w.priceChange5m >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {w.priceChange5m >= 0 ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
+                <div className={`text-sm font-mono font-bold flex items-center justify-end gap-1 ${(w.priceChange5m ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {(w.priceChange5m ?? 0) >= 0 ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
                   {fmtPct(w.priceChange5m)}
                 </div>
               </div>
@@ -617,7 +623,7 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
                 {/* 1h Change */}
                 <div className="flex items-center justify-between p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800/50">
                   <div className="flex items-center gap-2 text-xs text-zinc-500">1h Change</div>
-                  <span className={`text-xs font-mono font-bold ${w.priceChange1h >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  <span className={`text-xs font-mono font-bold ${(w.priceChange1h ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
                     {fmtPct(w.priceChange1h)}
                   </span>
                 </div>
