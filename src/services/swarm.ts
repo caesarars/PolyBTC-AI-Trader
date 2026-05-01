@@ -20,8 +20,16 @@ interface WindowResult {
 
 const predictionsMap = new Map<number, WindowPrediction[]>(); // windowStart -> predictions
 const resultsMap = new Map<number, WindowResult>(); // windowStart -> result
-const swarmEnabled = process.env.SWARM_ENABLED === "true";
+let swarmEnabled = process.env.SWARM_ENABLED === "true";
 const SWARM_CONCURRENCY = Number(process.env.SWARM_CONCURRENCY || 5);
+
+export function getSwarmEnabled(): boolean {
+  return swarmEnabled;
+}
+
+export function setSwarmEnabled(enabled: boolean): void {
+  swarmEnabled = enabled;
+}
 
 export interface SwarmEnsemble {
   windowStart: number;
@@ -37,9 +45,7 @@ export interface SwarmEnsemble {
   topBots: { id: number; name: string; confidence: number; direction: string }[];
 }
 
-export function isSwarmEnabled(): boolean {
-  return swarmEnabled;
-}
+
 
 export async function runSwarmPrediction(
   windowStart: number,

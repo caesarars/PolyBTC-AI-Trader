@@ -82,6 +82,18 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
     } catch {}
   };
 
+  const toggleSwarm = async () => {
+    const next = !status?.enabled;
+    try {
+      await fetch("/api/swarm/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+      setStatus((s) => (s ? { ...s, enabled: next } : null));
+    } catch {}
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center">
@@ -108,18 +120,31 @@ export default function SwarmDashboard({ onBack }: { onBack: () => void }) {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          <span className={`text-xs px-2 py-1 rounded-full font-bold ${status?.enabled ? "bg-green-500/20 text-green-400" : "bg-zinc-800 text-zinc-500"}`}>
-            {status?.enabled ? "● ACTIVE" : "○ INACTIVE"}
-          </span>
-          <button onClick={triggerSwarm} disabled={!status?.enabled} className="px-3 py-1.5 rounded-lg bg-amber-600 text-white text-xs font-bold hover:bg-amber-500 disabled:opacity-40">
+          {/* Toggle Button */}
+          <button
+            onClick={toggleSwarm}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all border ${
+              status?.enabled
+                ? "bg-green-500/15 border-green-500/30 text-green-400 hover:bg-green-500/25"
+                : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700 hover:text-white"
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-full ${status?.enabled ? "bg-green-400 animate-pulse" : "bg-zinc-600"}`} />
+            {status?.enabled ? "SWARM ON" : "SWARM OFF"}
+          </button>
+          <button onClick={triggerSwarm} disabled={!status?.enabled} className="px-3 py-2 rounded-lg bg-amber-600 text-white text-xs font-bold hover:bg-amber-500 disabled:opacity-40">
             Trigger Now
           </button>
         </div>
       </div>
 
       {!status?.enabled && (
-        <div className="mb-6 p-4 rounded-lg bg-amber-950/30 border border-amber-700/40 text-amber-300 text-sm">
-          Swarm is not enabled. Set <code className="bg-amber-900/50 px-1 rounded">SWARM_ENABLED=true</code> in your .env file and restart the server.
+        <div className="mb-6 p-4 rounded-lg bg-amber-950/30 border border-amber-700/40 text-amber-300 text-sm flex items-center gap-3">
+          <span className="text-xl">💡</span>
+          <div>
+            Swarm is currently <strong>disabled</strong>. Toggle the button above to activate the 100-bot prediction engine.
+            <div className="text-amber-500/70 text-xs mt-1">DeepSeek API key required. Each window triggers 100 predictions.</div>
+          </div>
         </div>
       )}
 

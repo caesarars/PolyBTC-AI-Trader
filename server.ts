@@ -11,7 +11,7 @@ import { ethers } from "ethers";
 import { MongoClient, Db, Collection } from "mongodb";
 import { getBotProfiles, updateBotAccuracy, generateBotProfiles, BotProfile } from "./src/services/bot-personality.ts";
 import { askDeepSeek, batchPredict, MarketContext } from "./src/services/deepseek.ts";
-import { runSwarmPrediction, resolveSwarmWindow, getPredictionsForWindow, getAllEnsembles, getLeaderboard, getBotDetail, getSwarmStats, isSwarmEnabled, clearSwarmMemory } from "./src/services/swarm.ts";
+import { runSwarmPrediction, resolveSwarmWindow, getPredictionsForWindow, getAllEnsembles, getLeaderboard, getBotDetail, getSwarmStats, getSwarmEnabled, setSwarmEnabled, clearSwarmMemory } from "./src/services/swarm.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -3218,7 +3218,7 @@ async function startServer() {
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"} | Heat: ${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
 
             // ── Swarm Prediction (100 AI bots) ───────────────────────────────
-            if (isSwarmEnabled() && currentWindowStart !== lastSwarmWindowStart) {
+            if (getSwarmEnabled() && currentWindowStart !== lastSwarmWindowStart) {
               lastSwarmWindowStart = currentWindowStart;
               setTimeout(async () => {
                 try {
@@ -3994,10 +3994,20 @@ async function startServer() {
   // ── Swarm API Endpoints ─────────────────────────────────────────────────────
   app.get("/api/swarm/status", (_req, res) => {
     res.json({
-      enabled: isSwarmEnabled(),
+      enabled: getSwarmEnabled(),
       botCount: 100,
       stats: getSwarmStats(),
     });
+  });
+
+  app.post("/api/swarm/toggle", (req, res) => {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled (boolean) is required." });
+    }
+    setSwarmEnabled(enabled);
+    botPrint("OK", `Swarm mode ${enabled ? "ENABLED" : "DISABLED"}`);
+    res.json({ ok: true, enabled: getSwarmEnabled() });
   });
 
   app.get("/api/swarm/bots", (_req, res) => {
@@ -4053,8 +4063,8 @@ async function startServer() {
   });
 
   app.post("/api/swarm/trigger", async (_req, res) => {
-    if (!isSwarmEnabled()) {
-      return res.status(400).json({ error: "Swarm is not enabled. Set SWARM_ENABLED=true in .env" });
+    if (!getSwarmEnabled()) {
+      return res.status(400).json({ error: "Swarm is not enabled. Toggle it via the dashboard." });
     }
     try {
       const now = Math.floor(Date.now() / 1000);
