@@ -541,7 +541,7 @@ function getActiveConfig() {
     fixedTradeUsdc:   aggressiveFixedTradeUsdc,
     balanceCap:       0.25,
     entryWindowStart: 10,
-    entryWindowEnd:   250,
+    entryWindowEnd:   280,
   };
 }
 
@@ -3274,15 +3274,15 @@ async function startServer() {
           }
 
           // ── Early window coin-flip guard ──────────────────────────────────
-          // Block trade in first 60s if there's no divergence and BTC is flat.
-          // At this point FastLoop hasn't built 5 fresh candles and any cached AI
-          // rec is from the previous window — no real edge exists.
-          if (windowElapsedSeconds < 60) {
+          // Block trade in first 30s if there's no divergence and BTC is flat.
+          // Relaxed from 60s: FastLoop + alignment fallback now provides direction
+          // even with fewer candles, so 30s is sufficient to avoid pure coin-flip.
+          if (windowElapsedSeconds < 30) {
             const btcFlat = !div || (div.strength === "NONE" && Math.abs(div.btcDelta30s) < 5);
             const noDivergence = !div || div.strength === "NONE";
             if (noDivergence && btcFlat) {
               botPrint("SKIP", `Early window coin-flip guard: elapsed=${windowElapsedSeconds}s, no divergence, BTC flat — waiting for signal | re-check enabled`);
-              analyzedThisWindow.delete(market.id); // allow re-check once past 60s or when signal appears
+              analyzedThisWindow.delete(market.id); // allow re-check once past 30s or when signal appears
               continue;
             }
           }
@@ -3525,21 +3525,26 @@ async function startServer() {
           // Rule: block when order book pressure opposes trade direction.
           //   UP   trade → block if YES book shows SELL_PRESSURE (crowd selling YES against us)
           //   DOWN trade → block if YES book shows BUY_PRESSURE (crowd buying YES against us)
-          //   UNKNOWN → block (no data = blind entry, hist WR ~17%)
+          //   UNKNOWN → allow if confidence ≥75% (high-confidence setups shouldn't be
+          //   blocked by missing order book data, which is common early in the window)
           if (qualifies) {
             const tokenIds: string[] = market.clobTokenIds || [];
             const yesSignal = orderBooks[tokenIds[0]]?.imbalanceSignal ?? "UNKNOWN";
             const pressureOpposesDirection =
-              (rec.direction === "UP" && (yesSignal === "SELL_PRESSURE" || yesSignal === "UNKNOWN")) ||
-              (rec.direction === "DOWN" && (yesSignal === "BUY_PRESSURE" || yesSignal === "UNKNOWN"));
+              (rec.direction === "UP" && yesSignal === "SELL_PRESSURE") ||
+              (rec.direction === "DOWN" && yesSignal === "BUY_PRESSURE");
+            const unknownBlocked = yesSignal === "UNKNOWN" && rec.confidence < 75;
 
-            if (pressureOpposesDirection) {
-              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (SELL_PRESSURE/UNKNOWN) | re-check next cycle`);
+            if (pressureOpposesDirection || unknownBlocked) {
+              const reason = pressureOpposesDirection
+                ? `${yesSignal} opposes ${rec.direction}`
+                : "UNKNOWN book (conf<75%)";
+              botPrint("SKIP", `Pressure filter: direction=${rec.direction} | YES book=${yesSignal} — blocked (${reason}) | re-check next cycle`);
               analyzedThisWindow.delete(market.id); // re-check each cycle in case pressure shifts
               pushSSE("cycle", { ts: new Date().toISOString() });
               continue;
             }
-            botPrint("INFO", `Pressure check: direction=${rec.direction} | YES book=${yesSignal} ✓`);
+            botPrint("INFO", `Pressure check: direction=${rec.direction} | YES book=${yesSignal} ✓${yesSignal === "UNKNOWN" ? " (conf≥75% bypass)" : ""}`);
           }
 
           const logEntry: BotLogEntry = {
