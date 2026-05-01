@@ -4308,16 +4308,61 @@ async function startServer() {
 
   // ── SSE endpoint — real-time bot events ────────────────────────────────────
   app.get("/api/bot/events", (req, res) => {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
+    // CORS — allow EventSource from any origin (echo Origin if present, else *)
+    const origin = req.headers.origin as string | undefined;
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+
+    // SSE headers
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // disable nginx response buffering
+
+    // Disable socket idle timeout so the stream stays open
+    if (res.socket) {
+      res.socket.setTimeout(0);
+      res.socket.setNoDelay(true);
+      res.socket.setKeepAlive(true);
+    }
+
     res.flushHeaders();
 
     // Send current log snapshot so the client is immediately up-to-date
+    res.write(`retry: 5000\n\n`);
     res.write(`event: snapshot\ndata: ${JSON.stringify({ log: rawLog.slice(0, 200) })}\n\n`);
 
     sseClients.add(res as unknown as ServerResponse);
-    req.on("close", () => sseClients.delete(res as unknown as ServerResponse));
+
+    // Heartbeat every 25s — prevents proxies/load balancers from killing idle SSE
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`: ping ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(heartbeat);
+        sseClients.delete(res as unknown as ServerResponse);
+      }
+    }, 25000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      sseClients.delete(res as unknown as ServerResponse);
+    };
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+    res.on("error", cleanup);
+  });
+
+  // Preflight for browsers that send OPTIONS before the SSE GET
+  app.options("/api/bot/events", (req, res) => {
+    const origin = req.headers.origin as string | undefined;
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Cache-Control");
+    res.setHeader("Vary", "Origin");
+    res.status(204).end();
   });
 
   app.get("/api/bot/learning", (_req, res) => {
