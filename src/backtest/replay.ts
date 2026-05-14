@@ -39,6 +39,33 @@ export interface BacktestOptions {
   /** Microstructure gate proxies. ATR check uses real candles; spread/liquidity
    *  are skipped here because we have no historical book — assume passable. */
   maxNormalizedAtr: number;
+  /** Optional calibrated P(WIN) predictor — when provided, Brier/log-loss are
+   *  computed against it and `useCalibratorGate` can enforce an EV threshold. */
+  calibratorPredict?: (features: CalibratorInput) => number | null;
+  /** When true and a predictor is provided, trades are gated on calibrated EV
+   *  in addition to the heuristic confidence/edge gate. */
+  useCalibratorGate?: boolean;
+  /** Calibrated EV threshold (pWin − entryPrice). Only used when gating. */
+  minCalibratedEdge?: number;
+  /** Calibrated probability floor. Only used when gating. */
+  minCalibratedPWin?: number;
+}
+
+/** Minimal feature payload passed to the calibrator. Mirrors `TradeFeatures`
+ *  from the runtime, but inlined here so this module stays self-contained. */
+export interface CalibratorInput {
+  direction: "UP" | "DOWN";
+  confidence: number;
+  rsi?: number;
+  emaCross?: "BULLISH" | "BEARISH";
+  signalScore?: number;
+  imbalanceSignal?: string;
+  divergenceDirection?: string;
+  divergenceStrength?: string;
+  btcDelta30s?: number;
+  yesDelta30s?: number;
+  windowElapsedSeconds: number;
+  entryPrice: number;
 }
 
 export interface BacktestTrade {
@@ -54,6 +81,7 @@ export interface BacktestTrade {
   btcClose: number;
   btcMovePct: number;
   reason: string;
+  calibratedPWin?: number;    // populated when a calibrator predictor was supplied
 }
 
 export interface CalibrationBucket {
@@ -69,14 +97,19 @@ export interface BacktestResult {
   signaled: number;           // SYNTH produced TRADE in any direction
   qualified: number;          // signaled AND passed confidence/edge gates
   filteredByAtr: number;
+  filteredByCalibrator: number;
   trades: BacktestTrade[];
   wins: number;
   losses: number;
   winRate: number;            // %
   grossPnl: number;
   netPnl: number;
-  brier: number | null;        // retained for legacy clients; not computed without calibration
-  logLoss: number | null;      // retained for legacy clients; not computed without calibration
+  /** Brier on calibrated probabilities. Null if no calibrator was supplied. */
+  brier: number | null;
+  /** Log-loss on calibrated probabilities. Null if no calibrator was supplied. */
+  logLoss: number | null;
+  /** Number of trades that contributed to Brier/log-loss. */
+  scoredN: number;
   calibration: CalibrationBucket[];
   // Honest comparison baselines
   baselineAlwaysYesNetPnl: number;
@@ -257,6 +290,7 @@ function synthDecision(candles: Candle[]):
 export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestResult {
   const trades: BacktestTrade[] = [];
   let signaled = 0, qualified = 0, filteredByAtr = 0;
+  let filteredByCalibrator = 0;
   const calBuckets: Record<string, { sum: number; wins: number; n: number }> = {
     "55-65": { sum: 0, wins: 0, n: 0 },
     "65-75": { sum: 0, wins: 0, n: 0 },
@@ -265,6 +299,11 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
   };
   let baselineWins = 0, baselineTotal = 0;
   const baselineEntry = 0.50 + opts.slippage;
+
+  // Brier / log-loss accumulators — only meaningful when a calibrator is supplied.
+  let brierSum = 0;
+  let logLossSum = 0;
+  let scoredN = 0;
 
   // Need at least 25 prior candles for indicators + 5 future candles for outcome.
   // Step backward in 5-candle increments to align with 5-min windows.
@@ -312,6 +351,35 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     const entryPrice = 0.50 + opts.slippage;
     const edge = maxEntryPriceFor(dec.confidence) - entryPrice;
     if (dec.confidence < opts.minConfidence || edge < opts.minEdge) continue;
+
+    // Optional calibrated EV gate. When a predictor is supplied we always
+    // score Brier/log-loss against it; when `useCalibratorGate` is set we
+    // additionally reject trades that fail the calibrated EV threshold.
+    let calibratedPWin: number | null = null;
+    if (opts.calibratorPredict) {
+      calibratedPWin = opts.calibratorPredict({
+        direction: dec.direction,
+        confidence: dec.confidence,
+        rsi: ind?.rsi,
+        emaCross: ind?.emaCross,
+        signalScore: ind?.signalScore,
+        imbalanceSignal: "NEUTRAL",
+        divergenceDirection: "NEUTRAL",
+        divergenceStrength: "NONE",
+        btcDelta30s: 0,
+        yesDelta30s: 0,
+        windowElapsedSeconds: 60, // mid-window proxy; matches synthetic trainer
+        entryPrice,
+      });
+      if (opts.useCalibratorGate && calibratedPWin !== null) {
+        const minP = opts.minCalibratedPWin ?? 0.55;
+        const minE = opts.minCalibratedEdge ?? 0.05;
+        if (calibratedPWin < minP || (calibratedPWin - entryPrice) < minE) {
+          filteredByCalibrator++;
+          continue;
+        }
+      }
+    }
     qualified++;
 
     const shares = opts.betUsdc / entryPrice;
@@ -328,6 +396,14 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     calBuckets[bucket].n += 1;
     if (correct) calBuckets[bucket].wins += 1;
 
+    if (calibratedPWin !== null) {
+      const y = correct ? 1 : 0;
+      brierSum += (calibratedPWin - y) ** 2;
+      const pClip = Math.min(0.9999, Math.max(0.0001, calibratedPWin));
+      logLossSum += -(y * Math.log(pClip) + (1 - y) * Math.log(1 - pClip));
+      scoredN++;
+    }
+
     trades.push({
       windowStart: candles[entryIdx].time,
       direction: dec.direction,
@@ -341,6 +417,7 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
       btcClose: exitClose,
       btcMovePct: ((exitClose - entryClose) / entryClose) * 100,
       reason: dec.reason,
+      calibratedPWin: calibratedPWin ?? undefined,
     });
   }
 
@@ -370,14 +447,16 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     signaled,
     qualified,
     filteredByAtr,
+    filteredByCalibrator,
     trades,
     wins,
     losses,
     winRate: trades.length > 0 ? parseFloat(((wins / trades.length) * 100).toFixed(1)) : 0,
     grossPnl: parseFloat(grossPnl.toFixed(2)),
     netPnl: parseFloat(netPnl.toFixed(2)),
-    brier: null,
-    logLoss: null,
+    brier: scoredN > 0 ? parseFloat((brierSum / scoredN).toFixed(4)) : null,
+    logLoss: scoredN > 0 ? parseFloat((logLossSum / scoredN).toFixed(4)) : null,
+    scoredN,
     calibration,
     baselineAlwaysYesNetPnl: parseFloat(baselineNetPnl.toFixed(2)),
     baselineAlwaysYesWinRate: parseFloat(baselineWinRate.toFixed(1)),

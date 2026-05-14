@@ -10,6 +10,17 @@ import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client"
 import { ethers } from "ethers";
 import { MongoClient, Db } from "mongodb";
 import { runBacktest, type BacktestOptions, type Candle as BacktestCandle } from "./src/backtest/replay.js";
+import {
+  loadCalibrator,
+  saveCalibrator,
+  clearCalibrator,
+  retrain as retrainCalibrator,
+  getCalibratorState,
+  isCalibratorReady,
+  predictPWin,
+} from "./src/calibration/runtime.js";
+import { buildSyntheticTrainingSet } from "./src/calibration/synthetic.js";
+import type { LabeledTrade, TradeFeatures } from "./src/calibration/calibrator.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -544,6 +555,14 @@ const GATE_MAX_NORMALIZED_ATR  = Number(process.env.GATE_MAX_NORMALIZED_ATR  ?? 
 // Heartbeat watchdog
 const HEARTBEAT_FAIL_WARN_AT   = Number(process.env.HEARTBEAT_FAIL_WARN_AT   ?? 2);
 const HEARTBEAT_FAIL_HALT_AT   = Number(process.env.HEARTBEAT_FAIL_HALT_AT   ?? 3);
+// Calibrator: authoritative EV gate when the model is loaded.
+//   pWin  = calibrated P(WIN) given heuristic features (NOT confidence/100)
+//   gate  = pWin − entryPrice ≥ BOT_CALIBRATED_MIN_EDGE
+// When the model is NOT loaded, the heuristic confidence/edge gate still
+// runs as a fallback — but it is *not* an EV statement, only a sanity gate.
+const BOT_CALIBRATED_MIN_EDGE  = Number(process.env.BOT_CALIBRATED_MIN_EDGE  ?? 0.05);
+const BOT_CALIBRATED_MIN_PWIN  = Number(process.env.BOT_CALIBRATED_MIN_PWIN  ?? 0.55);
+const BOT_REQUIRE_CALIBRATOR   = process.env.BOT_REQUIRE_CALIBRATOR === "true";
 
 // Runtime-overrideable thresholds (UI-adjustable via /api/bot/config)
 let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
@@ -572,20 +591,72 @@ function getFixedEntryBetAmount(balance: number): number {
 }
 
 // ── Confidence is NOT a probability — flat sizing only ───────────────────────
-// `confidence` is a heuristic point score: 60 base + alignScore×5 + boosts,
-// clamped to [55, 90]. It is uncalibrated. Live data shows the 85-95% bucket
-// won 33% of trades, so it is anti-correlated with truth at the tail.
+// `confidence` is a heuristic point score (60 base + alignScore×5 + boosts,
+// clamped to [55, 90]). It is uncalibrated — live data showed the 85–95%
+// bucket winning ~33%. It is NEVER used as a probability, including for sizing.
 //
-// Until Phase 2 ships a calibrated logistic-regression probability:
-//   • Sizing is FLAT (getFixedEntryBetAmount), never scaled by confidence.
-//   • Confidence is used ONLY as a quality gate (≥ effectiveMinConf).
-//   • The "edge" / "markup" gate is reframed as an explicit price-cap
-//     (maxEntryPriceFor): "at this heuristic conviction, do not pay more
-//     than X¢ per share". Same numeric cap as before, no probability claim.
+// Sizing is FLAT via getFixedEntryBetAmount, regardless of confidence or pWin.
+//
+// Two gates run in series:
+//   1. Heuristic price-cap (this function) — a policy cap derived from confidence.
+//      It is a "do not pay more than X¢" rule, not a probability claim.
+//   2. Calibrated EV gate (logistic regression in src/calibration) — predicts
+//      P(WIN) from indicators and rejects trades when pWin < min or pWin − ask
+//      < min edge. This is the authoritative EV gate; it runs after the cap.
 function maxEntryPriceFor(confidence: number, isDivergenceStrong: boolean): number {
   if (isDivergenceStrong) return 0.80;
   // 75% conf → max 60¢, 80% → 65¢, 85% → 70¢, 90% → 75¢ (capped).
+  // These are policy choices, not implied probabilities.
   return Math.min(0.75, Math.max(0.40, (confidence - 15) / 100));
+}
+
+// ── Calibrator auto-retrain (rate-limited) ──────────────────────────────────
+// After each resolved trade we want to refresh the calibrator so it sees the
+// new outcome. Training is O(samples × iterations) and only meaningful when
+// we have ≥ minTrades samples, so we debounce.
+const CALIBRATOR_AUTO_RETRAIN_MS = Number(process.env.CALIBRATOR_AUTO_RETRAIN_MS ?? 5 * 60 * 1000);
+let lastCalibratorRetrainAt = 0;
+let calibratorRetrainInFlight = false;
+async function maybeRetrainCalibratorFromTradeLog(): Promise<void> {
+  const now = Date.now();
+  if (calibratorRetrainInFlight) return;
+  if (now - lastCalibratorRetrainAt < CALIBRATOR_AUTO_RETRAIN_MS) return;
+  calibratorRetrainInFlight = true;
+  try {
+    const trades = await loadPersistedTradeLog();
+    const labeled: LabeledTrade[] = [];
+    for (const t of trades) {
+      if (t.isPaperTrade) continue;
+      if (t.result !== "WIN" && t.result !== "LOSS") continue;
+      labeled.push({
+        direction: t.direction as "UP" | "DOWN",
+        confidence: t.confidence,
+        rsi: t.rsi,
+        emaCross: t.emaCross,
+        signalScore: t.signalScore,
+        imbalanceSignal: t.imbalanceSignal,
+        divergenceDirection: t.divergenceDirection,
+        divergenceStrength: t.divergenceStrength,
+        btcDelta30s: t.btcDelta30s,
+        yesDelta30s: t.yesDelta30s,
+        windowElapsedSeconds: t.windowElapsedSeconds,
+        entryPrice: t.entryPrice,
+        result: t.result,
+      });
+    }
+    if (labeled.length < 20) return;
+    const state = retrainCalibrator(labeled, {
+      minTrades: Math.min(100, Math.floor(labeled.length * 0.5)),
+    });
+    lastCalibratorRetrainAt = now;
+    if (state.ready) {
+      console.log(`[Calibrate] Auto-retrained on ${state.nSamples} live trades. ${state.reason}`);
+    }
+  } catch (e: any) {
+    console.warn(`[Calibrate] Auto-retrain failed: ${e?.message ?? e}`);
+  } finally {
+    calibratorRetrainInFlight = false;
+  }
 }
 
 // ── Bot runtime state ────────────────────────────────────────────────────────
@@ -2161,6 +2232,17 @@ async function startServer() {
   void loadBotLogFromDb();
   startBtcBackgroundSync();
   startDivergenceTracker();
+  // Phase 0 Fix 1 — load calibrator (if a trained model exists on disk).
+  {
+    const loaded = loadCalibrator();
+    if (loaded?.ready) {
+      const m = loaded.model!;
+      const cv = Number.isFinite(m.cvBrier) ? m.cvBrier.toFixed(4) : "n/a";
+      console.log(`[Calibrate] Model loaded: n=${loaded.nSamples} | CV Brier=${cv} | trained ${new Date(m.trainedAt).toISOString()}`);
+    } else {
+      console.warn(`[Calibrate] No trained model on disk. Trades will fall back to heuristic gate. Train via POST /api/calibrator/train.`);
+    }
+  }
 
   const formatTradeError = (error: any, context?: Record<string, unknown>) => {
     const rawMessage =
@@ -3135,6 +3217,10 @@ async function startServer() {
       if (botLog.length > 100) botLog.pop();
 
       pendingResults.delete(tokenId);
+
+      // Refresh the calibrator with the new outcome (debounced internally).
+      // Live trades only; paper outcomes are excluded inside the helper.
+      if (!pending.isPaperTrade) void maybeRetrainCalibratorFromTradeLog();
     }
   };
 
@@ -3817,14 +3903,65 @@ async function startServer() {
                   }
                 }
 
+                // ── Phase 0 Fix 1: authoritative EV gate via calibrated P(WIN) ───
+                // `confidence` is a heuristic point score, NOT a probability. The
+                // calibrator (logistic regression on outcome ~ indicators) turns
+                // it into a real P(WIN) which is then compared against bestAsk
+                // to produce an actual EV. If the model isn't loaded yet, we fall
+                // back to the heuristic gate UNLESS BOT_REQUIRE_CALIBRATOR=true.
+                const yesImbalanceForCalibrator = orderBooks[market.clobTokenIds?.[0]]?.imbalanceSignal ?? "NEUTRAL";
+                const tradeFeatures: TradeFeatures = {
+                  direction: rec.direction as "UP" | "DOWN",
+                  confidence: rec.confidence,
+                  rsi: btcIndicatorsData?.rsi,
+                  emaCross: btcIndicatorsData?.emaCross,
+                  signalScore: btcIndicatorsData?.signalScore,
+                  imbalanceSignal: yesImbalanceForCalibrator,
+                  divergenceDirection: div?.direction,
+                  divergenceStrength: div?.strength,
+                  btcDelta30s: div?.btcDelta30s,
+                  yesDelta30s: div?.yesDelta30s,
+                  windowElapsedSeconds,
+                  entryPrice: bestAsk,
+                };
+                let calibratedPWin: number | null = null;
+                if (isCalibratorReady()) {
+                  calibratedPWin = predictPWin(tradeFeatures);
+                }
+
+                if (calibratedPWin === null) {
+                  if (BOT_REQUIRE_CALIBRATOR) {
+                    botPrint("SKIP", `Calibrator not ready and BOT_REQUIRE_CALIBRATOR=true — refusing to trade on heuristic confidence | re-check enabled`);
+                    analyzedThisWindow.delete(market.id);
+                    pushSSE("cycle", { ts: new Date().toISOString() });
+                    continue;
+                  }
+                  botPrint("WARN", `Calibrator not loaded — falling back to heuristic gate (no EV measurement). Train via POST /api/calibrator/train.`);
+                } else {
+                  const calibratedEdge = calibratedPWin - bestAsk;
+                  botPrint("INFO", `Calibrated: pWin=${(calibratedPWin * 100).toFixed(1)}% | entry=${(bestAsk * 100).toFixed(1)}¢ | EV=${(calibratedEdge * 100).toFixed(1)}¢/share`);
+                  if (calibratedPWin < BOT_CALIBRATED_MIN_PWIN) {
+                    botPrint("SKIP", `Calibrator gate: pWin ${(calibratedPWin * 100).toFixed(1)}% < ${(BOT_CALIBRATED_MIN_PWIN * 100).toFixed(0)}% min — model says coin-flip or worse | re-check enabled`);
+                    analyzedThisWindow.delete(market.id);
+                    pushSSE("cycle", { ts: new Date().toISOString() });
+                    continue;
+                  }
+                  if (calibratedEdge < BOT_CALIBRATED_MIN_EDGE) {
+                    botPrint("SKIP", `Calibrator gate: EV ${(calibratedEdge * 100).toFixed(1)}¢ < ${(BOT_CALIBRATED_MIN_EDGE * 100).toFixed(1)}¢/share min — price too rich for calibrated probability | re-check enabled`);
+                    analyzedThisWindow.delete(market.id);
+                    pushSSE("cycle", { ts: new Date().toISOString() });
+                    continue;
+                  }
+                }
+
                 // Minimum bet scales with balance: floor at $0.50 or 20% of balance, whichever smaller
                 const MIN_BET = Math.min(0.50, currentBalance * 0.20);
 
                 // Entry sizing is fixed at the runtime-configured fixedTradeUsdc for every buy order.
-                // `confidence` is a heuristic score, not a calibrated probability — sizing stays flat.
+                // `confidence` is a heuristic score; calibrated pWin (above) is the EV gate. Sizing stays flat.
                 const betAmount = getFixedEntryBetAmount(currentBalance);
 
-                botPrint("INFO", `Flat sizing: conf=${rec.confidence}% (heuristic) | implied=${(impliedPrice * 100).toFixed(0)}¢ | target=$${getActiveConfig().fixedTradeUsdc.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
+                botPrint("INFO", `Flat sizing: conf=${rec.confidence}% (heuristic)${calibratedPWin !== null ? ` | pWin=${(calibratedPWin * 100).toFixed(1)}% (calibrated)` : ""} | implied=${(impliedPrice * 100).toFixed(0)}¢ | target=$${getActiveConfig().fixedTradeUsdc.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < MIN_BET) {
@@ -4130,6 +4267,142 @@ async function startServer() {
     res.json({ ok: true, cleared: wasHalted, previousReason: prevReason });
   });
 
+  // ── Calibrator endpoints (Phase 0 Fix 1) ────────────────────────────────
+  // Trains a logistic regression on outcome ~ heuristic features. Produces a
+  // *real* P(WIN) used as the authoritative EV gate at trade time. This
+  // replaces the dangerous practice of treating heuristic confidence/100 as
+  // a probability.
+  app.get("/api/calibrator/status", (_req, res) => {
+    const state = getCalibratorState();
+    res.json({
+      ready: state.ready,
+      reason: state.reason,
+      nSamples: state.nSamples,
+      minTrades: state.minTrades,
+      buckets: state.buckets,
+      model: state.model
+        ? {
+            trainedAt: state.model.trainedAt,
+            trainBrier: state.model.trainBrier,
+            trainLogLoss: state.model.trainLogLoss,
+            cvBrier: Number.isFinite(state.model.cvBrier) ? state.model.cvBrier : null,
+            cvLogLoss: Number.isFinite(state.model.cvLogLoss) ? state.model.cvLogLoss : null,
+            features: state.model.features,
+            hyper: state.model.hyper,
+          }
+        : null,
+      thresholds: {
+        minPWin: BOT_CALIBRATED_MIN_PWIN,
+        minEdge: BOT_CALIBRATED_MIN_EDGE,
+        requireCalibrator: BOT_REQUIRE_CALIBRATOR,
+      },
+    });
+  });
+
+  app.post("/api/calibrator/train", async (req, res) => {
+    const body = (req.body || {}) as {
+      source?: "live" | "synthetic" | "both";
+      minTrades?: number;
+      iterations?: number;
+      learningRate?: number;
+      l2?: number;
+      cvFolds?: number;
+      syntheticStride?: number;
+    };
+    const source = body.source ?? "both";
+
+    try {
+      const labeled: LabeledTrade[] = [];
+
+      // ── Live trades from persisted log ────────────────────────────────────
+      if (source === "live" || source === "both") {
+        const live = await loadPersistedTradeLog();
+        for (const t of live) {
+          if (t.isPaperTrade) continue;            // paper outcomes aren't real
+          if (t.result !== "WIN" && t.result !== "LOSS") continue;
+          labeled.push({
+            direction: t.direction as "UP" | "DOWN",
+            confidence: t.confidence,
+            rsi: t.rsi,
+            emaCross: t.emaCross,
+            signalScore: t.signalScore,
+            imbalanceSignal: t.imbalanceSignal,
+            divergenceDirection: t.divergenceDirection,
+            divergenceStrength: t.divergenceStrength,
+            btcDelta30s: t.btcDelta30s,
+            yesDelta30s: t.yesDelta30s,
+            windowElapsedSeconds: t.windowElapsedSeconds,
+            entryPrice: t.entryPrice,
+            result: t.result,
+          });
+        }
+      }
+
+      // ── Synthetic from historical Binance candles (bootstrap) ────────────
+      if (source === "synthetic" || source === "both") {
+        const history = await getBtcHistory(true);
+        const candles = (history?.history ?? []).map((c) => ({
+          time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+        }));
+        if (candles.length >= 100) {
+          const synth = buildSyntheticTrainingSet(candles, {
+            horizon: 5,
+            stride: Math.max(1, body.syntheticStride ?? 1),
+          });
+          labeled.push(...synth);
+        }
+      }
+
+      if (labeled.length === 0) {
+        return res.status(503).json({ error: "No training data available (live log empty and Binance history unavailable)." });
+      }
+
+      const state = retrainCalibrator(labeled, {
+        minTrades: body.minTrades ?? Math.min(100, Math.floor(labeled.length * 0.5)),
+        iterations: body.iterations,
+        learningRate: body.learningRate,
+        l2: body.l2,
+        cvFolds: body.cvFolds,
+      });
+
+      if (state.ready) {
+        botPrint("OK", `[Calibrate] Retrained on ${state.nSamples} samples (source=${source}). ${state.reason}`);
+      } else {
+        botPrint("WARN", `[Calibrate] Train completed but model not ready: ${state.reason}`);
+      }
+
+      res.json({
+        ok: state.ready,
+        source,
+        labeledSamples: labeled.length,
+        state: {
+          ready: state.ready,
+          reason: state.reason,
+          nSamples: state.nSamples,
+          buckets: state.buckets,
+          model: state.model
+            ? {
+                trainedAt: state.model.trainedAt,
+                trainBrier: state.model.trainBrier,
+                trainLogLoss: state.model.trainLogLoss,
+                cvBrier: Number.isFinite(state.model.cvBrier) ? state.model.cvBrier : null,
+                cvLogLoss: Number.isFinite(state.model.cvLogLoss) ? state.model.cvLogLoss : null,
+              }
+            : null,
+        },
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "Calibrator training failed" });
+    }
+  });
+
+  app.post("/api/calibrator/clear", (_req, res) => {
+    clearCalibrator();
+    saveCalibrator(); // writes the cleared state too (no-op if no model)
+    botPrint("OK", `[Calibrate] Model cleared. Trades will fall back to heuristic gate.`);
+    res.json({ ok: true });
+  });
+
   app.get("/api/bot/log", (req, res) => {
     const executedOnly =
       String(req.query.executedOnly || "").toLowerCase() === "1" ||
@@ -4292,7 +4565,11 @@ async function startServer() {
   // baseline "always buy YES" benchmark. Replaces the old direction-accuracy toy.
   app.post("/api/backtest/replay", async (req, res) => {
     try {
-      const body = (req.body || {}) as Partial<BacktestOptions>;
+      const body = (req.body || {}) as Partial<BacktestOptions> & {
+        useCalibratorGate?: boolean;
+        minCalibratedPWin?: number;
+        minCalibratedEdge?: number;
+      };
       const opts: BacktestOptions = {
         windows:          Number(body.windows          ?? 200),
         minConfidence:    Number(body.minConfidence    ?? aggressiveMinConfidence),
@@ -4301,6 +4578,12 @@ async function startServer() {
         slippage:         Number(body.slippage         ?? 0.02),
         feeUsdc:          Number(body.feeUsdc          ?? 0),
         maxNormalizedAtr: Number(body.maxNormalizedAtr ?? GATE_MAX_NORMALIZED_ATR),
+        calibratorPredict: isCalibratorReady()
+          ? (features) => predictPWin(features as TradeFeatures)
+          : undefined,
+        useCalibratorGate: body.useCalibratorGate ?? false,
+        minCalibratedPWin: body.minCalibratedPWin ?? BOT_CALIBRATED_MIN_PWIN,
+        minCalibratedEdge: body.minCalibratedEdge ?? BOT_CALIBRATED_MIN_EDGE,
       };
       const historyResult = await getBtcHistory(true);
       const history = historyResult?.history ?? [];
