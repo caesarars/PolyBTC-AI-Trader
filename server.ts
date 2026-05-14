@@ -28,6 +28,7 @@ import {
   readOrderBookLogStats,
 } from "./src/measurement/orderbookLogger.js";
 import { buildPhase1Report, type TradeRecord } from "./src/measurement/phase1.js";
+import { evaluatePolicy, getPolicyStatus } from "./src/measurement/signalPolicy.js";
 import {
   runBookReplay,
   type BookReplayOptions,
@@ -569,14 +570,16 @@ const GATE_MAX_NORMALIZED_ATR  = Number(process.env.GATE_MAX_NORMALIZED_ATR  ?? 
 // Heartbeat watchdog
 const HEARTBEAT_FAIL_WARN_AT   = Number(process.env.HEARTBEAT_FAIL_WARN_AT   ?? 2);
 const HEARTBEAT_FAIL_HALT_AT   = Number(process.env.HEARTBEAT_FAIL_HALT_AT   ?? 3);
-// Calibrator: authoritative EV gate when the model is loaded.
-//   pWin  = calibrated P(WIN) given heuristic features (NOT confidence/100)
-//   gate  = pWin − entryPrice ≥ BOT_CALIBRATED_MIN_EDGE
-// When the model is NOT loaded, the heuristic confidence/edge gate still
-// runs as a fallback — but it is *not* an EV statement, only a sanity gate.
+// Calibrator: authoritative EV gate. The trained logistic regression in
+// src/calibration turns indicator features into a real P(WIN); this is the
+// ONLY binding probability gate. Heuristic confidence is advisory only
+// (BOT_CONFIDENCE_HARD_GATE=true restores the old behavior for ops who want it).
+// If no model is loaded, the bot refuses to trade unless BOT_REQUIRE_CALIBRATOR
+// is explicitly set to "false" (see startup auto-bootstrap below).
 const BOT_CALIBRATED_MIN_EDGE  = Number(process.env.BOT_CALIBRATED_MIN_EDGE  ?? 0.05);
 const BOT_CALIBRATED_MIN_PWIN  = Number(process.env.BOT_CALIBRATED_MIN_PWIN  ?? 0.55);
-const BOT_REQUIRE_CALIBRATOR   = process.env.BOT_REQUIRE_CALIBRATOR === "true";
+const BOT_REQUIRE_CALIBRATOR   = process.env.BOT_REQUIRE_CALIBRATOR !== "false";
+const BOT_CONFIDENCE_HARD_GATE = process.env.BOT_CONFIDENCE_HARD_GATE === "true";
 
 // Runtime-overrideable thresholds (UI-adjustable via /api/bot/config)
 let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
@@ -2246,15 +2249,49 @@ async function startServer() {
   void loadBotLogFromDb();
   startBtcBackgroundSync();
   startDivergenceTracker();
-  // Phase 0 Fix 1 — load calibrator (if a trained model exists on disk).
+  // Calibrator startup: load if present; else auto-bootstrap from synthetic
+  // training data so BOT_REQUIRE_CALIBRATOR=true (now the default) does not
+  // permanently halt trading on a fresh install. Synthetic = SYNTH replay on
+  // historical Binance candles; consider it a prior, not a final model.
+  // Override the auto-bootstrap with CALIBRATOR_AUTO_BOOTSTRAP=false.
   {
     const loaded = loadCalibrator();
     if (loaded?.ready) {
       const m = loaded.model!;
       const cv = Number.isFinite(m.cvBrier) ? m.cvBrier.toFixed(4) : "n/a";
       console.log(`[Calibrate] Model loaded: n=${loaded.nSamples} | CV Brier=${cv} | trained ${new Date(m.trainedAt).toISOString()}`);
+    } else if (process.env.CALIBRATOR_AUTO_BOOTSTRAP !== "false") {
+      console.log(`[Calibrate] No trained model on disk — auto-bootstrapping from synthetic training set…`);
+      void (async () => {
+        try {
+          const history = await getBtcHistory(true);
+          const candles = (history?.history ?? []).map((c: BtcCandle) => ({
+            time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+          }));
+          if (candles.length < 100) {
+            console.warn(`[Calibrate] Bootstrap skipped — only ${candles.length} candles available (need ≥ 100). Train manually via POST /api/calibrator/train once history accumulates.`);
+            return;
+          }
+          const synth = buildSyntheticTrainingSet(candles, { horizon: 5, stride: 1 });
+          if (synth.length < 50) {
+            console.warn(`[Calibrate] Bootstrap produced only ${synth.length} samples — skipping (need ≥ 50).`);
+            return;
+          }
+          const state = retrainCalibrator(synth, {
+            minTrades: Math.min(100, Math.floor(synth.length * 0.5)),
+          });
+          if (state.ready && state.model) {
+            const cv = Number.isFinite(state.model.cvBrier) ? state.model.cvBrier.toFixed(4) : "n/a";
+            console.log(`[Calibrate] Bootstrap trained on ${state.nSamples} synthetic samples | CV Brier=${cv}. Replace via POST /api/calibrator/train once you have live trades.`);
+          } else {
+            console.warn(`[Calibrate] Bootstrap completed but model not ready: ${state.reason}`);
+          }
+        } catch (e: any) {
+          console.error(`[Calibrate] Bootstrap failed: ${e?.message ?? e}`);
+        }
+      })();
     } else {
-      console.warn(`[Calibrate] No trained model on disk. Trades will fall back to heuristic gate. Train via POST /api/calibrator/train.`);
+      console.warn(`[Calibrate] No trained model on disk and auto-bootstrap disabled. ${BOT_REQUIRE_CALIBRATOR ? "Trades will be REFUSED" : "Trades will fall back to heuristic gate"} until POST /api/calibrator/train succeeds.`);
     }
   }
 
@@ -3745,19 +3782,46 @@ async function startServer() {
             void oppIdx; void entryAsk; // suppress unused warnings
           }
 
+          // ── Pre-calibrator filters ────────────────────────────────────────
+          // Phase 1 measurement showed heuristic confidence is anti-informative
+          // (Brier 0.349 > 0.25 coin-flip; 87%-bucket realized 33%). The
+          // calibrator (run later) is the binding probability gate. The checks
+          // below are sanity gates only:
+          //   • risk=HIGH: reject (the synth path's own data-quality flag).
+          //   • headroom: optional, still useful as a "don't pay >75¢ for a coin".
+          //   • confidence: ADVISORY only — does not reject by default.
+          //     BOT_CONFIDENCE_HARD_GATE=true restores the legacy hard gate.
+          //   • signal policy (KILL rules from Phase 1): blocks BEARISH EMA
+          //     cross and SELL_PRESSURE imbalance (override via POLICY_BLOCK_*).
+          const policyDecision = evaluatePolicy({
+            direction: rec.direction as "UP" | "DOWN",
+            emaCross: btcIndicatorsData?.emaCross,
+            imbalanceSignal: orderBooks[market.clobTokenIds?.[0]]?.imbalanceSignal,
+            rsi: btcIndicatorsData?.rsi,
+            divergenceStrength: div?.strength,
+          });
+          const confidenceShortfall = rec.confidence < effectiveMinConf;
           const qualifies =
             rec.decision === "TRADE" &&
-            rec.confidence >= effectiveMinConf &&
             rec.estimatedEdge >= cfg.minEdge &&
-            rec.riskLevel !== "HIGH";
+            rec.riskLevel !== "HIGH" &&
+            !policyDecision.block &&
+            (!BOT_CONFIDENCE_HARD_GATE || !confidenceShortfall);
 
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
-            if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
+            if (policyDecision.block) reasons.push(...policyDecision.reasons);
+            if (BOT_CONFIDENCE_HARD_GATE && confidenceShortfall) {
+              reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive, hard gate)`);
+            }
             if (rec.estimatedEdge < cfg.minEdge) reasons.push(`headroom ${(rec.estimatedEdge * 100).toFixed(1)}¢ < ${(cfg.minEdge * 100).toFixed(1)}¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
-            botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")} | re-check enabled`);
+            botPrint("SKIP", `Trade rejected by pre-calibrator filters: ${reasons.join(" | ")} | re-check enabled`);
             analyzedThisWindow.delete(market.id); // re-check if divergence or cached conditions improve later this window
+          } else if (rec.decision === "TRADE" && confidenceShortfall) {
+            // Confidence is below the adaptive floor but the calibrator is now
+            // the gate — log the advisory so it's visible without blocking.
+            botPrint("INFO", `Advisory: conf ${rec.confidence}% < ${effectiveMinConf}% adaptive floor (heuristic only — calibrator decides)`);
           }
 
           // ── Order book pressure alignment filter ──────────────────────────────
@@ -4563,6 +4627,9 @@ async function startServer() {
       adaptiveLossPenaltyEnabled,
       effectiveMinConfidence: BOT_MIN_CONFIDENCE + maxBoost,
       baseMinConfidence: BOT_MIN_CONFIDENCE,
+      confidenceIsHardGate: BOT_CONFIDENCE_HARD_GATE,
+      requireCalibrator: BOT_REQUIRE_CALIBRATOR,
+      signalPolicy: getPolicyStatus(),
       lossMemoryCount: lossMemory.length,
       winMemoryCount: winMemory.length,
       recentLosses: lossMemory.slice(0, 10),
