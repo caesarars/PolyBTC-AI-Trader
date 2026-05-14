@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { RefreshCw, Activity, DollarSign, Clock, Smile } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import BotDashboard from "./BotDashboard";
 import PaperTradeWidget from "./PaperTradeWidget";
 import BotLogSidebar from "./BotLogSidebar";
@@ -69,85 +69,81 @@ export default function TradingBotPage() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
+  const sentimentColor = sentiment
+    ? sentiment.value > 60
+      ? "text-emerald-400"
+      : sentiment.value < 40
+      ? "text-red-400"
+      : "text-amber-400"
+    : "text-zinc-500";
+
   return (
-    <div className="p-4 md:p-8 max-w-6xl mx-auto">
-      {/* ── Header ── */}
-      <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-6">
-        <div>
-          <h1 className="text-4xl font-bold tracking-tight mb-2 flex items-center gap-3">
-            <Activity className="text-blue-500 w-10 h-10" />
-            Trading Bot
-          </h1>
-          <p className="text-zinc-400 max-w-md italic">
-            BTC 5-minute prediction market trading engine
-          </p>
-        </div>
+    <div className="px-4 md:px-8 py-6 max-w-6xl mx-auto">
+      {/* ── Minimal status strip ── */}
+      <div className="flex items-center flex-wrap gap-x-8 gap-y-3 mb-8 text-sm">
+        <Stat label="Window" mono>
+          <span className={cn("font-medium", countdownColor)}>
+            {String(Math.floor(countdown / 60)).padStart(2, "0")}:{String(countdown % 60).padStart(2, "0")}
+          </span>
+        </Stat>
 
-        <div className="flex flex-wrap gap-4">
-          {/* Countdown */}
-          <div className="glass-card p-4 flex items-center gap-3">
-            <Clock className="w-4 h-4 text-zinc-500" />
-            <div className="flex flex-col">
-              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Window closes in</span>
-              <span className={cn("text-xl font-mono font-bold", countdownColor)}>
-                {String(Math.floor(countdown / 60)).padStart(2, "0")}:{String(countdown % 60).padStart(2, "0")}
-              </span>
-            </div>
-          </div>
-
-          {balance && (
-            <div className="glass-card p-4 flex flex-col justify-center">
-              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-1">Trading Balance</span>
-              <span className="text-sm font-mono text-green-400 font-bold">${balance.polymarketBalance} USDC</span>
-              <span className="text-[10px] text-zinc-500">Trade via {balance.funderAddress ? "Polymarket Profile" : "Wallet Signer"}</span>
-              <span className="text-xs font-mono text-zinc-500 truncate w-40">{balance.tradingAddress}</span>
-              <span className="text-[10px] text-zinc-600 mt-1">Wallet: {balance.onChainBalance} {balance.tokenSymbolUsed}</span>
-            </div>
+        <Stat label="BTC" mono>
+          {btcPrice ? (
+            <span className="font-medium text-zinc-100">
+              ${parseFloat(btcPrice.price).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+            </span>
+          ) : (
+            <span className="text-zinc-600">---</span>
           )}
+        </Stat>
 
-          {sentiment && (
-            <div className="glass-card p-4 flex items-center gap-4">
-              <div className="bg-zinc-800 p-2 rounded-lg">
-                <Smile className={cn("w-5 h-5", sentiment.value > 60 ? "text-green-500" : sentiment.value < 40 ? "text-red-500" : "text-yellow-500")} />
-              </div>
-              <div className="flex flex-col">
-                <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold">Sentiment</span>
-                <span className="text-sm font-bold">{sentiment.value_classification} ({sentiment.value})</span>
-              </div>
-            </div>
-          )}
+        {balance && (
+          <Stat label="Balance" mono>
+            <span className="font-medium text-emerald-400">${balance.polymarketBalance}</span>
+          </Stat>
+        )}
 
-          <div className="glass-card p-4 flex items-center gap-6">
-            <div className="flex flex-col">
-              <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-1">Live BTC</span>
-              <div className="flex items-center gap-2">
-                <DollarSign className="w-4 h-4 text-green-500" />
-                <span className="text-xl font-mono font-bold">
-                  {btcPrice ? parseFloat(btcPrice.price).toLocaleString(undefined, { minimumFractionDigits: 2 }) : "---"}
-                </span>
-              </div>
-            </div>
-            <button type="button" title="Refresh" onClick={fetchData} disabled={loading} className="btn-secondary p-2 rounded-full">
-              <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
-            </button>
-          </div>
-        </div>
-      </header>
+        {sentiment && (
+          <Stat label="Sentiment">
+            <span className={cn("font-medium", sentimentColor)}>
+              {sentiment.value_classification} · {sentiment.value}
+            </span>
+          </Stat>
+        )}
+
+        <button
+          type="button"
+          title="Refresh"
+          onClick={fetchData}
+          disabled={loading}
+          className="ml-auto text-zinc-500 hover:text-zinc-200 transition-colors p-1"
+        >
+          <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
+        </button>
+      </div>
 
       <BotDashboard />
 
-      {/* Paper Trade Widget - injected below dashboard */}
       <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="md:col-span-1">
           <PaperTradeWidget />
         </div>
       </div>
 
-      <footer className="mt-20 pt-8 border-t border-zinc-900 text-center text-zinc-600 text-sm">
-        <p>© 2026 PolyBTC AI Trader • Personal use only • Not financial advice</p>
+      <footer className="mt-20 pt-6 border-t border-zinc-900 text-center text-zinc-700 text-[11px]">
+        © 2026 PolyBTC AI Trader · Personal use · Not financial advice
       </footer>
 
       <BotLogSidebar />
+    </div>
+  );
+}
+
+function Stat({ label, mono, children }: { label: string; mono?: boolean; children: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline gap-2">
+      <span className="text-[10px] uppercase tracking-[0.18em] text-zinc-600">{label}</span>
+      <span className={mono ? "font-mono text-sm" : "text-sm"}>{children}</span>
     </div>
   );
 }
