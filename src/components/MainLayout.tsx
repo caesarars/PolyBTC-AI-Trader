@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { Activity, Zap, Eye, Menu, X, Bot, BarChart3 } from "lucide-react";
+import { Activity, Eye, Menu, X, Bot } from "lucide-react";
 
 type NavItem = {
-  id: "trading" | "swarm" | "visual";
+  id: "trading" | "visual";
   label: string;
   icon: React.ReactNode;
   badge?: string;
@@ -14,13 +14,6 @@ const NAV_ITEMS: NavItem[] = [
     id: "trading",
     label: "Trading Bot",
     icon: <Activity className="w-5 h-5" />,
-  },
-  {
-    id: "swarm",
-    label: "AI Swarm",
-    icon: <Zap className="w-5 h-5" />,
-    badge: "100",
-    badgeColor: "bg-amber-500/20 text-amber-400",
   },
   {
     id: "visual",
@@ -36,8 +29,8 @@ export default function MainLayout({
   onChangeView,
   children,
 }: {
-  activeView: "trading" | "swarm" | "visual";
-  onChangeView: (view: "trading" | "swarm" | "visual") => void;
+  activeView: "trading" | "visual";
+  onChangeView: (view: "trading" | "visual") => void;
   children: React.ReactNode;
 }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);

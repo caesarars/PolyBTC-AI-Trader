@@ -8,10 +8,8 @@ import type { ServerResponse } from "http";
 import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
-import { MongoClient, Db, Collection } from "mongodb";
-import { getBotProfiles, updateBotAccuracy, generateBotProfiles, BotProfile } from "./src/services/bot-personality.ts";
-import { askDeepSeek, batchPredict, MarketContext } from "./src/services/deepseek.ts";
-import { runSwarmPrediction, resolveSwarmWindow, getPredictionsForWindow, getAllEnsembles, getLeaderboard, getBotDetail, getSwarmStats, getSwarmEnabled, setSwarmEnabled, clearSwarmMemory } from "./src/services/swarm.ts";
+import { MongoClient, Db } from "mongodb";
+import { runBacktest, type BacktestOptions, type Candle as BacktestCandle } from "./src/backtest/replay.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -525,11 +523,27 @@ const SESSION_PNL_LOOKBACK_DAYS = 7;
 
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
+// `confidence` is a heuristic point score (60 base + alignment + boosts), NOT a calibrated
+// probability. `minEdge` here is a price-buffer gate (confidence/100 − entryPrice), used only
+// to require a markup over fair-coin price before entering. Do not interpret either as EV.
 const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 75);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.15);
-const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_FIXED_TRADE_USDC = Number(process.env.BOT_FIXED_TRADE_USDC || 1);
+
+// ── Phase 0 risk / safety config ─────────────────────────────────────────────
+// Live mode is gated behind PHASE_0_COMPLETE=true. Until set, paper mode is forced.
+const PHASE_0_COMPLETE = process.env.PHASE_0_COMPLETE === "true";
+const RISK_MAX_DRAWDOWN_PCT  = Number(process.env.RISK_MAX_DRAWDOWN_PCT  ?? 10);
+const RISK_MAX_CONSEC_LOSSES = Number(process.env.RISK_MAX_CONSEC_LOSSES ?? 5);
+const RISK_DAILY_LOSS_PCT    = Number(process.env.RISK_DAILY_LOSS_PCT    ?? 15);
+// Microstructure gates (per trade)
+const GATE_MAX_SPREAD          = Number(process.env.GATE_MAX_SPREAD          ?? 0.05);  // 5¢
+const GATE_MIN_TOB_LIQ_USDC    = Number(process.env.GATE_MIN_TOB_LIQ_USDC    ?? 50);    // top-of-book notional both sides
+const GATE_MAX_NORMALIZED_ATR  = Number(process.env.GATE_MAX_NORMALIZED_ATR  ?? 0.004); // 0.40% of price (1m ATR)
+// Heartbeat watchdog
+const HEARTBEAT_FAIL_WARN_AT   = Number(process.env.HEARTBEAT_FAIL_WARN_AT   ?? 2);
+const HEARTBEAT_FAIL_HALT_AT   = Number(process.env.HEARTBEAT_FAIL_HALT_AT   ?? 3);
 
 // Runtime-overrideable thresholds (UI-adjustable via /api/bot/config)
 let aggressiveMinConfidence = BOT_MIN_CONFIDENCE;
@@ -542,7 +556,6 @@ function getActiveConfig() {
   return {
     minConfidence:    aggressiveMinConfidence,
     minEdge:          aggressiveMinEdge,
-    kellyFraction:    BOT_KELLY_FRACTION,
     maxBetUsdc:       BOT_MAX_BET_USDC,
     fixedTradeUsdc:   aggressiveFixedTradeUsdc,
     balanceCap:       0.25,
@@ -558,62 +571,41 @@ function getFixedEntryBetAmount(balance: number): number {
   return parseFloat(Math.min(getActiveConfig().fixedTradeUsdc, spendable).toFixed(2));
 }
 
-// ── Dynamic Kelly fraction based on confidence ────────────────────────────────
-// CONSERVATIVE mode always uses its flat fraction (already risk-managed).
-// AGGRESSIVE mode scales the fraction with conviction level:
-//   65–74% → 0.25  (borderline signal, bet small)
-//   75–84% → 0.40  (normal, use base fraction)
-//   85–89% → 0.55  (strong signal, size up)
-//   90%+   → 0.65  (very high conviction, max size)
-function dynamicKellyFraction(confidence: number): number {
-  if (confidence >= 90) return 0.65;
-  if (confidence >= 85) return 0.55;
-  if (confidence >= 75) return 0.50;
-  return 0.25;
-}
-
 // ── Bot runtime state ────────────────────────────────────────────────────────
 let botEnabled = process.env.BOT_AUTO_START === "true";
 let botRunning = false;
-let paperMode = process.env.PAPER_MODE === "true";
+// Phase 0: paper mode is forced ON until PHASE_0_COMPLETE=true is set in env.
+let paperMode = (!PHASE_0_COMPLETE) || process.env.PAPER_MODE === "true";
+if (!PHASE_0_COMPLETE) {
+  console.warn("┌─────────────────────────────────────────────────────────────┐");
+  console.warn("│ PHASE 0 NOT COMPLETE — paper mode FORCED. Live trades       │");
+  console.warn("│ are disabled. Set PHASE_0_COMPLETE=true to allow real fills.│");
+  console.warn("└─────────────────────────────────────────────────────────────┘");
+}
 let botInterval: NodeJS.Timeout | null = null;
 let botSessionStartBalance: number | null = null;
+let botSessionPeakBalance: number | null = null;
 let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
-let lastSwarmWindowStart = 0;
 
-// ── Swarm current window snapshot (for dashboard) ────────────────────────────
-interface SwarmWindowSnapshot {
-  windowStart: number;
-  windowEnd: number;
-  elapsedSeconds: number;
-  remainingSeconds: number;
-  progressPct: number;
-  btcPrice: number;
-  priceChange5m: number;
-  priceChange1h: number;
-  fastLoopDirection: string;
-  fastLoopStrength: string;
-  fastLoopVW: number;
-  rsi?: number;
-  emaCross?: string;
-  fundingRate?: number;
-  longShortRatio?: number;
-  heatSignal?: string;
-  squeezeRisk?: string;
-  sentiment?: string;
-  swarmPredicted: boolean;
-  swarmPrediction?: {
-    consensusDirection: string;
-    consensusConfidence: number;
-    upVotes: number;
-    downVotes: number;
-    neutralVotes: number;
-    predictionsCount: number;
-  };
-  updatedAt: number;
+// ── Risk halt state (Phase 0 fix 2 + 5) ──────────────────────────────────────
+interface RiskHaltState {
+  halted: boolean;
+  reason: string;
+  haltedAt: number; // unix seconds
 }
-let latestSwarmWindowSnapshot: SwarmWindowSnapshot | null = null;
+const riskHalt: RiskHaltState = { halted: false, reason: "", haltedAt: 0 };
+
+// Daily PnL tracker — keyed by YYYY-MM-DD (UTC). Used for daily-loss circuit breaker.
+const dailyPnlByDate: Map<string, number> = new Map();
+function dateKeyUtc(ts = Date.now()): string { return new Date(ts).toISOString().slice(0, 10); }
+function recordDailyPnl(pnl: number, ts = Date.now()) {
+  const k = dateKeyUtc(ts);
+  dailyPnlByDate.set(k, (dailyPnlByDate.get(k) ?? 0) + pnl);
+}
+function todayPnl(): number {
+  return dailyPnlByDate.get(dateKeyUtc()) ?? 0;
+}
 
 // Per-asset analyzed-this-window tracking (keyed by asset → Set of market IDs)
 const botAnalyzedThisWindowByAsset = new Map<TradingAsset, Set<string>>(
@@ -821,7 +813,6 @@ const winMemory: WinMemory[] = [];
 const consecutiveLossesByAsset   = new Map<TradingAsset, number>([["BTC",0]]);
 const consecutiveWinsByAsset     = new Map<TradingAsset, number>([["BTC",0]]);
 const adaptiveConfidenceByAsset  = new Map<TradingAsset, number>([["BTC",0]]);
-const resolvedSwarmWindows = new Set<number>(); // Track which windows have been resolved by swarm
 // Global aliases kept for persistence (sum/avg not needed — persist per entry in lossMemory)
 let adaptiveLossPenaltyEnabled = true;
 
@@ -2551,14 +2542,10 @@ async function startServer() {
         const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
         if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
 
-        // Kelly sizing — use last known balance (updated by bot cycle, fresh within ~30s)
+        // Sizing — fixed bet from runtime config. (Kelly removed: `confidence` is a
+        // heuristic point score, not a calibrated probability; sizing on it is unsafe.)
         const balance = lastKnownBalance ?? botSessionStartBalance ?? 0;
         if (balance <= 0) return;
-
-        const p = confidence / 100;
-        const b = (1 - bestAsk) / bestAsk;
-        const kelly = (p * b - (1 - p)) / b;
-        if (kelly <= 0) return;
 
         const MIN_BET = Math.min(0.50, balance * 0.20);
         const betAmount = getFixedEntryBetAmount(balance);
@@ -2965,22 +2952,6 @@ async function startServer() {
         continue;
       }
 
-      // ── Resolve Swarm for this window (once per window) ────────────────────
-      if (getSwarmEnabled() && !resolvedSwarmWindows.has(pending.windowEnd)) {
-        try {
-          // Determine actual direction from market result
-          // ourTokenPrice >= 0.90 means we won → our direction was correct
-          const actualDir = ourTokenPrice >= 0.90 ? pending.direction : (pending.direction === "UP" ? "DOWN" : "UP");
-          if (actualDir === "UP" || actualDir === "DOWN") {
-            await resolveSwarmWindow(pending.windowEnd, actualDir as "UP" | "DOWN");
-            resolvedSwarmWindows.add(pending.windowEnd);
-            botPrint("INFO", `[Swarm] Window ${pending.windowEnd} resolved → ${actualDir} (from market result)`);
-          }
-        } catch (err: any) {
-          botPrint("WARN", `[Swarm] Failed to resolve window ${pending.windowEnd}: ${err?.message || String(err)}`);
-        }
-      }
-
       // ── Determine WIN / LOSS ───────────────────────────────────────────────
       // PnL: shares × $1 payout minus cost (WIN), or full bet lost (LOSS)
       // won_final = pnl > 0: even $0.01 profit = WIN; no profit = LOSS
@@ -2991,6 +2962,9 @@ async function startServer() {
       const won_final = pnl > 0;
 
       botPrint("INFO", `Result resolved via [${resolvedSource}] → ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
+
+      // ── Daily PnL accounting (live trades only) ─────────────────────────
+      if (!pending.isPaperTrade) recordDailyPnl(pnl);
 
       if (won_final) {
         if (!pending.isPaperTrade) {
@@ -3087,6 +3061,18 @@ async function startServer() {
           } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
             botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
           }
+
+          // ── Phase 0 risk halts ────────────────────────────────────────────
+          if (cLosses >= RISK_MAX_CONSEC_LOSSES) {
+            triggerRiskHalt(`Consecutive-loss limit hit (${cLosses} ≥ ${RISK_MAX_CONSEC_LOSSES})`);
+          }
+          if (botSessionStartBalance && botSessionStartBalance > 0) {
+            const dailyLoss = -todayPnl(); // positive if losing money
+            const dailyLossPct = (dailyLoss / botSessionStartBalance) * 100;
+            if (dailyLossPct >= RISK_DAILY_LOSS_PCT) {
+              triggerRiskHalt(`Daily loss limit hit (-${dailyLossPct.toFixed(1)}% ≥ -${RISK_DAILY_LOSS_PCT}%)`);
+            }
+          }
         }
         const paperTagLoss = pending.isPaperTrade ? " [PAPER]" : "";
         botPrint("WARN", `━━━ ✗ LOSS${paperTagLoss} ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
@@ -3136,8 +3122,26 @@ async function startServer() {
   };
 
   // ── Bot cycle ──────────────────────────────────────────────────────────────
+  const triggerRiskHalt = (reason: string) => {
+    if (riskHalt.halted) return;
+    riskHalt.halted = true;
+    riskHalt.reason = reason;
+    riskHalt.haltedAt = Math.floor(Date.now() / 1000);
+    botEnabled = false;
+    if (botInterval) { clearInterval(botInterval); botInterval = null; }
+    stopHeartbeat();
+    console.error(`[RISK HALT] ${reason}`);
+    botPrint("ERR", `🛑 RISK HALT — ${reason}. Bot disabled until manual reset (/api/risk/reset).`);
+    void sendNotification(`🛑 <b>RISK HALT</b>\n${reason}\nBot disabled. Reset via /api/risk/reset.`);
+  };
+
   const runBotCycle = async () => {
     if (botRunning || !botEnabled) return;
+    if (riskHalt.halted) {
+      botPrint("SKIP", `Bot halted: ${riskHalt.reason}`);
+      if (botInterval) { clearInterval(botInterval); botInterval = null; }
+      return;
+    }
 
     botRunning = true;
     try {
@@ -3267,80 +3271,6 @@ async function startServer() {
               getAssetHeatData(currentAsset),
             ]);
             botPrint("OK", `[${currentAsset}] $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"} | Heat: ${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
-
-            // ── Update swarm window snapshot for dashboard ──────────────────
-            const _fastMomSnapshot = btcHistoryResult?.history?.length
-              ? computeFastLoopMomentum(btcHistoryResult.history)
-              : null;
-            latestSwarmWindowSnapshot = {
-              windowStart: currentWindowStart,
-              windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
-              elapsedSeconds: windowElapsedSeconds,
-              remainingSeconds: windowRemaining,
-              progressPct: parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1)),
-              btcPrice: btcPriceData?.price ? parseFloat(btcPriceData.price) : 0,
-              priceChange5m: _fastMomSnapshot?.raw ?? 0,
-              priceChange1h: btcHistoryResult?.history?.length
-                ? ((btcHistoryResult.history[btcHistoryResult.history.length - 1].close - btcHistoryResult.history[0].close) / btcHistoryResult.history[0].close) * 100
-                : 0,
-              fastLoopDirection: _fastMomSnapshot?.direction ?? "NEUTRAL",
-              fastLoopStrength: _fastMomSnapshot?.strength ?? "WEAK",
-              fastLoopVW: _fastMomSnapshot?.volumeWeighted ?? 0,
-              rsi: btcIndicatorsData?.rsi,
-              emaCross: btcIndicatorsData?.emaCross,
-              fundingRate: heatData?.fundingRate,
-              longShortRatio: heatData?.longShortRatio,
-              heatSignal: heatData?.heatSignal,
-              squeezeRisk: heatData?.squeezeRisk,
-              sentiment: sentimentData?.value_classification,
-              swarmPredicted: lastSwarmWindowStart === currentWindowStart,
-              updatedAt: Date.now(),
-            };
-
-            // ── Swarm Prediction (100 AI bots) ───────────────────────────────
-            if (getSwarmEnabled() && currentWindowStart !== lastSwarmWindowStart) {
-              lastSwarmWindowStart = currentWindowStart;
-              setTimeout(async () => {
-                try {
-                  const fastMom = btcHistoryResult?.history?.length
-                    ? computeFastLoopMomentum(btcHistoryResult.history)
-                    : null;
-                  const context: MarketContext = {
-                    btcPrice: btcPriceData?.price ? parseFloat(btcPriceData.price) : 0,
-                    priceChange5m: fastMom?.raw ?? 0,
-                    priceChange1h: btcHistoryResult?.history?.length
-                      ? ((btcHistoryResult.history[btcHistoryResult.history.length - 1].close - btcHistoryResult.history[0].close) / btcHistoryResult.history[0].close) * 100
-                      : 0,
-                    fastLoopDirection: fastMom?.direction ?? "NEUTRAL",
-                    fastLoopStrength: fastMom?.strength ?? "WEAK",
-                    fastLoopVW: fastMom?.volumeWeighted ?? 0,
-                    rsi: btcIndicatorsData?.rsi,
-                    emaCross: btcIndicatorsData?.emaCross,
-                    fundingRate: heatData?.fundingRate,
-                    longShortRatio: heatData?.longShortRatio,
-                    heatSignal: heatData?.heatSignal,
-                    windowElapsedSeconds: windowElapsedSeconds,
-                  };
-                  const { ensemble, predictions } = await runSwarmPrediction(currentWindowStart, context);
-                  botPrint("INFO", `[Swarm] ${predictions}/100 bots → ${ensemble.consensusDirection} (${ensemble.consensusConfidence}%) | UP:${ensemble.upVotes} DOWN:${ensemble.downVotes} NEUTRAL:${ensemble.neutralVotes}`);
-                  pushSSE("swarm", { windowStart: currentWindowStart, ensemble, predictions });
-                  // Update snapshot with prediction result
-                  if (latestSwarmWindowSnapshot && latestSwarmWindowSnapshot.windowStart === currentWindowStart) {
-                    latestSwarmWindowSnapshot.swarmPredicted = true;
-                    latestSwarmWindowSnapshot.swarmPrediction = {
-                      consensusDirection: ensemble.consensusDirection,
-                      consensusConfidence: ensemble.consensusConfidence,
-                      upVotes: ensemble.upVotes,
-                      downVotes: ensemble.downVotes,
-                      neutralVotes: ensemble.neutralVotes,
-                      predictionsCount: predictions,
-                    };
-                  }
-                } catch (err: any) {
-                  botPrint("ERR", `[Swarm] Prediction failed: ${err?.message || String(err)}`);
-                }
-              }, 500);
-            }
 
             // ── Strike price vs current price analysis ──────────────────────
             // Parse strike from question e.g. "Will BTC be above $95,500 at 12:05?"
@@ -3764,13 +3694,27 @@ async function startServer() {
                 break;
               }
 
-              // ── Kelly sizing with balance-aware adjustment ──────────────────
+              // ── Sizing (flat) + microstructure & risk gates ─────────────────
+              // `confidence` is a heuristic score, NOT a probability — sizing stays flat.
               const outcomeIndex = rec.direction === "UP" ? 0 : 1;
               const tokenId: string = market.clobTokenIds?.[outcomeIndex];
               if (tokenId) {
                 const ob = orderBooks[tokenId];
                 const clobAsk = Number(ob?.asks?.[0]?.price || "0");
                 const bestBid = Number(ob?.bids?.[0]?.price || "0");
+
+                // ── Session drawdown gate (Phase 0 fix 2) ─────────────────────
+                if (botSessionStartBalance && botSessionStartBalance > 0) {
+                  if (botSessionPeakBalance === null || currentBalance > botSessionPeakBalance) {
+                    botSessionPeakBalance = currentBalance;
+                  }
+                  const peak = botSessionPeakBalance ?? botSessionStartBalance;
+                  const ddPct = peak > 0 ? ((peak - currentBalance) / peak) * 100 : 0;
+                  if (ddPct >= RISK_MAX_DRAWDOWN_PCT) {
+                    triggerRiskHalt(`Session drawdown limit hit (-${ddPct.toFixed(1)}% from peak ≥ -${RISK_MAX_DRAWDOWN_PCT}%)`);
+                    break;
+                  }
+                }
 
                 // ── Use outcomePrices (AMM implied price) as primary fill reference ──
                 // CLOB asks are almost always 99¢ in these 5m markets because nobody
@@ -3813,30 +3757,40 @@ async function startServer() {
                   continue;
                 }
 
-                // Use bestAsk as fill price for Kelly (already AMM-corrected above).
-                const kellyFillPrice = bestAsk > 0 ? bestAsk : parseFloat(market.outcomePrices[outcomeIndex] || "0.5");
-
-                const p = rec.confidence / 100;
-                const b = (1 - kellyFillPrice) / kellyFillPrice;
-                const kelly = (p * b - (1 - p)) / b;
-
-                // ── Volatility-adjusted Kelly ───────────────────────────────
-                // Scale bet down when BTC is choppy (high ATR = noisy market).
-                // ATR = avg true range of last 10 1-min candles.
-                // Baseline: 0.15% of BTC price (e.g. $120 on $80K BTC).
-                // Above baseline → reduce Kelly. Below → capped at 1.0 (no reward for calm).
-                let volMultiplier = 1.0;
+                // ── Phase 0 Fix 6: spread / liquidity / volatility gates ────
+                // Spread: skip if too wide — wide books mean adverse selection risk.
+                if (bestBid > 0 && bestAsk > 0) {
+                  const spread = bestAsk - bestBid;
+                  if (spread > GATE_MAX_SPREAD) {
+                    botPrint("SKIP", `Spread gate: ${(spread * 100).toFixed(1)}¢ > ${(GATE_MAX_SPREAD * 100).toFixed(1)}¢ max — book too wide | re-check enabled`);
+                    analyzedThisWindow.delete(market.id);
+                    pushSSE("cycle", { ts: new Date().toISOString() });
+                    continue;
+                  }
+                }
+                // Top-of-book liquidity: notional USDC at touch must exceed floor.
+                const tobBidSize = Number(ob?.bids?.[0]?.size || "0");
+                const tobAskSize = Number(ob?.asks?.[0]?.size || "0");
+                const tobNotional = (tobBidSize * (bestBid || 0)) + (tobAskSize * (bestAsk || 0));
+                if (tobNotional < GATE_MIN_TOB_LIQ_USDC) {
+                  botPrint("SKIP", `Liquidity gate: TOB notional $${tobNotional.toFixed(2)} < $${GATE_MIN_TOB_LIQ_USDC} min — thin book | re-check enabled`);
+                  analyzedThisWindow.delete(market.id);
+                  pushSSE("cycle", { ts: new Date().toISOString() });
+                  continue;
+                }
+                // Volatility: skip if normalized 1m ATR is above ceiling (news / flash move).
                 const btcCandles = btcHistoryResult?.history ?? [];
                 if (btcCandles.length >= 5 && btcPriceData?.price) {
                   const last10 = btcCandles.slice(-10);
-                  const atr = last10.reduce((sum: number, c: { high: number; low: number }) => sum + (c.high - c.low), 0) / last10.length;
+                  const atr = last10.reduce((sum: number, c: BtcCandle) => sum + (c.high - c.low), 0) / last10.length;
                   const btcPriceNum = Number(btcPriceData.price);
                   if (btcPriceNum > 0) {
-                    const normalizedAtr = atr / btcPriceNum; // as fraction of price
-                    const BASELINE_ATR = 0.0015;            // 0.15% = calm/normal BTC
-                    volMultiplier = Math.max(0.50, Math.min(1.0, BASELINE_ATR / normalizedAtr));
-                    if (volMultiplier < 1.0) {
-                      botPrint("INFO", `Volatility gate: ATR=${atr.toFixed(0)} (${(normalizedAtr * 100).toFixed(2)}% of price) → Kelly scaled to ${(volMultiplier * 100).toFixed(0)}%`);
+                    const normalizedAtr = atr / btcPriceNum;
+                    if (normalizedAtr > GATE_MAX_NORMALIZED_ATR) {
+                      botPrint("SKIP", `Volatility gate: ATR=${atr.toFixed(0)} (${(normalizedAtr * 100).toFixed(2)}% of price) > ${(GATE_MAX_NORMALIZED_ATR * 100).toFixed(2)}% max — too choppy | re-check enabled`);
+                      analyzedThisWindow.delete(market.id);
+                      pushSSE("cycle", { ts: new Date().toISOString() });
+                      continue;
                     }
                   }
                 }
@@ -3845,13 +3799,14 @@ async function startServer() {
                 const MIN_BET = Math.min(0.50, currentBalance * 0.20);
 
                 // Entry sizing is fixed at the runtime-configured fixedTradeUsdc for every buy order.
+                // `confidence` is a heuristic score, not a calibrated probability — sizing stays flat.
                 const betAmount = getFixedEntryBetAmount(currentBalance);
 
-                botPrint("INFO", `Fixed sizing: conf=${rec.confidence}% | implied=${(impliedPrice * 100).toFixed(0)}¢ | target=$${getActiveConfig().fixedTradeUsdc.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
+                botPrint("INFO", `Flat sizing: conf=${rec.confidence}% (heuristic) | implied=${(impliedPrice * 100).toFixed(0)}¢ | target=$${getActiveConfig().fixedTradeUsdc.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
                 botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < MIN_BET) {
-                  botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC < $${MIN_BET.toFixed(2)} min). Balance may be too low or Kelly fraction too conservative. Skipping.`);
+                  botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC < $${MIN_BET.toFixed(2)} min). Balance too low. Skipping.`);
                   logEntry.reasoning += ` | Skipped: Adjusted bet $${betAmount.toFixed(2)} < $${MIN_BET.toFixed(2)} minimum (balance=$${currentBalance.toFixed(2)}).`;
                 } else {
                   const executionStatus = getTradeWindowStatus(currentAsset, market.id);
@@ -3964,6 +3919,9 @@ async function startServer() {
   // Chain: first call uses "" → server returns heartbeat_id → each subsequent call passes that ID.
   // On 400: server returns the correct heartbeat_id in the response body — extract and use it.
   // On other errors: reset to "" to start a fresh chain next tick.
+  // Watchdog: N consecutive failures → notification, then risk halt.
+  let heartbeatConsecutiveFailures = 0;
+  let heartbeatWarnedAt = 0;
   const startHeartbeat = () => {
     if (heartbeatInterval) return;
     const sendHeartbeat = async () => {
@@ -3972,6 +3930,11 @@ async function startServer() {
       try {
         const resp = await cl.postHeartbeat(lastHeartbeatId || null);
         lastHeartbeatId = resp?.heartbeat_id ?? "";
+        if (heartbeatConsecutiveFailures > 0) {
+          console.log(`[Heartbeat] Recovered after ${heartbeatConsecutiveFailures} failures`);
+          botPrint("OK", `Heartbeat recovered after ${heartbeatConsecutiveFailures} failed beats`);
+        }
+        heartbeatConsecutiveFailures = 0;
       } catch (err: any) {
         // Polymarket returns 400 with the correct heartbeat_id when we send a stale/wrong ID.
         // The SDK throws on 400 but may attach the response body — try to extract it.
@@ -3980,9 +3943,25 @@ async function startServer() {
         if (recoveredId) {
           console.warn(`[Heartbeat] 400 — recovered correct ID from response, re-chaining`);
           lastHeartbeatId = recoveredId;
-        } else {
-          console.warn("[Heartbeat] Failed:", err?.message ?? String(err), "— resetting chain");
-          lastHeartbeatId = "";
+          heartbeatConsecutiveFailures = 0;
+          return;
+        }
+        heartbeatConsecutiveFailures++;
+        console.warn(`[Heartbeat] Failed (${heartbeatConsecutiveFailures} consecutive):`, err?.message ?? String(err), "— resetting chain");
+        lastHeartbeatId = "";
+        const nowMs = Date.now();
+        // Warn once per 60s on sustained failures before halt threshold.
+        if (heartbeatConsecutiveFailures >= HEARTBEAT_FAIL_WARN_AT &&
+            heartbeatConsecutiveFailures < HEARTBEAT_FAIL_HALT_AT &&
+            nowMs - heartbeatWarnedAt > 60_000) {
+          heartbeatWarnedAt = nowMs;
+          botPrint("WARN", `Heartbeat watchdog: ${heartbeatConsecutiveFailures} consecutive failures — open orders may be at risk`);
+          void sendNotification(
+            `⚠️ <b>HEARTBEAT WATCHDOG</b>\n${heartbeatConsecutiveFailures} consecutive failures.\nPolymarket will cancel open orders after ~10s without heartbeat.`
+          );
+        }
+        if (heartbeatConsecutiveFailures >= HEARTBEAT_FAIL_HALT_AT) {
+          triggerRiskHalt(`Heartbeat watchdog tripped (${heartbeatConsecutiveFailures} consecutive failures ≥ ${HEARTBEAT_FAIL_HALT_AT})`);
         }
       }
     };
@@ -4046,13 +4025,14 @@ async function startServer() {
       config: {
         minConfidence: getActiveConfig().minConfidence,
         minEdge: getActiveConfig().minEdge,
-        kellyFraction: getActiveConfig().kellyFraction,
         maxBetUsdc: getActiveConfig().maxBetUsdc,
         fixedTradeUsdc: getActiveConfig().fixedTradeUsdc,
         entryWindowStart: getActiveConfig().entryWindowStart,
         entryWindowEnd: getActiveConfig().entryWindowEnd,
         scanIntervalMs: BOT_SCAN_INTERVAL_MS,
       },
+      riskHalt,
+      phase0Complete: PHASE_0_COMPLETE,
     });
   });
 
@@ -4062,8 +4042,15 @@ async function startServer() {
       return res.status(400).json({ error: "enabled (boolean) is required." });
     }
     if (enabled) {
+      if (riskHalt.halted) {
+        return res.status(409).json({
+          error: `Bot is risk-halted: ${riskHalt.reason}. Reset via POST /api/risk/reset before enabling.`,
+          riskHalt,
+        });
+      }
       botEnabled = true;
       botSessionStartBalance = null; // reset session on re-enable
+      botSessionPeakBalance = null;
       botSessionTradesCount = 0;
       startBot();
       res.json({ enabled: true, message: "Bot started." });
@@ -4078,173 +4065,47 @@ async function startServer() {
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ error: "enabled (boolean) is required." });
     }
+    if (!enabled && !PHASE_0_COMPLETE) {
+      return res.status(403).json({
+        error: "Cannot disable paper mode: PHASE_0_COMPLETE is not set. Live trading is locked.",
+        paperMode,
+      });
+    }
     paperMode = enabled;
     botPrint("OK", `Paper mode ${enabled ? "ENABLED" : "DISABLED"}`);
     res.json({ ok: true, paperMode });
   });
 
-  // ── Swarm API Endpoints ─────────────────────────────────────────────────────
-  app.get("/api/swarm/status", (_req, res) => {
+  // ── Risk halt control (Phase 0 fix 2 + 5) ────────────────────────────────
+  app.get("/api/risk/status", (_req, res) => {
     res.json({
-      enabled: getSwarmEnabled(),
-      botCount: 100,
-      stats: getSwarmStats(),
-      apiKeyConfigured: Boolean(process.env.DEEPSEEK_API_KEY),
-      botRunning: botRunning,
-      botEnabled: botEnabled,
+      riskHalt,
+      sessionStartBalance: botSessionStartBalance,
+      sessionPeakBalance: botSessionPeakBalance,
+      todayPnl: todayPnl(),
+      limits: {
+        maxDrawdownPct: RISK_MAX_DRAWDOWN_PCT,
+        maxConsecLosses: RISK_MAX_CONSEC_LOSSES,
+        dailyLossPct: RISK_DAILY_LOSS_PCT,
+        gateMaxSpread: GATE_MAX_SPREAD,
+        gateMinTobLiqUsdc: GATE_MIN_TOB_LIQ_USDC,
+        gateMaxNormalizedAtr: GATE_MAX_NORMALIZED_ATR,
+        heartbeatFailWarnAt: HEARTBEAT_FAIL_WARN_AT,
+        heartbeatFailHaltAt: HEARTBEAT_FAIL_HALT_AT,
+      },
+      phase0Complete: PHASE_0_COMPLETE,
     });
   });
 
-  app.get("/api/swarm/current-window", (_req, res) => {
-    const nowUtcSeconds = Math.floor(Date.now() / 1000);
-    const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
-    const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
-    const windowRemaining = MARKET_SESSION_SECONDS - windowElapsedSeconds;
-
-    // If snapshot is stale (different window), return fresh computed values without market data
-    if (!latestSwarmWindowSnapshot || latestSwarmWindowSnapshot.windowStart !== currentWindowStart) {
-      return res.json({
-        windowStart: currentWindowStart,
-        windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
-        elapsedSeconds: windowElapsedSeconds,
-        remainingSeconds: windowRemaining,
-        progressPct: parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1)),
-        btcPrice: 0,
-        swarmPredicted: false,
-        isStale: true,
-        updatedAt: Date.now(),
-      });
-    }
-
-    // Update elapsed/remaining in real-time from snapshot base
-    const snapshot = { ...latestSwarmWindowSnapshot };
-    snapshot.elapsedSeconds = windowElapsedSeconds;
-    snapshot.remainingSeconds = windowRemaining;
-    snapshot.progressPct = parseFloat(((windowElapsedSeconds / MARKET_SESSION_SECONDS) * 100).toFixed(1));
-    res.json(snapshot);
-  });
-
-  app.post("/api/swarm/toggle", (req, res) => {
-    const { enabled } = req.body || {};
-    if (typeof enabled !== "boolean") {
-      return res.status(400).json({ error: "enabled (boolean) is required." });
-    }
-    if (enabled && !process.env.DEEPSEEK_API_KEY) {
-      return res.status(400).json({
-        error: "DEEPSEEK_API_KEY is not configured. Add it to your .env file before enabling the swarm.",
-        enabled: getSwarmEnabled(),
-      });
-    }
-    setSwarmEnabled(enabled);
-    botPrint("OK", `Swarm mode ${enabled ? "ENABLED" : "DISABLED"}`);
-    res.json({ ok: true, enabled: getSwarmEnabled() });
-  });
-
-  app.get("/api/swarm/bots", (_req, res) => {
-    const profiles = getBotProfiles();
-    res.json({ bots: profiles });
-  });
-
-  app.get("/api/swarm/bots/:id", (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid bot ID" });
-    const detail = getBotDetail(id);
-    if (!detail.profile) return res.status(404).json({ error: "Bot not found" });
-    res.json(detail);
-  });
-
-  app.get("/api/swarm/leaderboard", (_req, res) => {
-    res.json({ leaderboard: getLeaderboard().slice(0, 20) });
-  });
-
-  app.get("/api/swarm/ensembles", (_req, res) => {
-    res.json({ ensembles: getAllEnsembles().slice(0, 50) });
-  });
-
-  app.get("/api/swarm/ensemble/:windowStart", (req, res) => {
-    const ws = parseInt(req.params.windowStart, 10);
-    if (isNaN(ws)) return res.status(400).json({ error: "Invalid window start" });
-    const predictions = getPredictionsForWindow(ws);
-    res.json({ windowStart: ws, predictions, count: predictions.length });
-  });
-
-  app.get("/api/swarm/analytics", (_req, res) => {
-    const ensembles = getAllEnsembles();
-    const resolved = ensembles.filter((e: any) => e.actual !== null);
-    const consensusCorrect = resolved.filter((e: any) => e.correct === true).length;
-
-    // Direction breakdown
-    const upWins = resolved.filter((e: any) => e.actual === "UP" && e.correct).length;
-    const upTotal = resolved.filter((e: any) => e.actual === "UP").length;
-    const downWins = resolved.filter((e: any) => e.actual === "DOWN" && e.correct).length;
-    const downTotal = resolved.filter((e: any) => e.actual === "DOWN").length;
-
-    res.json({
-      totalWindows: ensembles.length,
-      resolvedWindows: resolved.length,
-      consensusAccuracy: resolved.length > 0 ? parseFloat(((consensusCorrect / resolved.length) * 100).toFixed(1)) : 0,
-      upAccuracy: upTotal > 0 ? parseFloat(((upWins / upTotal) * 100).toFixed(1)) : 0,
-      downAccuracy: downTotal > 0 ? parseFloat(((downWins / downTotal) * 100).toFixed(1)) : 0,
-      avgBotsPerWindow: ensembles.length > 0
-        ? parseFloat((ensembles.reduce((s: number, e: any) => s + e.upVotes + e.downVotes + e.neutralVotes, 0) / ensembles.length).toFixed(1))
-        : 0,
-      topBots: getLeaderboard().slice(0, 10),
-    });
-  });
-
-  app.post("/api/swarm/trigger", async (_req, res) => {
-    if (!getSwarmEnabled()) {
-      return res.status(400).json({ error: "Swarm is not enabled. Toggle it via the dashboard." });
-    }
-    try {
-      const now = Math.floor(Date.now() / 1000);
-      const windowStart = Math.floor(now / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
-
-      // Gather market context fresh
-      const [history, indicators, heatData] = await Promise.all([
-        getBtcHistory(),
-        getBtcIndicators(),
-        getAssetHeatData("BTC", false),
-      ]);
-      const fastMom = history?.history?.length ? computeFastLoopMomentum(history.history) : null;
-
-      const context: MarketContext = {
-        btcPrice: history?.history?.length ? history.history[history.history.length - 1].close : 0,
-        priceChange5m: fastMom?.raw ?? 0,
-        priceChange1h: history?.history?.length
-          ? ((history.history[history.history.length - 1].close - history.history[0].close) / history.history[0].close) * 100
-          : 0,
-        fastLoopDirection: fastMom?.direction ?? "NEUTRAL",
-        fastLoopStrength: fastMom?.strength ?? "WEAK",
-        fastLoopVW: fastMom?.volumeWeighted ?? 0,
-        rsi: indicators?.rsi,
-        emaCross: indicators?.emaCross,
-        fundingRate: heatData?.fundingRate,
-        longShortRatio: heatData?.longShortRatio,
-        heatSignal: heatData?.heatSignal,
-        windowElapsedSeconds: now - windowStart,
-      };
-
-      const { ensemble, predictions } = await runSwarmPrediction(windowStart, context);
-      res.json({ ok: true, ensemble, predictions, windowStart });
-    } catch (err: any) {
-      res.status(500).json({ error: err?.message || "Swarm prediction failed" });
-    }
-  });
-
-  app.post("/api/swarm/resolve", async (req, res) => {
-    const { windowStart, actual } = req.body || {};
-    if (!windowStart || !actual || !["UP", "DOWN"].includes(actual)) {
-      return res.status(400).json({ error: "windowStart and actual (UP/DOWN) required" });
-    }
-    await resolveSwarmWindow(windowStart, actual);
-    res.json({ ok: true, windowStart, actual });
-  });
-
-  app.post("/api/swarm/reset", (_req, res) => {
-    clearSwarmMemory();
-    botPrint("INFO", "[Swarm] Memory cleared");
-    res.json({ ok: true });
+  app.post("/api/risk/reset", (_req, res) => {
+    const wasHalted = riskHalt.halted;
+    const prevReason = riskHalt.reason;
+    riskHalt.halted = false;
+    riskHalt.reason = "";
+    riskHalt.haltedAt = 0;
+    botSessionPeakBalance = null;
+    botPrint("OK", `Risk halt cleared${wasHalted ? ` (was: ${prevReason})` : ""}`);
+    res.json({ ok: true, cleared: wasHalted, previousReason: prevReason });
   });
 
   app.get("/api/bot/log", (req, res) => {
@@ -4403,51 +4264,78 @@ async function startServer() {
     });
   });
 
+  // ── Phase 0 Fix 10: honest backtest ─────────────────────────────────────
+  // Replays SYNTH heuristic on real Binance 1-min candles with realistic
+  // entry, slippage, fees, ATR gate, Brier + log-loss calibration, and a
+  // baseline "always buy YES" benchmark. Replaces the old direction-accuracy toy.
+  app.post("/api/backtest/replay", async (req, res) => {
+    try {
+      const body = (req.body || {}) as Partial<BacktestOptions>;
+      const opts: BacktestOptions = {
+        windows:          Number(body.windows          ?? 200),
+        minConfidence:    Number(body.minConfidence    ?? aggressiveMinConfidence),
+        minEdge:          Number(body.minEdge          ?? aggressiveMinEdge),
+        betUsdc:          Number(body.betUsdc          ?? aggressiveFixedTradeUsdc),
+        slippage:         Number(body.slippage         ?? 0.02),
+        feeUsdc:          Number(body.feeUsdc          ?? 0),
+        maxNormalizedAtr: Number(body.maxNormalizedAtr ?? GATE_MAX_NORMALIZED_ATR),
+      };
+      const historyResult = await getBtcHistory(true);
+      const history = historyResult?.history ?? [];
+      if (history.length < 50) {
+        return res.status(503).json({ error: `Insufficient candle history (have ${history.length}, need ≥50)` });
+      }
+      const candles: BacktestCandle[] = history.map((c) => ({
+        time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+      }));
+      const result = runBacktest(candles, opts);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Backtest failed" });
+    }
+  });
+
+  // Deprecated direction-accuracy backtest kept as an alias to avoid breaking
+  // any existing UI callers. Internally delegates to the replay backtester
+  // and projects a thin "results" view onto the response.
   app.post("/api/backtest", async (_req, res) => {
     try {
       const historyResult = await getBtcHistory(true);
-      if (!historyResult?.history?.length) return res.json({ error: "No BTC history available" });
-      const history = historyResult.history;
-      const minStart = 20;
-      const maxWindows = Math.floor((history.length - minStart - 5) / 3);
-      const actualWindows = Math.min(40, maxWindows);
-      const results: any[] = [];
-      for (let w = 0; w < actualWindows; w++) {
-        const endIdx = minStart + w * 3;
-        if (endIdx + 5 >= history.length) break;
-        const slice = history.slice(0, endIdx + 1);
-        const future = history.slice(endIdx + 1, endIdx + 6);
-        let fastMom: FastLoopMomentum | null = null;
-        let indicators: any = null;
-        try { fastMom = computeFastLoopMomentum(slice); } catch {}
-        try { if (slice.length >= 15) indicators = computeBtcIndicatorsFromHistory(slice); } catch {}
-        const entryClose = history[endIdx].close;
-        const exitClose = future.length > 0 ? future[future.length - 1].close : null;
-        const actualDir = exitClose != null ? (exitClose > entryClose ? "UP" : exitClose < entryClose ? "DOWN" : "NEUTRAL") : null;
-        const signaled = !!(fastMom && fastMom.strength !== "WEAK" && fastMom.direction !== "NEUTRAL");
-        const correct = signaled && actualDir !== null ? fastMom!.direction === actualDir : null;
-        results.push({
-          ts: history[endIdx].time,
-          fastMom: fastMom ? { direction: fastMom.direction, strength: fastMom.strength, vw: fastMom.volumeWeighted } : null,
-          rsi: indicators?.rsi ?? null,
-          emaCross: indicators?.emaCross ?? null,
-          signalScore: indicators?.signalScore ?? null,
-          signaled,
-          signalDirection: fastMom?.direction ?? null,
-          actualDir,
-          correct,
-          entryClose: parseFloat(entryClose.toFixed(0)),
-          exitClose: exitClose != null ? parseFloat(exitClose.toFixed(0)) : null,
-        });
+      const history = historyResult?.history ?? [];
+      if (history.length < 50) {
+        return res.json({ error: `Insufficient candle history (have ${history.length}, need ≥50)` });
       }
-      const signaled = results.filter((r) => r.signaled);
-      const correct = signaled.filter((r) => r.correct === true);
+      const candles: BacktestCandle[] = history.map((c) => ({
+        time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+      }));
+      const result = runBacktest(candles, {
+        windows: 40,
+        minConfidence: 0,   // include all signaled — preserves "every signal" shape
+        minEdge: 0,
+        betUsdc: 1,
+        slippage: 0.02,
+        feeUsdc: 0,
+        maxNormalizedAtr: 1,
+      });
       res.json({
-        totalWindows: results.length,
-        signaledCount: signaled.length,
-        correctCount: correct.length,
-        winRate: signaled.length > 0 ? parseFloat(((correct.length / signaled.length) * 100).toFixed(1)) : null,
-        results,
+        deprecated: "Use /api/backtest/replay for the honest backtester.",
+        totalWindows: result.totalWindows,
+        signaledCount: result.signaled,
+        correctCount: result.wins,
+        winRate: result.winRate || null,
+        netPnl: result.netPnl,
+        brier: result.brier,
+        results: result.trades.map((t) => ({
+          ts: t.windowStart,
+          signaled: true,
+          signalDirection: t.direction,
+          actualDir: t.btcMovePct >= 0 ? "UP" : "DOWN",
+          correct: t.outcome === "WIN",
+          confidence: t.confidence,
+          entryClose: parseFloat(t.btcOpen.toFixed(0)),
+          exitClose: parseFloat(t.btcClose.toFixed(0)),
+          pnl: t.pnl,
+        })),
       });
     } catch (err: any) {
       res.json({ error: err?.message || "Backtest failed" });
