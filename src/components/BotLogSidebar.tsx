@@ -538,11 +538,11 @@ function BotMessage({ entry }: { entry: BotLogEntry }) {
         </div>
       )}
 
-      {/* Confidence + edge (trade decisions only) */}
+      {/* Confidence + price headroom (trade decisions only) */}
       {entry.confidence > 0 && (
         <div className="flex items-center gap-3 mb-1.5 text-[10px]">
           <span className="text-zinc-500">Conf: <span className="text-zinc-200 font-bold">{entry.confidence}%</span></span>
-          <span className="text-zinc-500">Edge: <span className="text-zinc-200 font-bold">{entry.edge}¢</span></span>
+          <span className="text-zinc-500">Headroom: <span className="text-zinc-200 font-bold">{(entry.edge * 100).toFixed(1)}¢</span></span>
         </div>
       )}
 

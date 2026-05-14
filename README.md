@@ -11,10 +11,10 @@
 | **Multi-Asset** | Scan BTC, ETH, dan SOL secara paralel setiap 5 menit — masing-masing dengan indikator, divergence threshold, dan analisa AI sendiri |
 | **FastLoop Momentum** | Volume-weighted momentum dari 5 candle 1-menit terakhir (terinspirasi Simmer SDK) — arah, kekuatan (STRONG/MODERATE/WEAK), dan akselerasi |
 | **Divergence Fast Path ⚡** | Bypass Gemini AI sepenuhnya saat STRONG divergence terdeteksi — eksekusi dalam <1s vs ~3s |
-| **Correlated Multi-Asset Entry** | Saat BTC diverge STRONG, bot otomatis masuk ETH+SOL di arah yang sama (70% Kelly) — manfaatkan price lag lintas aset |
+| **Correlated Multi-Asset Entry** | Dinonaktifkan untuk mode BTC-only; tidak ada position sizing berbasis confidence |
 | **AI Analysis** | Google Gemini menganalisa order book, indikator teknikal, FastLoop momentum, dan sentimen pasar sebelum tiap keputusan trade |
 | **Pressure Alignment Filter** | Hanya trade saat arah order book (BUY/SELL pressure) searah dengan sinyal — dari data: BUY_PRESSURE 67% WR vs SELL_PRESSURE 20% WR |
-| **Dynamic Kelly Fraction** | Kelly fraction naik otomatis seiring confidence: 65-74%→25%, 75-84%→50%, 85-89%→55%, ≥90%→65% |
+| **Flat Auto-Entry Sizing** | Auto-entry memakai fixed size dari konfigurasi; confidence hanya menjadi quality gate |
 | **Profit Lock** | Saat posisi mencapai 70% dari jarak TP, trailing stop otomatis dikencangkan ke 3¢ — kunci profit sebelum reversal |
 | **Spike Capture** | Jika dalam 90 detik pertama posisi sudah naik +8¢, langsung exit — ambil spike sebelum mean-revert |
 | **TP/SL Monitor 3s** | Monitor posisi setiap 3 detik (bukan 10s) — tidak ada lagi spike TP yang terlewat |
@@ -27,9 +27,9 @@
 | **Window AI Cache** | Gemini hanya dipanggil sekali per window; price-gate retry hanya re-fetch order book (~0.5s) |
 | **Technical Indicators** | RSI(14), EMA(9/21), MACD, Bollinger Bands, volume spike, signal score alignment |
 | **Adaptive Learning** | Bot menyimpan pola loss **dan win**, menyesuaikan confidence per aset, dan memberi Gemini konteks setup yang berhasil/gagal |
-| **Volatility-Adjusted Kelly** | Bet size dikurangi otomatis saat pasar choppy (ATR > baseline) |
+| **Volatility Gate** | Entry diblokir saat pasar terlalu choppy berdasarkan ATR ternormalisasi |
 | **Near-Expiry Exit** | Posisi profitable dipaksa keluar ≤60 detik sebelum window tutup |
-| **Bot Mode** | Mode AGGRESSIVE (default) dan CONSERVATIVE — beda threshold confidence, Kelly, max bet, dan session loss limit |
+| **Bot Mode** | Mode AGGRESSIVE (default) dan CONSERVATIVE — beda threshold confidence, headroom harga, max bet, dan session loss limit |
 | **Push Notifications** | Alert Telegram dan Discord saat trade dieksekusi atau divergence STRONG terdeteksi |
 | **Analytics** | Win rate per jam (UTC), per kekuatan divergence, per arah (UP/DOWN) |
 | **TP/SL Automation** | Take profit, stop loss, dan trailing stop per posisi dari UI — dengan profit lock dan spike capture |
@@ -304,7 +304,7 @@ MONGODB_POSITION_AUTOMATION_COLLECTION=position_automation
 | Parameter | AGGRESSIVE | CONSERVATIVE |
 |---|---|---|
 | Min Confidence | 75% | 75% |
-| Min Edge | 0.15¢ | 0.15¢ |
+| Min Price Headroom | 15¢ | 15¢ |
 | Fixed Trade Size | $1 | $1 |
 | Max Bet | Not used for auto-entry | Not used for auto-entry |
 | Session Loss Limit | 30% | 15% |

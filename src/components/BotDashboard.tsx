@@ -75,7 +75,6 @@ interface BotStatus {
   config: {
     minConfidence: number;
     minEdge: number;
-    kellyFraction: number;
     maxBetUsdc: number;
     fixedTradeUsdc?: number;
     sessionLossLimit: number;
@@ -1529,7 +1528,7 @@ export default function BotDashboard() {
           </div>
           <div className="text-[10px] text-zinc-600 space-y-0.5">
             <div className="flex items-center gap-2">
-              <span>Conf ≥{status?.config.minConfidence ?? 70}% | Edge ≥{status?.config.minEdge ?? 10}¢ | Window {status?.config.entryWindowStart ?? 10}s–{status?.config.entryWindowEnd ?? 280}s</span>
+              <span>Conf ≥{status?.config.minConfidence ?? 70}% | Headroom ≥{((status?.config.minEdge ?? 0.10) * 100).toFixed(0)}¢ | Window {status?.config.entryWindowStart ?? 10}s–{status?.config.entryWindowEnd ?? 280}s</span>
               <button
                 type="button"
                 onClick={handleResetConfidence}
@@ -1626,12 +1625,12 @@ export default function BotDashboard() {
                 <span>50%</span><span>60%</span><span>70%</span><span>80%</span><span>95%</span>
               </div>
             </div>
-            {/* Min Edge */}
+            {/* Min Headroom */}
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-[10px]">
-                <span className="text-zinc-400">Min Edge</span>
+                <span className="text-zinc-400">Min Headroom</span>
                 <span className="font-mono text-blue-400">
-                  {edgeInput !== "" ? `${Number(edgeInput).toFixed(2)}¢` : `${(status?.config.minEdge ?? 0.10).toFixed(2)}¢ (aktif)`}
+                  {edgeInput !== "" ? `${(Number(edgeInput) * 100).toFixed(0)}¢` : `${((status?.config.minEdge ?? 0.10) * 100).toFixed(0)}¢ (aktif)`}
                 </span>
               </div>
               <input
@@ -1642,7 +1641,7 @@ export default function BotDashboard() {
                 className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-blue-500 bg-zinc-700"
               />
               <div className="flex justify-between text-[9px] text-zinc-600 font-mono">
-                <span>0.01</span><span>0.10</span><span>0.20</span><span>0.30</span>
+                <span>1¢</span><span>10¢</span><span>20¢</span><span>30¢</span>
               </div>
             </div>
             <div className="space-y-1.5">
@@ -1719,17 +1718,6 @@ export default function BotDashboard() {
                 </div>
               </div>
             </div>
-            {/* EV preview */}
-            {confInput !== "" && edgeInput !== "" && (() => {
-              const conf = Number(confInput) / 100;
-              const maxEntry = Math.min(0.75, (Number(confInput) - 10) / 100);
-              const ev = conf * (1 - maxEntry) - (1 - conf) * maxEntry;
-              return (
-                <div className={`text-[10px] font-mono px-2 py-1 rounded ${ev > 0 ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"}`}>
-                  EV @ max entry {(maxEntry * 100).toFixed(0)}¢: {ev > 0 ? "+" : ""}{(ev * 100).toFixed(1)}¢/share {ev > 0 ? "✓" : "✗ negative"}
-                </div>
-              );
-            })()}
             <button
               type="button"
               onClick={handleSaveConfig}
@@ -1892,7 +1880,7 @@ export default function BotDashboard() {
                   )}
                   {snap.edge !== null && (
                     <span className="px-2 py-0.5 rounded-full font-bold bg-zinc-800 text-zinc-300 border border-zinc-700">
-                      Edge {snap.edge}¢
+                      Headroom {(snap.edge * 100).toFixed(1)}¢
                     </span>
                   )}
                   {snap.riskLevel && (
@@ -2144,7 +2132,7 @@ export default function BotDashboard() {
               color: tradeLog ? (tradeLog.totalPnl > 0 ? "text-green-400" : tradeLog.totalPnl < 0 ? "text-red-400" : "text-zinc-500") : "text-zinc-500",
             },
             {
-              label: "Edge Status",
+              label: "Signal Status",
               value: tradeLog?.divergence.winRate != null
                 ? tradeLog.divergence.winRate >= 60 ? "ACTIVE" : tradeLog.divergence.winRate >= 50 ? "MARGINAL" : "GONE"
                 : "MEASURING",

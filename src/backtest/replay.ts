@@ -5,7 +5,7 @@
 //   • applies a configurable slippage on the implied entry price,
 //   • applies a configurable per-trade fee (Polymarket is 0¢ today; future-proof),
 //   • computes net PnL on a flat $ bet, not direction-only accuracy,
-//   • tracks Brier score + calibration buckets on the heuristic confidence,
+//   • tracks declared-vs-realized calibration buckets on the heuristic confidence,
 //   • reports separate counts for SIGNAL (any direction) vs QUALIFIED (≥ thresholds),
 //   • includes a baseline "always buy YES at 0.50" benchmark for honesty.
 //
@@ -28,7 +28,7 @@ export interface BacktestOptions {
   windows: number;
   /** Min heuristic confidence to qualify a trade (matches BOT_MIN_CONFIDENCE). */
   minConfidence: number;
-  /** Min heuristic "edge" (confidence/100 − entryPrice). */
+  /** Min price headroom: maxEntryPriceFor(confidence) - entryPrice. */
   minEdge: number;
   /** Flat bet size in USDC. */
   betUsdc: number;
@@ -45,7 +45,7 @@ export interface BacktestTrade {
   windowStart: number;        // unix sec
   direction: "UP" | "DOWN";
   confidence: number;
-  edge: number;
+  edge: number;                 // legacy field: price headroom
   entryPrice: number;         // 0.50 + slippage
   shares: number;
   outcome: "WIN" | "LOSS";
@@ -75,8 +75,8 @@ export interface BacktestResult {
   winRate: number;            // %
   grossPnl: number;
   netPnl: number;
-  brier: number;              // mean (p_predicted − outcome)^2 across qualified trades
-  logLoss: number;            // mean − [y log p + (1−y) log (1−p)] across qualified trades
+  brier: number | null;        // retained for legacy clients; not computed without calibration
+  logLoss: number | null;      // retained for legacy clients; not computed without calibration
   calibration: CalibrationBucket[];
   // Honest comparison baselines
   baselineAlwaysYesNetPnl: number;
@@ -192,6 +192,10 @@ function computeFastLoop(candles: Candle[]) {
   return { direction, strength, vw };
 }
 
+function maxEntryPriceFor(confidence: number): number {
+  return Math.min(0.75, Math.max(0.40, (confidence - 15) / 100));
+}
+
 // ── SYNTH heuristic — kept faithful to runtime decision path ─────────────────
 function synthDecision(candles: Candle[]):
   | { decision: "TRADE"; direction: "UP" | "DOWN"; confidence: number; reason: string }
@@ -259,7 +263,6 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     "75-85": { sum: 0, wins: 0, n: 0 },
     "85-90": { sum: 0, wins: 0, n: 0 },
   };
-  let brierSum = 0, logLossSum = 0;
   let baselineWins = 0, baselineTotal = 0;
   const baselineEntry = 0.50 + opts.slippage;
 
@@ -304,9 +307,10 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
       continue;
     }
 
-    // Confidence + edge gate
+    // Confidence + price-headroom gate. This intentionally does not interpret
+    // confidence as a win probability.
     const entryPrice = 0.50 + opts.slippage;
-    const edge = dec.confidence / 100 - entryPrice;
+    const edge = maxEntryPriceFor(dec.confidence) - entryPrice;
     if (dec.confidence < opts.minConfidence || edge < opts.minEdge) continue;
     qualified++;
 
@@ -314,14 +318,6 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     const correct = dec.direction === actualDir;
     const payout = correct ? shares * 1.0 : 0;
     const pnl = parseFloat((payout - opts.betUsdc - opts.feeUsdc).toFixed(4));
-
-    // Calibration + scoring
-    const p = dec.confidence / 100;
-    const y = correct ? 1 : 0;
-    brierSum += (p - y) ** 2;
-    // Clip to avoid log(0) blowup
-    const pClip = Math.min(0.999, Math.max(0.001, p));
-    logLossSum += -(y * Math.log(pClip) + (1 - y) * Math.log(1 - pClip));
 
     const bucket =
       dec.confidence < 65 ? "55-65"
@@ -352,8 +348,6 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
   const losses = trades.length - wins;
   const grossPnl = trades.reduce((s, t) => s + (t.outcome === "WIN" ? t.shares - opts.betUsdc : -opts.betUsdc), 0);
   const netPnl = trades.reduce((s, t) => s + t.pnl, 0);
-  const brier = qualified > 0 ? brierSum / qualified : 0;
-  const logLoss = qualified > 0 ? logLossSum / qualified : 0;
 
   const calibration: CalibrationBucket[] = Object.entries(calBuckets)
     .filter(([, v]) => v.n > 0)
@@ -382,8 +376,8 @@ export function runBacktest(candles: Candle[], opts: BacktestOptions): BacktestR
     winRate: trades.length > 0 ? parseFloat(((wins / trades.length) * 100).toFixed(1)) : 0,
     grossPnl: parseFloat(grossPnl.toFixed(2)),
     netPnl: parseFloat(netPnl.toFixed(2)),
-    brier: parseFloat(brier.toFixed(4)),
-    logLoss: parseFloat(logLoss.toFixed(4)),
+    brier: null,
+    logLoss: null,
     calibration,
     baselineAlwaysYesNetPnl: parseFloat(baselineNetPnl.toFixed(2)),
     baselineAlwaysYesWinRate: parseFloat(baselineWinRate.toFixed(1)),

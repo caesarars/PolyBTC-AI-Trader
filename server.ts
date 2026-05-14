@@ -524,8 +524,8 @@ const SESSION_PNL_LOOKBACK_DAYS = 7;
 // ── Bot configuration ────────────────────────────────────────────────────────
 const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
 // `confidence` is a heuristic point score (60 base + alignment + boosts), NOT a calibrated
-// probability. `minEdge` here is a price-buffer gate (confidence/100 − entryPrice), used only
-// to require a markup over fair-coin price before entering. Do not interpret either as EV.
+// probability. `minEdge` is kept as a backward-compatible config/API name, but it now means
+// minimum price headroom: maxEntryPriceFor(confidence, divergence) - entryPrice.
 const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 75);
 const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.15);
 const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
@@ -569,6 +569,23 @@ function getFixedEntryBetAmount(balance: number): number {
   const reserve = Math.min(1.0, balance * 0.10);
   const spendable = Math.max(0, balance - reserve);
   return parseFloat(Math.min(getActiveConfig().fixedTradeUsdc, spendable).toFixed(2));
+}
+
+// ── Confidence is NOT a probability — flat sizing only ───────────────────────
+// `confidence` is a heuristic point score: 60 base + alignScore×5 + boosts,
+// clamped to [55, 90]. It is uncalibrated. Live data shows the 85-95% bucket
+// won 33% of trades, so it is anti-correlated with truth at the tail.
+//
+// Until Phase 2 ships a calibrated logistic-regression probability:
+//   • Sizing is FLAT (getFixedEntryBetAmount), never scaled by confidence.
+//   • Confidence is used ONLY as a quality gate (≥ effectiveMinConf).
+//   • The "edge" / "markup" gate is reframed as an explicit price-cap
+//     (maxEntryPriceFor): "at this heuristic conviction, do not pay more
+//     than X¢ per share". Same numeric cap as before, no probability claim.
+function maxEntryPriceFor(confidence: number, isDivergenceStrong: boolean): number {
+  if (isDivergenceStrong) return 0.80;
+  // 75% conf → max 60¢, 80% → 65¢, 85% → 70¢, 90% → 75¢ (capped).
+  return Math.min(0.75, Math.max(0.40, (confidence - 15) / 100));
 }
 
 // ── Bot runtime state ────────────────────────────────────────────────────────
@@ -2531,18 +2548,18 @@ async function startServer() {
         const bestAsk = (clobAsk > 0 && clobAsk < 0.97) ? clobAsk : divImpliedPrice > 0 ? divImpliedPrice : clobAsk;
         if (bestAsk <= 0) return;
 
-        // Entry price gate — STRONG divergence gets the 85¢ override (same as main cycle)
-        const MAX_ENTRY_PRICE = 0.75;
+        // Entry price gate — STRONG divergence gets the 80¢ override (same as main cycle)
+        const confidence = 78;
+        const MAX_ENTRY_PRICE = maxEntryPriceFor(confidence, true);
         if (bestAsk > MAX_ENTRY_PRICE) {
           botPrint("SKIP", `[DIV FAST] Price too high: ${(bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ — window closed`);
           return;
         }
 
-        const confidence = 78;
-        const estimatedEdge = parseFloat((confidence / 100 - bestAsk).toFixed(2));
-        if (confidence < cfg.minConfidence || estimatedEdge < cfg.minEdge) return;
+        const priceHeadroom = parseFloat((MAX_ENTRY_PRICE - bestAsk).toFixed(4));
+        if (confidence < cfg.minConfidence || priceHeadroom < cfg.minEdge) return;
 
-        // Sizing — fixed bet from runtime config. (Kelly removed: `confidence` is a
+        // Sizing — fixed bet from runtime config. `confidence` is a
         // heuristic point score, not a calibrated probability; sizing on it is unsafe.)
         const balance = lastKnownBalance ?? botSessionStartBalance ?? 0;
         if (balance <= 0) return;
@@ -2567,7 +2584,7 @@ async function startServer() {
           decision: "TRADE",
           direction,
           confidence,
-          estimatedEdge,
+          estimatedEdge: priceHeadroom,
           riskLevel: "MEDIUM",
           reasoning: `[DIV FAST PATH] STRONG divergence: BTC ${snapshot.btcDelta >= 0 ? "+" : ""}$${snapshot.btcDelta.toFixed(0)} in 30s, YES lagging.`,
           candlePatterns: [],
@@ -2592,7 +2609,7 @@ async function startServer() {
         botSessionTradesCount++;
         botPrint("OK", `⚡ FAST PATH EXECUTED ✓ | ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
         void sendNotification(
-          `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Edge: ${estimatedEdge}¢\n(STRONG divergence)`
+          `⚡ <b>FAST PATH TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${confidence}% | Headroom: ${(priceHeadroom * 100).toFixed(1)}¢\n(STRONG divergence)`
         );
 
         const levels = recommendAutomationLevels(bestAsk);
@@ -2621,7 +2638,7 @@ async function startServer() {
           orderId: tradeResult.orderID,
           windowEnd: nowWindowStart + MARKET_SESSION_SECONDS,
           confidence,
-          edge: estimatedEdge,
+          edge: priceHeadroom,
           reasoning: fastRec.reasoning,
           windowElapsedSeconds: now - nowWindowStart,
           asset: fastAsset,
@@ -3462,12 +3479,16 @@ async function startServer() {
             const divBoost = div && (div.strength === "STRONG" || div.strength === "MODERATE") ? 8 : 0;
             const baseConf = alignmentScore === 5 ? 80 : 75;
             const fastConf = Math.min(92, baseConf + divBoost);
-            const fastEdge = parseFloat(((fastConf / 100) - 0.5).toFixed(2));
+            const fastEntryRef = fastPathDir === "UP"
+              ? parseFloat(market.outcomePrices?.[0] ?? "0.5")
+              : parseFloat(market.outcomePrices?.[1] ?? "0.5");
+            const fastMaxEntry = maxEntryPriceFor(fastConf, div?.strength === "STRONG");
+            const fastHeadroom = parseFloat((fastMaxEntry - fastEntryRef).toFixed(4));
             rec = {
-              decision: "TRADE",
+              decision: fastEntryRef > 0 && fastEntryRef <= fastMaxEntry ? "TRADE" : "NO_TRADE",
               direction: fastPathDir,
               confidence: fastConf,
-              estimatedEdge: fastEdge,
+              estimatedEdge: fastHeadroom,
               candlePatterns: [],
               reasoning: `[FAST PATH] ${alignmentScore}/5 signals aligned ${fastPathDir} | FastLoop STRONG vw=${fastMom!.volumeWeighted.toFixed(3)}% accel=${fastMom!.acceleration.toFixed(3)}%${div && div.strength !== "NONE" ? ` | Divergence ${div.strength} ${div.direction}` : ""}${heatData ? ` | heat=${heatData.heatSignal} squeeze=${heatData.squeezeRisk}` : ""}`,
               riskLevel: alignmentScore === 5 ? "LOW" : "MEDIUM",
@@ -3476,7 +3497,7 @@ async function startServer() {
               oppositePressureProbability: 25,
               reversalReasoning: "Fast path — strong multi-signal consensus",
             };
-            botPrint("TRADE", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | edge=${fastEdge}¢${heatData ? ` | heat=${heatData.heatSignal}` : ""}`);
+            botPrint(rec.decision === "TRADE" ? "TRADE" : "SKIP", `⚡ FAST PATH ⚡ ${alignmentScore}/5 aligned ${fastPathDir} | FastLoop STRONG | conf=${fastConf}% | headroom=${(fastHeadroom * 100).toFixed(1)}¢${heatData ? ` | heat=${heatData.heatSignal}` : ""}`);
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
 
           // ── NORMAL PATH: price-lag signal synthesizer ───────
@@ -3533,13 +3554,20 @@ async function startServer() {
               const entryRef  = synthDir === "UP"
                 ? (parseFloat(market.outcomePrices?.[0] ?? "0.5"))
                 : (parseFloat(market.outcomePrices?.[1] ?? "0.5"));
-              const synthEdge = parseFloat(((synthConf / 100) - entryRef).toFixed(4));
+              // Price-cap framing: would we pay this
+              // implied price given our heuristic conviction? Headroom is purely
+              // for display / logging, never for sizing.
+              const isDivergenceStrongForCap = div?.strength === "STRONG" && div.direction === synthDir;
+              const synthMaxEntry = maxEntryPriceFor(synthConf, isDivergenceStrongForCap);
+              const synthHeadroom = parseFloat((synthMaxEntry - entryRef).toFixed(4));
 
               rec = {
-                decision: synthEdge > 0 ? "TRADE" : "NO_TRADE",
+                decision: entryRef > 0 && entryRef <= synthMaxEntry ? "TRADE" : "NO_TRADE",
                 direction: synthDir,
                 confidence: synthConf,
-                estimatedEdge: synthEdge,
+                // `estimatedEdge` retained for back-compat with persisted trade logs.
+                // It now stores the price headroom (maxEntry − entry).
+                estimatedEdge: synthHeadroom,
                 riskLevel,
                 reasoning: `[SYNTH] ${synthDir} | align=${alignScore}/5 | FastLoop=${fastMom?.strength ?? "N/A"} vw=${fastMom?.volumeWeighted?.toFixed(3) ?? "0"}% | div=${div?.strength ?? "NONE"} | tech=${btcIndicatorsData?.signalScore ?? 0} | heat=${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"} | streak-${synthDir}=${lossStreak}L`,
                 candlePatterns: [],
@@ -3548,7 +3576,7 @@ async function startServer() {
                 oppositePressureProbability: 30,
                 reversalReasoning: "Synthesized from local signals",
               };
-              botPrint("INFO", `[SYNTH] ${synthDir} conf=${synthConf}% edge=${synthEdge}¢ align=${alignScore}/5 div=${div?.strength ?? "NONE"} mom=${fastMom?.strength ?? "N/A"} heat=${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
+              botPrint("INFO", `[SYNTH] ${synthDir} conf=${synthConf}% maxEntry=${(synthMaxEntry*100).toFixed(0)}¢ implied=${(entryRef*100).toFixed(0)}¢ headroom=${(synthHeadroom*100).toFixed(1)}¢ align=${alignScore}/5 div=${div?.strength ?? "NONE"} mom=${fastMom?.strength ?? "N/A"} heat=${heatData?.heatSignal ?? "?"} squeeze=${heatData?.squeezeRisk ?? "?"}`);
             }
             currentWindowAiCache.set(currentAsset, { windowStart: currentWindowStart, marketId: market.id, rec });
           }
@@ -3565,7 +3593,7 @@ async function startServer() {
           const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
           botPrint(
             rec.decision === "TRADE" ? "INFO" : "SKIP",
-            `AI Result: ${decisionIcon} ${rec.decision} ${rec.direction} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}¢ | risk=${rec.riskLevel}`
+            `AI Result: ${decisionIcon} ${rec.decision} ${rec.direction} | conf=${rec.confidence}% | headroom=${(rec.estimatedEdge * 100).toFixed(1)}¢ | risk=${rec.riskLevel}`
           );
           botPrint("INFO", `Reasoning: ${rec.reasoning.slice(0, 120)}`);
 
@@ -3607,7 +3635,7 @@ async function startServer() {
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
             if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
-            if (rec.estimatedEdge < cfg.minEdge) reasons.push(`edge ${rec.estimatedEdge}¢ < ${cfg.minEdge}¢`);
+            if (rec.estimatedEdge < cfg.minEdge) reasons.push(`headroom ${(rec.estimatedEdge * 100).toFixed(1)}¢ < ${(cfg.minEdge * 100).toFixed(1)}¢`);
             if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")} | re-check enabled`);
             analyzedThisWindow.delete(market.id); // re-check if divergence or cached conditions improve later this window
@@ -3728,12 +3756,8 @@ async function startServer() {
                   : impliedPrice > 0 ? impliedPrice : clobAsk;
 
                 // ── Dynamic entry price gate ─────────────────────────────────
-                // Raised buffer from 10¢ to 15¢ for better EV per trade.
-                //   75% conf → max 60¢  (EV = +15¢/share)
-                //   80% conf → max 65¢  (EV = +15¢/share)
-                //   85% conf → max 70¢  (EV = +15¢/share)
-                //   90%+ conf → max 75¢ (capped; divergence gets 80¢ exception)
-                // STRONG divergence is a structural edge (real price lag) → allow 80¢.
+                // This is a heuristic price cap. Confidence is not used as
+                // a probability; sizing remains flat unless a calibrated model is wired in.
                 if (bestAsk <= 0) {
                   botPrint("SKIP", `No price data available — skipping for now | re-check enabled`);
                   analyzedThisWindow.delete(market.id);
@@ -3741,9 +3765,7 @@ async function startServer() {
                 }
 
                 const isDivergenceStrong = div?.strength === "STRONG";
-                const MAX_ENTRY_PRICE = isDivergenceStrong
-                  ? 0.80
-                  : Math.min(0.75, (rec.confidence - 15) / 100);
+                const MAX_ENTRY_PRICE = maxEntryPriceFor(rec.confidence, isDivergenceStrong);
                 if (bestAsk > MAX_ENTRY_PRICE) {
                   const priceSource = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD) ? "CLOB" : "AMM";
                   botPrint("SKIP", `Entry price too high: ${priceSource}=${( bestAsk * 100).toFixed(1)}¢ > ${(MAX_ENTRY_PRICE * 100).toFixed(0)}¢ max (conf=${rec.confidence}%${isDivergenceStrong ? ", divergence override" : ""}). Monitoring for better price | re-check enabled`);
@@ -3820,7 +3842,7 @@ async function startServer() {
                   botPrint("TRADE", `Direction : ${rec.direction === "UP" ? "▲ UP (YES)" : "▼ DOWN (NO)"}`);
                   botPrint("TRADE", `Amount    : $${betAmount.toFixed(2)} USDC`);
                   botPrint("TRADE", `Price     : ${(bestAsk * 100).toFixed(1)}¢ (ask) | ${(bestBid * 100).toFixed(1)}¢ (bid)`);
-                  botPrint("TRADE", `Confidence: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`);
+                  botPrint("TRADE", `Confidence: ${rec.confidence}% | Headroom: ${(rec.estimatedEdge * 100).toFixed(1)}¢ | Risk: ${rec.riskLevel}`);
                   try {
                     markTradeExecutionStarted(currentAsset, market.id);
                     const tradeResult = await executePolymarketTrade({
@@ -3856,7 +3878,7 @@ async function startServer() {
                     analyzedThisWindow.add(market.id);
                     botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
                     void sendNotification(
-                      `✅ <b>TRADE EXECUTED</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${rec.direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${rec.confidence}% | Edge: ${rec.estimatedEdge}¢ | Risk: ${rec.riskLevel}`
+                      `✅ <b>TRADE EXECUTED</b>\nMarket: ${market.question?.slice(0, 60) ?? "BTC 5m"}\nDirection: ${rec.direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\nConf: ${rec.confidence}% | Headroom: ${(rec.estimatedEdge * 100).toFixed(1)}¢ | Risk: ${rec.riskLevel}`
                     );
                     botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}¢ distance — automation ARMED`);
                     botPrint("OK", `Session trades: ${botSessionTradesCount} | Balance: ~$${currentBalance.toFixed(2)}`);
@@ -3984,7 +4006,7 @@ async function startServer() {
     console.log("╚═══════════════════════════════════════════════════╝");
     const startCfg = getActiveConfig();
     botPrint("INFO", `Min confidence : ${startCfg.minConfidence}%`);
-    botPrint("INFO", `Min edge       : ${startCfg.minEdge}¢`);
+    botPrint("INFO", `Min headroom   : ${(startCfg.minEdge * 100).toFixed(1)}¢`);
     botPrint("INFO", `Fixed trade    : $${startCfg.fixedTradeUsdc.toFixed(2)} USDC`);
     botPrint("INFO", `Scan interval  : every ${BOT_SCAN_INTERVAL_MS / 1000}s`);
     console.log("");
@@ -4266,7 +4288,7 @@ async function startServer() {
 
   // ── Phase 0 Fix 10: honest backtest ─────────────────────────────────────
   // Replays SYNTH heuristic on real Binance 1-min candles with realistic
-  // entry, slippage, fees, ATR gate, Brier + log-loss calibration, and a
+  // entry, slippage, fees, ATR gate, heuristic-confidence calibration buckets, and a
   // baseline "always buy YES" benchmark. Replaces the old direction-accuracy toy.
   app.post("/api/backtest/replay", async (req, res) => {
     try {
@@ -4412,7 +4434,7 @@ async function startServer() {
       aggressiveEntryWindowEnd = val;
     }
     const cfg = getActiveConfig();
-    botPrint("INFO", `Config updated: conf≥${aggressiveMinConfidence}% edge≥${aggressiveMinEdge}¢ fixed=$${aggressiveFixedTradeUsdc.toFixed(2)} win=[${aggressiveEntryWindowStart}s–${aggressiveEntryWindowEnd}s]`);
+    botPrint("INFO", `Config updated: conf≥${aggressiveMinConfidence}% headroom≥${(aggressiveMinEdge * 100).toFixed(1)}¢ fixed=$${aggressiveFixedTradeUsdc.toFixed(2)} win=[${aggressiveEntryWindowStart}s–${aggressiveEntryWindowEnd}s]`);
     res.json({ ok: true, config: cfg });
   });
 
