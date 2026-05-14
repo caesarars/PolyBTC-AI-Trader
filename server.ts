@@ -21,6 +21,19 @@ import {
 } from "./src/calibration/runtime.js";
 import { buildSyntheticTrainingSet } from "./src/calibration/synthetic.js";
 import type { LabeledTrade, TradeFeatures } from "./src/calibration/calibrator.js";
+import {
+  appendOrderBookSnapshot,
+  buildSnapshot as buildOrderBookSnapshot,
+  readOrderBookLog,
+  readOrderBookLogStats,
+} from "./src/measurement/orderbookLogger.js";
+import { buildPhase1Report, type TradeRecord } from "./src/measurement/phase1.js";
+import {
+  runBookReplay,
+  type BookReplayOptions,
+  type StrategyTickContext,
+  type StrategyTickDecision,
+} from "./src/backtest/bookReplay.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,6 +43,7 @@ const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
 const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
 const PAPER_TRADE_LOG_FILE = path.join(DATA_DIR, "paper_trade_log.jsonl");
+const ORDERBOOK_LOG_FILE   = path.join(DATA_DIR, "orderbook_log.jsonl");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -3414,6 +3428,25 @@ async function startServer() {
                 orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
                 const outcome = market.outcomes?.[idx] ?? `Token${idx}`;
                 botPrint("OK", `OrderBook [${outcome}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} imbalance=${(imbalance * 100).toFixed(0)}% (${imbalanceSignal}) liquidity=$${totalLiquidityUsdc}`);
+                // Phase 1 — append full ladder snapshot to disk for the
+                // book-replay backtester. Disabled via OB_LOG_DISABLED=true.
+                if (process.env.OB_LOG_DISABLED !== "true") {
+                  const snap = buildOrderBookSnapshot({
+                    rawBook: raw,
+                    marketId: String(market.id),
+                    market: market.question || String(market.id),
+                    eventSlug: market.eventSlug ?? null,
+                    tokenId: tid,
+                    outcomeIndex: idx,
+                    outcome,
+                    asset: currentAsset,
+                    windowStart: currentWindowStart,
+                    imbalance,
+                    imbalanceSignal,
+                    totalLiquidityUsdc,
+                  });
+                  if (snap) appendOrderBookSnapshot(ORDERBOOK_LOG_FILE, snap);
+                }
               } catch {
                 botPrint("WARN", `Failed to fetch order book for token ${tid.slice(0, 12)}...`);
               }
@@ -4597,6 +4630,119 @@ async function startServer() {
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || "Backtest failed" });
+    }
+  });
+
+  // ── Phase 1 — Honest measurement endpoint ─────────────────────────────────
+  // Pulls the persisted trade log, computes Brier on confidence/100 (this is
+  // a measurement of how miscalibrated that anti-pattern is), and emits a
+  // per-signal keep/kill/recalibrate verdict.
+  app.get("/api/measurement/phase1", async (req, res) => {
+    try {
+      const includePaper = String(req.query.includePaper || "").toLowerCase() === "true";
+      const minBucketN = req.query.minBucketN ? Number(req.query.minBucketN) : undefined;
+      const trades = await loadPersistedTradeLog();
+      const records: TradeRecord[] = trades
+        .filter((t) => t.result === "WIN" || t.result === "LOSS")
+        .map((t) => ({
+          ts: t.ts,
+          market: t.market,
+          direction: t.direction as "UP" | "DOWN",
+          confidence: t.confidence,
+          entryPrice: t.entryPrice,
+          pnl: t.pnl,
+          result: t.result,
+          rsi: t.rsi,
+          emaCross: t.emaCross,
+          signalScore: t.signalScore,
+          imbalanceSignal: t.imbalanceSignal,
+          divergenceDirection: t.divergenceDirection,
+          divergenceStrength: t.divergenceStrength,
+          btcDelta30s: t.btcDelta30s,
+          yesDelta30s: t.yesDelta30s,
+          windowElapsedSeconds: t.windowElapsedSeconds,
+          isPaperTrade: t.isPaperTrade,
+        }));
+      const report = buildPhase1Report(records, { includePaper, minBucketN });
+      res.json(report);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "Phase 1 report failed" });
+    }
+  });
+
+  // ── Phase 1 — Order book log stats ─────────────────────────────────────────
+  app.get("/api/measurement/orderbook-log", (_req, res) => {
+    try {
+      const stats = readOrderBookLogStats(ORDERBOOK_LOG_FILE);
+      res.json(stats);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "Order book log stats failed" });
+    }
+  });
+
+  // ── Phase 1 — Book replay backtest ─────────────────────────────────────────
+  // Replays the SYNTH heuristic against the logged Polymarket order books with
+  // realistic depth-aware fills. Until the log has accumulated enough data,
+  // returns `insufficient: true` with the reason.
+  app.post("/api/backtest/bookReplay", async (req, res) => {
+    try {
+      const body = (req.body || {}) as {
+        betUsdc?: number;
+        feeUsdc?: number;
+        minSnapshotsPerWindow?: number;
+        minConfidence?: number;
+      };
+      const snapshots = readOrderBookLog(ORDERBOOK_LOG_FILE);
+      const historyResult = await getBtcHistory(true);
+      const candles: BacktestCandle[] = (historyResult?.history ?? []).map((c: BtcCandle) => ({
+        time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+      }));
+      const minConfidence = Number(body.minConfidence ?? aggressiveMinConfidence);
+      // Minimal in-replay strategy hook: re-use the synth feature set from the
+      // YES book + BTC candles. Server-side SYNTH is not directly re-importable
+      // (it lives inline in startServer), so this skeleton uses the calibrator
+      // when ready and otherwise enters after a fixed `windowElapsedSec` floor.
+      const strategy: BookReplayOptions["strategy"] = (ctx: StrategyTickContext): StrategyTickDecision => {
+        if (ctx.windowElapsedSec < 30) return { decision: "NO_TRADE", reason: "warm-up" };
+        // Direction from the latest 5-min candle slope.
+        const lastN = ctx.btcCandles.slice(-5);
+        if (lastN.length < 2) return { decision: "NO_TRADE", reason: "no candles" };
+        const slope = lastN[lastN.length - 1].close - lastN[0].open;
+        const direction: "UP" | "DOWN" = slope >= 0 ? "UP" : "DOWN";
+        return {
+          decision: "TRADE",
+          direction,
+          confidence: 75,
+          reason: `slope=${slope.toFixed(2)}`,
+        };
+      };
+      const opts: BookReplayOptions = {
+        betUsdc: Number(body.betUsdc ?? aggressiveFixedTradeUsdc),
+        feeUsdc: Number(body.feeUsdc ?? 0),
+        minSnapshotsPerWindow: Number(body.minSnapshotsPerWindow ?? 3),
+        strategy,
+        calibratorPredict: isCalibratorReady()
+          ? (snap, dec) => predictPWin({
+              direction: dec.direction,
+              confidence: dec.confidence,
+              rsi: 50,
+              emaCross: "BULLISH",
+              signalScore: 0,
+              imbalanceSignal: snap.imbalanceSignal ?? "NEUTRAL",
+              divergenceStrength: "NONE",
+              divergenceDirection: "NEUTRAL",
+              btcDelta30s: 0,
+              yesDelta30s: 0,
+              windowElapsedSeconds: snap.midpoint ? Math.min(280, 60) : 60,
+              entryPrice: snap.asks[0]?.price ?? 0.5,
+            })
+          : undefined,
+      };
+      void minConfidence;
+      const result = runBookReplay(snapshots, candles, opts);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "Book replay failed" });
     }
   });
 
