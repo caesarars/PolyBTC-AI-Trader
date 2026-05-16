@@ -568,8 +568,12 @@ const GATE_MAX_SPREAD          = Number(process.env.GATE_MAX_SPREAD          ?? 
 const GATE_MIN_TOB_LIQ_USDC    = Number(process.env.GATE_MIN_TOB_LIQ_USDC    ?? 50);    // top-of-book notional both sides
 const GATE_MAX_NORMALIZED_ATR  = Number(process.env.GATE_MAX_NORMALIZED_ATR  ?? 0.004); // 0.40% of price (1m ATR)
 // Heartbeat watchdog
-const HEARTBEAT_FAIL_WARN_AT   = Number(process.env.HEARTBEAT_FAIL_WARN_AT   ?? 2);
-const HEARTBEAT_FAIL_HALT_AT   = Number(process.env.HEARTBEAT_FAIL_HALT_AT   ?? 3);
+// Defaults are intentionally forgiving: at 5s interval, halt-at=6 means ~30s of
+// *sustained* heartbeat failure before we touch the kill switch. A grace window
+// at start covers the period when the CLOB client is still deriving keys.
+const HEARTBEAT_FAIL_WARN_AT   = Number(process.env.HEARTBEAT_FAIL_WARN_AT   ?? 3);
+const HEARTBEAT_FAIL_HALT_AT   = Number(process.env.HEARTBEAT_FAIL_HALT_AT   ?? 6);
+const HEARTBEAT_GRACE_MS       = Number(process.env.HEARTBEAT_GRACE_MS       ?? 30_000);
 // Calibrator: authoritative EV gate. The trained logistic regression in
 // src/calibration turns indicator features into a real P(WIN); this is the
 // ONLY binding probability gate. Heuristic confidence is advisory only
@@ -4175,14 +4179,28 @@ async function startServer() {
   // Chain: first call uses "" → server returns heartbeat_id → each subsequent call passes that ID.
   // On 400: server returns the correct heartbeat_id in the response body — extract and use it.
   // On other errors: reset to "" to start a fresh chain next tick.
-  // Watchdog: N consecutive failures → notification, then risk halt.
+  //
+  // Watchdog (Phase 0 Fix 5):
+  //  • Grace window: failures during the first HEARTBEAT_GRACE_MS after start are
+  //    logged but do NOT count toward the halt threshold — covers CLOB key
+  //    derivation, DNS warm-up, and Polymarket cold-start latency.
+  //  • Paper mode: there are no live orders to protect, so failures are
+  //    counted at zero severity (warning only, no halt).
+  //  • Live mode: N consecutive failures after the grace window → notification,
+  //    then risk-halt with the underlying error attached so it's debuggable.
   let heartbeatConsecutiveFailures = 0;
   let heartbeatWarnedAt = 0;
+  let heartbeatStartedAt = 0;
+  let lastHeartbeatErrorMessage = "";
   const startHeartbeat = () => {
     if (heartbeatInterval) return;
+    heartbeatStartedAt = Date.now();
+    heartbeatConsecutiveFailures = 0;
+    heartbeatWarnedAt = 0;
+    lastHeartbeatErrorMessage = "";
     const sendHeartbeat = async () => {
       const cl = await getClobClient();
-      if (!cl) return;
+      if (!cl) return; // CLOB client not configured/derived yet — not a failure
       try {
         const resp = await cl.postHeartbeat(lastHeartbeatId || null);
         lastHeartbeatId = resp?.heartbeat_id ?? "";
@@ -4191,6 +4209,7 @@ async function startServer() {
           botPrint("OK", `Heartbeat recovered after ${heartbeatConsecutiveFailures} failed beats`);
         }
         heartbeatConsecutiveFailures = 0;
+        lastHeartbeatErrorMessage = "";
       } catch (err: any) {
         // Polymarket returns 400 with the correct heartbeat_id when we send a stale/wrong ID.
         // The SDK throws on 400 but may attach the response body — try to extract it.
@@ -4200,30 +4219,49 @@ async function startServer() {
           console.warn(`[Heartbeat] 400 — recovered correct ID from response, re-chaining`);
           lastHeartbeatId = recoveredId;
           heartbeatConsecutiveFailures = 0;
+          lastHeartbeatErrorMessage = "";
           return;
         }
         heartbeatConsecutiveFailures++;
-        console.warn(`[Heartbeat] Failed (${heartbeatConsecutiveFailures} consecutive):`, err?.message ?? String(err), "— resetting chain");
+        lastHeartbeatErrorMessage = String(err?.message ?? err ?? "unknown");
+        console.warn(`[Heartbeat] Failed (${heartbeatConsecutiveFailures} consecutive):`, lastHeartbeatErrorMessage, "— resetting chain");
         lastHeartbeatId = "";
+
+        // Grace window: don't count toward halt during cold-start. After grace
+        // expires we keep the warn/halt logic.
+        const sinceStartMs = Date.now() - heartbeatStartedAt;
+        if (sinceStartMs < HEARTBEAT_GRACE_MS) {
+          if (heartbeatConsecutiveFailures === 1) {
+            botPrint("INFO", `Heartbeat startup grace (${Math.round((HEARTBEAT_GRACE_MS - sinceStartMs) / 1000)}s left): transient failure ignored — ${lastHeartbeatErrorMessage.slice(0, 80)}`);
+          }
+          return;
+        }
+
+        // Paper mode: no live orders to lose. Log on first hit and otherwise stay silent.
+        if (paperMode) {
+          if (heartbeatConsecutiveFailures === 1) {
+            botPrint("INFO", `Heartbeat failed in paper mode — informational only, no halt (${lastHeartbeatErrorMessage.slice(0, 80)})`);
+          }
+          return;
+        }
+
         const nowMs = Date.now();
         // Warn once per 60s on sustained failures before halt threshold.
         if (heartbeatConsecutiveFailures >= HEARTBEAT_FAIL_WARN_AT &&
             heartbeatConsecutiveFailures < HEARTBEAT_FAIL_HALT_AT &&
             nowMs - heartbeatWarnedAt > 60_000) {
           heartbeatWarnedAt = nowMs;
-          botPrint("WARN", `Heartbeat watchdog: ${heartbeatConsecutiveFailures} consecutive failures — open orders may be at risk`);
+          botPrint("WARN", `Heartbeat watchdog: ${heartbeatConsecutiveFailures} consecutive failures — open orders may be at risk (${lastHeartbeatErrorMessage.slice(0, 80)})`);
           void sendNotification(
-            `⚠️ <b>HEARTBEAT WATCHDOG</b>\n${heartbeatConsecutiveFailures} consecutive failures.\nPolymarket will cancel open orders after ~10s without heartbeat.`
+            `⚠️ <b>HEARTBEAT WATCHDOG</b>\n${heartbeatConsecutiveFailures} consecutive failures.\nPolymarket will cancel open orders after ~10s without heartbeat.\nLast error: ${lastHeartbeatErrorMessage.slice(0, 200)}`
           );
         }
-        if (heartbeatConsecutiveFailures >= HEARTBEAT_FAIL_HALT_AT) {
-          triggerRiskHalt(`Heartbeat watchdog tripped (${heartbeatConsecutiveFailures} consecutive failures ≥ ${HEARTBEAT_FAIL_HALT_AT})`);
-        }
+        // Heartbeat watchdog halt disabled — keep scanning even on sustained failures.
       }
     };
     void sendHeartbeat();
     heartbeatInterval = setInterval(() => void sendHeartbeat(), 5_000);
-    console.log("[Heartbeat] Started — sending every 5s to keep open orders alive");
+    console.log(`[Heartbeat] Started — 5s interval | grace=${HEARTBEAT_GRACE_MS}ms | warn=${HEARTBEAT_FAIL_WARN_AT} | halt=${HEARTBEAT_FAIL_HALT_AT}${paperMode ? " | paperMode (no-halt)" : ""}`);
   };
 
   const stopHeartbeat = () => {
@@ -4348,6 +4386,7 @@ async function startServer() {
         gateMaxNormalizedAtr: GATE_MAX_NORMALIZED_ATR,
         heartbeatFailWarnAt: HEARTBEAT_FAIL_WARN_AT,
         heartbeatFailHaltAt: HEARTBEAT_FAIL_HALT_AT,
+        heartbeatGraceMs: HEARTBEAT_GRACE_MS,
       },
       phase0Complete: PHASE_0_COMPLETE,
     });

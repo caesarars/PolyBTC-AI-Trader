@@ -82,6 +82,11 @@ interface BotStatus {
     entryWindowEnd?: number;
     scanIntervalMs: number;
   };
+  riskHalt?: {
+    halted: boolean;
+    reason: string;
+    haltedAt: number;
+  };
 }
 
 interface BotLogEntry {
@@ -312,6 +317,7 @@ export default function BotDashboard() {
   const [controlLoading, setControlLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [resetConfLoading, setResetConfLoading] = useState(false);
+  const [resetRiskLoading, setResetRiskLoading] = useState(false);
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
@@ -446,6 +452,16 @@ export default function BotDashboard() {
       await fetchAll();
     } finally {
       setResetConfLoading(false);
+    }
+  };
+
+  const handleResetRisk = async () => {
+    setResetRiskLoading(true);
+    try {
+      await fetch("/api/risk/reset", { method: "POST" });
+      await fetchAll();
+    } finally {
+      setResetRiskLoading(false);
     }
   };
 
@@ -1526,6 +1542,26 @@ export default function BotDashboard() {
               Stop
             </button>
           </div>
+          {status?.riskHalt?.halted && (
+            <div className="text-[10px] text-red-300 bg-red-500/10 border border-red-500/30 rounded p-1.5 leading-tight">
+              <span className="font-bold">🛑 RISK HALT:</span> {status.riskHalt.reason}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={handleResetRisk}
+            disabled={resetRiskLoading}
+            title="Clear risk halt state and re-enable trading"
+            className={cn(
+              "w-full py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider transition-all",
+              status?.riskHalt?.halted
+                ? "bg-amber-500 text-black hover:bg-amber-400"
+                : "bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700 hover:text-white",
+              resetRiskLoading && "opacity-50 cursor-wait"
+            )}
+          >
+            {resetRiskLoading ? "Resetting…" : "Reset Risk State"}
+          </button>
           <div className="text-[10px] text-zinc-600 space-y-0.5">
             <div className="flex items-center gap-2">
               <span>Conf ≥{status?.config.minConfidence ?? 70}% | Headroom ≥{((status?.config.minEdge ?? 0.10) * 100).toFixed(0)}¢ | Window {status?.config.entryWindowStart ?? 10}s–{status?.config.entryWindowEnd ?? 280}s</span>
