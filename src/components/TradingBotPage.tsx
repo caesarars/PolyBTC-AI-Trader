@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { RefreshCw } from "lucide-react";
 import BotDashboard from "./BotDashboard";
-import PaperTradeWidget from "./PaperTradeWidget";
 import BotLogSidebar from "./BotLogSidebar";
 
 function cn(...inputs: any[]) {
@@ -123,12 +122,6 @@ export default function TradingBotPage() {
       </div>
 
       <BotDashboard />
-
-      <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="md:col-span-1">
-          <PaperTradeWidget />
-        </div>
-      </div>
 
       <footer className="mt-20 pt-6 border-t border-zinc-900 text-center text-zinc-700 text-[11px]">
         © 2026 PolyBTC AI Trader · Personal use · Not financial advice

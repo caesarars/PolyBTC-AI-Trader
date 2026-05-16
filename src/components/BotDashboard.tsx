@@ -35,8 +35,6 @@ import {
   ReferenceLine,
   CartesianGrid,
 } from "recharts";
-import PaperTradeWidget from "./PaperTradeWidget";
-
 function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(" ");
 }
@@ -65,7 +63,6 @@ interface EntrySnapshot {
 interface BotStatus {
   enabled: boolean;
   running: boolean;
-  paperMode: boolean;
   sessionStartBalance: number | null;
   sessionTradesCount: number;
   windowElapsedSeconds: number;
@@ -354,7 +351,6 @@ export default function BotDashboard() {
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
-  const [paperStats, setPaperStats] = useState<{ total: number; wins: number; losses: number; winRate: number; totalPnl: number } | null>(null);
   const [confInput, setConfInput] = useState<string>("");
   const [edgeInput, setEdgeInput] = useState<string>("");
   const [fixedTradeInput, setFixedTradeInput] = useState<number | null>(null);
@@ -383,7 +379,7 @@ export default function BotDashboard() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, paperStatsRes, momRes, notifRes, analyticsRes, calibRes, learningRes, heatRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes, sessionTradeLogRes, momRes, notifRes, analyticsRes, calibRes, learningRes, heatRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
@@ -391,7 +387,6 @@ export default function BotDashboard() {
         fetch("/api/polymarket/balance").then((r) => r.json()),
         fetch("/api/bot/trade-log?limit=50").then((r) => r.json()),
         fetch("/api/bot/trade-log?days=7&limit=1000").then((r) => r.json()),
-        fetch("/api/bot/paper-trade-stats").then((r) => r.json()),
         fetch("/api/bot/momentum-history").then((r) => r.json()),
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
@@ -411,7 +406,6 @@ export default function BotDashboard() {
       if (autoRes.status === "fulfilled") setAutomations((autoRes.value as any).automations || []);
       if (tradeLogRes.status === "fulfilled") setTradeLog(tradeLogRes.value as TradeLogStats);
       if (sessionTradeLogRes.status === "fulfilled") setSessionTradeLog(sessionTradeLogRes.value as TradeLogStats);
-      if (paperStatsRes.status === "fulfilled") setPaperStats(paperStatsRes.value as any);
       if (balRes.status === "fulfilled" && !(balRes.value as any).error) {
         setBalance((balRes.value as any).balance || "—");
       }
@@ -536,7 +530,7 @@ export default function BotDashboard() {
       } else {
         setManualTradeMsg({
           type: "ok",
-          text: `Order ${data.orderId} | ${direction === "UP" ? "▲ UP" : "▼ DOWN"} @ ${(data.entryPrice * 100).toFixed(1)}¢ | $${data.spent.toFixed(2)}${data.paperMode ? " (paper)" : ""}`,
+          text: `Order ${data.orderId} | ${direction === "UP" ? "▲ UP" : "▼ DOWN"} @ ${(data.entryPrice * 100).toFixed(1)}¢ | $${data.spent.toFixed(2)}`,
         });
       }
       await fetchAll();
@@ -1679,42 +1673,6 @@ export default function BotDashboard() {
               </button>
             </div>
             <div>Fixed ${status?.config.fixedTradeUsdc ?? 1} per trade | Loss limit {((status?.config.sessionLossLimit ?? 0.1) * 100).toFixed(0)}%</div>
-            <div className="flex items-center gap-2">
-              <span className={cn("text-[10px] font-bold uppercase tracking-wide", status?.paperMode ? "text-amber-400" : "text-zinc-500")}>
-                {status?.paperMode ? "📄 Paper Mode ON" : "Paper Mode OFF"}
-              </span>
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    await fetch("/api/bot/paper-mode", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ enabled: !status?.paperMode }),
-                    });
-                    await fetchAll();
-                  } catch {}
-                }}
-                className={cn(
-                  "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide transition-colors",
-                  status?.paperMode
-                    ? "bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
-                    : "bg-zinc-700 text-zinc-400 hover:bg-zinc-600 hover:text-white"
-                )}
-              >
-                {status?.paperMode ? "Disable" : "Enable"}
-              </button>
-            </div>
-            {paperStats && paperStats.total > 0 && (
-              <div className="flex items-center gap-2 text-[10px]">
-                <span className="text-zinc-500">Paper trades:</span>
-                <span className="font-mono font-bold text-amber-400">{paperStats.wins}W / {paperStats.losses}L</span>
-                <span className="text-zinc-600">|</span>
-                <span className={cn("font-mono font-bold", paperStats.winRate >= 55 ? "text-green-400" : "text-red-400")}>{paperStats.winRate}% WR</span>
-                <span className="text-zinc-600">|</span>
-                <span className={cn("font-mono font-bold", paperStats.totalPnl >= 0 ? "text-green-400" : "text-red-400")}>{paperStats.totalPnl >= 0 ? "+" : ""}${paperStats.totalPnl.toFixed(2)}</span>
-              </div>
-            )}
           </div>
         </div>
 
@@ -1896,13 +1854,6 @@ export default function BotDashboard() {
             <div className="text-xs text-zinc-500 mt-1">{performance?.openPositions.length ?? 0} open positions</div>
           </div>
           <div className="text-[10px] text-zinc-600">{armedCount} automations armed</div>
-        </div>
-      </div>
-
-      {/* ── Paper Trade Widget ── */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="md:col-span-1">
-          <PaperTradeWidget />
         </div>
       </div>
 

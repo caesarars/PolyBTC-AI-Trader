@@ -43,7 +43,6 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR        = path.join(__dirname, "data");
 const LOSS_MEMORY_FILE = path.join(DATA_DIR, "loss_memory.json");
 const TRADE_LOG_FILE   = path.join(DATA_DIR, "trade_log.jsonl");
-const PAPER_TRADE_LOG_FILE = path.join(DATA_DIR, "paper_trade_log.jsonl");
 const ORDERBOOK_LOG_FILE   = path.join(DATA_DIR, "orderbook_log.jsonl");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -68,7 +67,6 @@ interface TradeLogEntry {
   yesDelta30s?: number;
   windowElapsedSeconds: number;
   orderId: string | null;
-  isPaperTrade?: boolean;
 }
 
 type ResolvedOrderMeta = {
@@ -160,13 +158,6 @@ async function loadPersistedTradeLog(): Promise<TradeLogEntry[]> {
   }
 
   if (trades.length === 0) trades = loadTradeLog();
-
-  // Merge paper trades
-  const paperTrades = loadPaperTradeLog();
-  if (paperTrades.length > 0) {
-    trades = trades.concat(paperTrades);
-    trades.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
-  }
   return trades;
 }
 
@@ -303,27 +294,6 @@ function loadTradeLog(): TradeLogEntry[] {
       .map((line) => JSON.parse(line) as TradeLogEntry);
   } catch (e: any) {
     console.error("[Persist] Failed to read trade_log.jsonl:", e.message);
-    return [];
-  }
-}
-
-function savePaperTradeLog(entry: TradeLogEntry): void {
-  try {
-    fs.appendFileSync(PAPER_TRADE_LOG_FILE, JSON.stringify({ ...entry, isPaperTrade: true }) + "\n", "utf8");
-  } catch (e: any) {
-    console.error("[Persist] Failed to write paper_trade_log.jsonl:", e.message);
-  }
-}
-
-function loadPaperTradeLog(): TradeLogEntry[] {
-  try {
-    if (!fs.existsSync(PAPER_TRADE_LOG_FILE)) return [];
-    return fs.readFileSync(PAPER_TRADE_LOG_FILE, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as TradeLogEntry);
-  } catch (e: any) {
-    console.error("[Persist] Failed to read paper_trade_log.jsonl:", e.message);
     return [];
   }
 }
@@ -558,7 +528,6 @@ const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
 const BOT_FIXED_TRADE_USDC = Number(process.env.BOT_FIXED_TRADE_USDC || 1);
 
 // ── Phase 0 risk / safety config ─────────────────────────────────────────────
-// Live mode is gated behind PHASE_0_COMPLETE=true. Until set, paper mode is forced.
 const PHASE_0_COMPLETE = process.env.PHASE_0_COMPLETE === "true";
 const RISK_MAX_DRAWDOWN_PCT  = Number(process.env.RISK_MAX_DRAWDOWN_PCT  ?? 10);
 const RISK_MAX_CONSEC_LOSSES = Number(process.env.RISK_MAX_CONSEC_LOSSES ?? 5);
@@ -647,7 +616,6 @@ async function maybeRetrainCalibratorFromTradeLog(): Promise<void> {
     const trades = await loadPersistedTradeLog();
     const labeled: LabeledTrade[] = [];
     for (const t of trades) {
-      if (t.isPaperTrade) continue;
       if (t.result !== "WIN" && t.result !== "LOSS") continue;
       labeled.push({
         direction: t.direction as "UP" | "DOWN",
@@ -683,14 +651,6 @@ async function maybeRetrainCalibratorFromTradeLog(): Promise<void> {
 // ── Bot runtime state ────────────────────────────────────────────────────────
 let botEnabled = process.env.BOT_AUTO_START === "true";
 let botRunning = false;
-// Phase 0: paper mode is forced ON until PHASE_0_COMPLETE=true is set in env.
-let paperMode = (!PHASE_0_COMPLETE) || process.env.PAPER_MODE === "true";
-if (!PHASE_0_COMPLETE) {
-  console.warn("┌─────────────────────────────────────────────────────────────┐");
-  console.warn("│ PHASE 0 NOT COMPLETE — paper mode FORCED. Live trades       │");
-  console.warn("│ are disabled. Set PHASE_0_COMPLETE=true to allow real fills.│");
-  console.warn("└─────────────────────────────────────────────────────────────┘");
-}
 let botInterval: NodeJS.Timeout | null = null;
 let botSessionStartBalance: number | null = null;
 let botSessionPeakBalance: number | null = null;
@@ -875,7 +835,6 @@ interface PendingResult {
   signalScore?: number;
   imbalanceSignal?: string;
   asset?: TradingAsset;
-  isPaperTrade?: boolean;
 }
 const pendingResults = new Map<string, PendingResult>();
 
@@ -2405,32 +2364,6 @@ async function startServer() {
     executionMode?: "MANUAL" | "PASSIVE" | "AGGRESSIVE";
     amountMode?: "SPEND" | "SIZE";
   }) => {
-    if (paperMode) {
-      const parsedAmount = Number(amount);
-      const parsedSide = String(side || "BUY").toUpperCase() as Side;
-      const parsedPrice = Number(price) || 0.5;
-      const normalizedAmountMode = amountMode || (parsedSide === Side.BUY ? "SPEND" : "SIZE");
-      const orderSize = normalizedAmountMode === "SIZE"
-        ? parsedAmount
-        : parsedSide === Side.BUY
-          ? parsedAmount / parsedPrice
-          : parsedAmount;
-      return {
-        success: true,
-        orderID: `PAPER-${Date.now()}`,
-        status: "PENDING",
-        tickSize: 0.01,
-        negRisk: false,
-        orderSize: Number(orderSize.toFixed(6)),
-        spendingAmount: normalizedAmountMode === "SPEND" ? parsedAmount : Number((parsedAmount * parsedPrice).toFixed(6)),
-        executionMode: String(executionMode || "MANUAL").toUpperCase(),
-        amountMode: normalizedAmountMode,
-        limitPriceUsed: parsedPrice,
-        marketSnapshot: { bestBid: null, bestAsk: null, spread: null, distanceToMarket: 0 },
-        raw: null,
-      };
-    }
-
     const client = await getClobClient();
     if (!client) {
       throw new Error("CLOB client not initialized. Check credentials.");
@@ -2779,7 +2712,6 @@ async function startServer() {
           reasoning: fastRec.reasoning,
           windowElapsedSeconds: now - nowWindowStart,
           asset: fastAsset,
-          isPaperTrade: paperMode,
         });
         botPrint("INFO", `Result tracker armed — checking after ${new Date((nowWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
 
@@ -3117,27 +3049,24 @@ async function startServer() {
 
       botPrint("INFO", `Result resolved via [${resolvedSource}] → ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
 
-      // ── Daily PnL accounting (live trades only) ─────────────────────────
-      if (!pending.isPaperTrade) recordDailyPnl(pnl);
+      // ── Daily PnL accounting ────────────────────────────────────────────
+      recordDailyPnl(pnl);
 
       if (won_final) {
-        if (!pending.isPaperTrade) {
-          // ── WIN: relax adaptive threshold (per-asset) ──────────────────────
-          const pendingAsset = pending.asset ?? "BTC";
-          const cWins  = (consecutiveWinsByAsset.get(pendingAsset)  ?? 0) + 1;
-          const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
-          consecutiveWinsByAsset.set(pendingAsset, cWins);
-          consecutiveLossesByAsset.set(pendingAsset, 0);
-          if (cWins >= 2 && cBoost > 0) {
-            const newBoost = Math.max(cBoost - 3, 0);
-            adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-            botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
-          }
+        // ── WIN: relax adaptive threshold (per-asset) ──────────────────────
+        const pendingAsset = pending.asset ?? "BTC";
+        const cWins  = (consecutiveWinsByAsset.get(pendingAsset)  ?? 0) + 1;
+        const cBoost =  adaptiveConfidenceByAsset.get(pendingAsset) ?? 0;
+        consecutiveWinsByAsset.set(pendingAsset, cWins);
+        consecutiveLossesByAsset.set(pendingAsset, 0);
+        if (cWins >= 2 && cBoost > 0) {
+          const newBoost = Math.max(cBoost - 3, 0);
+          adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
+          botPrint("OK", `[${pendingAsset}] Adaptive: streak=${cWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + newBoost}% (boost=${newBoost > 0 ? `+${newBoost}%` : "none"})`);
         }
-        const paperTag = pending.isPaperTrade ? " [PAPER]" : "";
-        botPrint("OK", `━━━ 🏆 WIN${paperTag} ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        botPrint("OK", `━━━ 🏆 WIN ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         const winLesson = generateWinLesson(pending);
-        if (!pending.isPaperTrade) winMemory.unshift({
+        winMemory.unshift({
           timestamp: new Date().toISOString(),
           market: pending.market,
           asset: pending.asset,
@@ -3154,10 +3083,10 @@ async function startServer() {
           imbalanceSignal: pending.imbalanceSignal,
           lesson: winLesson,
         });
-        if (!pending.isPaperTrade && winMemory.length > 20) winMemory.pop();
+        if (winMemory.length > 20) winMemory.pop();
         botPrint("INFO", `Win pattern recorded: ${winLesson}`);
-        if (!pending.isPaperTrade) saveLearning();
-        (pending.isPaperTrade ? savePaperTradeLog : saveTradeLog)({
+        saveLearning();
+        saveTradeLog({
           ts: new Date().toISOString(),
           market: pending.market,
           direction: pending.direction as "UP" | "DOWN",
@@ -3183,56 +3112,52 @@ async function startServer() {
         const pendingAsset = pending.asset ?? "BTC";
         const lesson = generateLesson(pending);
 
-        if (!pending.isPaperTrade) {
-          const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
-          consecutiveLossesByAsset.set(pendingAsset, cLosses);
-          consecutiveWinsByAsset.set(pendingAsset, 0);
+        const cLosses = (consecutiveLossesByAsset.get(pendingAsset) ?? 0) + 1;
+        consecutiveLossesByAsset.set(pendingAsset, cLosses);
+        consecutiveWinsByAsset.set(pendingAsset, 0);
 
-          lossMemory.unshift({
-            timestamp: new Date().toISOString(),
-            market: pending.market,
-            asset: pending.asset,
-            direction: pending.direction,
-            confidence: pending.confidence,
-            edge: pending.edge,
-            entryPrice: pending.entryPrice,
-            betAmount: pending.betAmount,
-            pnl,
-            windowElapsedSeconds: pending.windowElapsedSeconds,
-            rsi: pending.rsi,
-            emaCross: pending.emaCross,
-            signalScore: pending.signalScore,
-            imbalanceSignal: pending.imbalanceSignal,
-            reasoning: pending.reasoning,
-            lesson,
-          });
-          if (lossMemory.length > 20) lossMemory.pop();
+        lossMemory.unshift({
+          timestamp: new Date().toISOString(),
+          market: pending.market,
+          asset: pending.asset,
+          direction: pending.direction,
+          confidence: pending.confidence,
+          edge: pending.edge,
+          entryPrice: pending.entryPrice,
+          betAmount: pending.betAmount,
+          pnl,
+          windowElapsedSeconds: pending.windowElapsedSeconds,
+          rsi: pending.rsi,
+          emaCross: pending.emaCross,
+          signalScore: pending.signalScore,
+          imbalanceSignal: pending.imbalanceSignal,
+          reasoning: pending.reasoning,
+          lesson,
+        });
+        if (lossMemory.length > 20) lossMemory.pop();
 
-          if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
-            const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
-            adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
-            botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
-          } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
-            botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
-          }
+        if (adaptiveLossPenaltyEnabled && cLosses >= 2) {
+          const newBoost = Math.min((adaptiveConfidenceByAsset.get(pendingAsset) ?? 0) + 5, 20);
+          adaptiveConfidenceByAsset.set(pendingAsset, newBoost);
+          botPrint("WARN", `[${pendingAsset}] Adaptive: streak=${cLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + newBoost}% (+${newBoost}% boost)`);
+        } else if (!adaptiveLossPenaltyEnabled && cLosses >= 2) {
+          botPrint("INFO", `[${pendingAsset}] Adaptive loss penalty disabled — streak=${cLosses}L recorded, threshold unchanged`);
+        }
 
-          // ── Phase 0 risk halts ────────────────────────────────────────────
-          if (cLosses >= RISK_MAX_CONSEC_LOSSES) {
-            triggerRiskHalt(`Consecutive-loss limit hit (${cLosses} ≥ ${RISK_MAX_CONSEC_LOSSES})`);
-          }
-          if (botSessionStartBalance && botSessionStartBalance > 0) {
-            const dailyLoss = -todayPnl(); // positive if losing money
-            const dailyLossPct = (dailyLoss / botSessionStartBalance) * 100;
-            if (dailyLossPct >= RISK_DAILY_LOSS_PCT) {
-              triggerRiskHalt(`Daily loss limit hit (-${dailyLossPct.toFixed(1)}% ≥ -${RISK_DAILY_LOSS_PCT}%)`);
-            }
+        if (cLosses >= RISK_MAX_CONSEC_LOSSES) {
+          triggerRiskHalt(`Consecutive-loss limit hit (${cLosses} ≥ ${RISK_MAX_CONSEC_LOSSES})`);
+        }
+        if (botSessionStartBalance && botSessionStartBalance > 0) {
+          const dailyLoss = -todayPnl();
+          const dailyLossPct = (dailyLoss / botSessionStartBalance) * 100;
+          if (dailyLossPct >= RISK_DAILY_LOSS_PCT) {
+            triggerRiskHalt(`Daily loss limit hit (-${dailyLossPct.toFixed(1)}% ≥ -${RISK_DAILY_LOSS_PCT}%)`);
           }
         }
-        const paperTagLoss = pending.isPaperTrade ? " [PAPER]" : "";
-        botPrint("WARN", `━━━ ✗ LOSS${paperTagLoss} ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
         botPrint("INFO", `Lesson recorded: ${lesson}`);
-        if (!pending.isPaperTrade) saveLearning();
-        (pending.isPaperTrade ? savePaperTradeLog : saveTradeLog)({
+        saveLearning();
+        saveTradeLog({
           ts: new Date().toISOString(),
           market: pending.market,
           direction: pending.direction as "UP" | "DOWN",
@@ -3263,7 +3188,7 @@ async function startServer() {
         confidence: 0,
         edge: 0,
         riskLevel: "LOW",
-        reasoning: `${pending.isPaperTrade ? "[PAPER] " : ""}Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
+        reasoning: `Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
         tradeExecuted: false,
         tradeAmount: pending.betAmount,
         tradePrice: pending.entryPrice,
@@ -3274,8 +3199,7 @@ async function startServer() {
       pendingResults.delete(tokenId);
 
       // Refresh the calibrator with the new outcome (debounced internally).
-      // Live trades only; paper outcomes are excluded inside the helper.
-      if (!pending.isPaperTrade) void maybeRetrainCalibratorFromTradeLog();
+      void maybeRetrainCalibratorFromTradeLog();
     }
   };
 
@@ -3582,9 +3506,9 @@ async function startServer() {
             if (bias60 === "UP") _localBullish++; else if (bias60 === "DOWN") _localBearish++;
           }
           if (_hist.length >= 5) {
-            const recent5 = _hist.slice(-5);
-            const up5 = recent5.filter(c => c.close > c.open).length;
-            const dn5 = recent5.filter(c => c.close < c.open).length;
+            const recent5: BtcCandle[] = _hist.slice(-5);
+            const up5 = recent5.filter((c) => c.close > c.open).length;
+            const dn5 = recent5.filter((c) => c.close < c.open).length;
             if (up5 >= 3) _localBullish++; else if (dn5 >= 3) _localBearish++;
           }
           if (_hist.length >= 2) {
@@ -4143,7 +4067,6 @@ async function startServer() {
                       signalScore: btcIndicatorsData?.signalScore,
                       imbalanceSignal: orderBooks[tokenId]?.imbalanceSignal,
                       asset: currentAsset,
-                      isPaperTrade: paperMode,
                     });
                     botPrint("INFO", `Result tracker armed — checking after ${new Date((currentWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
                   } catch (tradeErr: any) {
@@ -4237,14 +4160,6 @@ async function startServer() {
           return;
         }
 
-        // Paper mode: no live orders to lose. Log on first hit and otherwise stay silent.
-        if (paperMode) {
-          if (heartbeatConsecutiveFailures === 1) {
-            botPrint("INFO", `Heartbeat failed in paper mode — informational only, no halt (${lastHeartbeatErrorMessage.slice(0, 80)})`);
-          }
-          return;
-        }
-
         const nowMs = Date.now();
         // Warn once per 60s on sustained failures before halt threshold.
         if (heartbeatConsecutiveFailures >= HEARTBEAT_FAIL_WARN_AT &&
@@ -4261,7 +4176,7 @@ async function startServer() {
     };
     void sendHeartbeat();
     heartbeatInterval = setInterval(() => void sendHeartbeat(), 5_000);
-    console.log(`[Heartbeat] Started — 5s interval | grace=${HEARTBEAT_GRACE_MS}ms | warn=${HEARTBEAT_FAIL_WARN_AT} | halt=${HEARTBEAT_FAIL_HALT_AT}${paperMode ? " | paperMode (no-halt)" : ""}`);
+    console.log(`[Heartbeat] Started — 5s interval | grace=${HEARTBEAT_GRACE_MS}ms | warn=${HEARTBEAT_FAIL_WARN_AT} | halt=${HEARTBEAT_FAIL_HALT_AT}`);
   };
 
   const stopHeartbeat = () => {
@@ -4305,11 +4220,9 @@ async function startServer() {
     const nowUtcSeconds = Math.floor(Date.now() / 1000);
     const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
     const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
-    const nowSec = Math.floor(Date.now() / 1000);
     res.json({
       enabled: botEnabled,
       running: botRunning,
-      paperMode,
       sessionStartBalance: botSessionStartBalance,
       sessionTradesCount: botSessionTradesCount,
       windowElapsedSeconds,
@@ -4352,22 +4265,6 @@ async function startServer() {
       stopBot();
       res.json({ enabled: false, message: "Bot stopped." });
     }
-  });
-
-  app.post("/api/bot/paper-mode", (req, res) => {
-    const { enabled } = req.body || {};
-    if (typeof enabled !== "boolean") {
-      return res.status(400).json({ error: "enabled (boolean) is required." });
-    }
-    if (!enabled && !PHASE_0_COMPLETE) {
-      return res.status(403).json({
-        error: "Cannot disable paper mode: PHASE_0_COMPLETE is not set. Live trading is locked.",
-        paperMode,
-      });
-    }
-    paperMode = enabled;
-    botPrint("OK", `Paper mode ${enabled ? "ENABLED" : "DISABLED"}`);
-    res.json({ ok: true, paperMode });
   });
 
   // ── Risk halt control (Phase 0 fix 2 + 5) ────────────────────────────────
@@ -4474,13 +4371,11 @@ async function startServer() {
       }
 
       const client = await getClobClient();
-      if (!client && !paperMode) {
+      if (!client) {
         return res.status(503).json({ ok: false, error: "CLOB client not initialised. Check POLYGON_PRIVATE_KEY." });
       }
 
-      const orderbook = client
-        ? await withRetry(() => client.getOrderBook(tokenId), { label: "manual:getOrderBook" }).catch(() => null)
-        : null;
+      const orderbook = await withRetry(() => client.getOrderBook(tokenId), { label: "manual:getOrderBook" }).catch(() => null);
       const clobAsk = Number(orderbook?.asks?.[0]?.price || "0");
       const bestBid = Number(orderbook?.bids?.[0]?.price || "0");
       const impliedPrice = parseFloat(market.outcomePrices?.[outcomeIndex] ?? "0");
@@ -4492,16 +4387,13 @@ async function startServer() {
         return res.status(503).json({ ok: false, error: `Invalid ask price (${bestAsk}) — order book not ready` });
       }
 
-      // Balance check
       let currentBalance = lastKnownBalance ?? botSessionStartBalance ?? 0;
-      if (!paperMode && client) {
-        try {
-          const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-          currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
-          lastKnownBalance = currentBalance;
-        } catch { /* fall back to cached */ }
-      }
-      if (!paperMode && currentBalance < 1) {
+      try {
+        const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+        lastKnownBalance = currentBalance;
+      } catch { /* fall back to cached */ }
+      if (currentBalance < 1) {
         return res.status(400).json({ ok: false, error: `Insufficient balance ($${currentBalance.toFixed(2)} USDC < $1 min)` });
       }
 
@@ -4510,7 +4402,7 @@ async function startServer() {
       const betAmount = Number.isFinite(requestedAmount) && requestedAmount > 0
         ? requestedAmount
         : cfg.fixedTradeUsdc;
-      if (!paperMode && betAmount > currentBalance) {
+      if (betAmount > currentBalance) {
         return res.status(400).json({ ok: false, error: `Amount $${betAmount.toFixed(2)} exceeds balance $${currentBalance.toFixed(2)}` });
       }
       if (betAmount < 0.5) {
@@ -4588,7 +4480,6 @@ async function startServer() {
         reasoning: `[MANUAL] ${advisoryNote}`,
         windowElapsedSeconds: nowSec - windowStart,
         asset,
-        isPaperTrade: paperMode,
       });
 
       botSessionTradesCount++;
@@ -4608,7 +4499,6 @@ async function startServer() {
         entryPrice: bestAsk,
         size: tradeResult.orderSize,
         spent: betAmount,
-        paperMode,
         fastLoop: fastMom
           ? { direction: fastMom.direction, strength: fastMom.strength, vw: fastMom.volumeWeighted, accel: fastMom.acceleration, advisoryAgrees }
           : null,
@@ -4876,7 +4766,6 @@ async function startServer() {
       if (source === "live" || source === "both") {
         const live = await loadPersistedTradeLog();
         for (const t of live) {
-          if (t.isPaperTrade) continue;            // paper outcomes aren't real
           if (t.result !== "WIN" && t.result !== "LOSS") continue;
           labeled.push({
             direction: t.direction as "UP" | "DOWN",
@@ -5167,7 +5056,6 @@ async function startServer() {
   // per-signal keep/kill/recalibrate verdict.
   app.get("/api/measurement/phase1", async (req, res) => {
     try {
-      const includePaper = String(req.query.includePaper || "").toLowerCase() === "true";
       const minBucketN = req.query.minBucketN ? Number(req.query.minBucketN) : undefined;
       const trades = await loadPersistedTradeLog();
       const records: TradeRecord[] = trades
@@ -5189,9 +5077,8 @@ async function startServer() {
           btcDelta30s: t.btcDelta30s,
           yesDelta30s: t.yesDelta30s,
           windowElapsedSeconds: t.windowElapsedSeconds,
-          isPaperTrade: t.isPaperTrade,
         }));
-      const report = buildPhase1Report(records, { includePaper, minBucketN });
+      const report = buildPhase1Report(records, { minBucketN });
       res.json(report);
     } catch (err: any) {
       res.status(500).json({ error: err?.message ?? "Phase 1 report failed" });
@@ -5418,11 +5305,7 @@ async function startServer() {
   app.get("/api/bot/trade-log", async (req, res) => {
     const all = await loadPersistedTradeLog();
     const days = Number.parseInt(String(req.query.days || ""), 10);
-    let filtered = filterTradeLogByDays(all, days);
-    const paperOnly = String(req.query.paperOnly || "").toLowerCase() === "true" || String(req.query.paperOnly || "").toLowerCase() === "1";
-    const realOnly = String(req.query.realOnly || "").toLowerCase() === "true" || String(req.query.realOnly || "").toLowerCase() === "1";
-    if (paperOnly) filtered = filtered.filter((e) => e.isPaperTrade);
-    if (realOnly) filtered = filtered.filter((e) => !e.isPaperTrade);
+    const filtered = filterTradeLogByDays(all, days);
     const limit = Math.min(parseInt(String(req.query.limit || "200"), 10), 1000);
     const offset = parseInt(String(req.query.offset || "0"), 10);
     const entries = filtered.slice().reverse().slice(offset, offset + limit);
@@ -5437,18 +5320,6 @@ async function startServer() {
       total: filtered.length, wins, losses, winRate, totalPnl,
       divergence: { trades: divTrades.length, wins: divWins, winRate: divWinRate },
       entries,
-    });
-  });
-
-  app.get("/api/bot/paper-trade-stats", async (_req, res) => {
-    const paper = loadPaperTradeLog();
-    const wins = paper.filter((e) => e.result === "WIN").length;
-    const losses = paper.filter((e) => e.result === "LOSS").length;
-    const totalPnl = parseFloat(paper.reduce((s, e) => s + e.pnl, 0).toFixed(2));
-    const winRate = paper.length > 0 ? parseFloat(((wins / paper.length) * 100).toFixed(1)) : 0;
-    res.json({
-      total: paper.length, wins, losses, winRate, totalPnl,
-      lastTrade: paper[paper.length - 1] || null,
     });
   });
 

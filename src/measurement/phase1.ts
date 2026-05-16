@@ -28,7 +28,6 @@ export interface TradeRecord {
   btcDelta30s?: number;
   yesDelta30s?: number;
   windowElapsedSeconds?: number;
-  isPaperTrade?: boolean;
 }
 
 export interface SignalBucket {
@@ -66,9 +65,6 @@ interface MeasurementOptions {
   keepLiftPp?: number;
   /** Win-rate lift threshold (pp) below which a bucket is KILL. */
   killLiftPp?: number;
-  /** Include paper trades. Default false — paper outcomes can be real, but the
-   *  trade was never actually filled at that price, so PnL is informational. */
-  includePaper?: boolean;
 }
 
 function clamp01(p: number): number {
@@ -183,12 +179,10 @@ export function buildPhase1Report(
     minBucketN: options.minBucketN ?? 10,
     keepLiftPp: options.keepLiftPp ?? 5,
     killLiftPp: options.killLiftPp ?? -5,
-    includePaper: options.includePaper ?? false,
   };
 
-  const liveCount = trades.filter((t) => !t.isPaperTrade).length;
-  const paperCount = trades.length - liveCount;
-  const filtered = opts.includePaper ? trades : trades.filter((t) => !t.isPaperTrade);
+  const liveCount = trades.length;
+  const filtered = trades;
 
   const wins = filtered.filter((t) => t.result === "WIN").length;
   const losses = filtered.length - wins;
@@ -244,13 +238,9 @@ export function buildPhase1Report(
   if (bl.brier > 0.25) {
     notes.push(`Brier on confidence/100 is ${bl.brier.toFixed(3)} — worse than a 50-50 coin (0.250). Heuristic confidence is anti-informative as a probability; this is exactly what motivates the calibrator.`);
   }
-  if (paperCount > 0 && !opts.includePaper) {
-    notes.push(`${paperCount} paper trades excluded (set includePaper=true to include).`);
-  }
-
   return {
     generatedAt: new Date().toISOString(),
-    source: { trades: filtered.length, livePaperSplit: { live: liveCount, paper: paperCount } },
+    source: { trades: filtered.length, livePaperSplit: { live: liveCount, paper: 0 } },
     baseRate: {
       winRate: parseFloat(baseWinRate.toFixed(1)),
       n: filtered.length,
