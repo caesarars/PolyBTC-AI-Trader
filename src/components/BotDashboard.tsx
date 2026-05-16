@@ -2052,9 +2052,10 @@ export default function BotDashboard() {
       {/* ── Manual Entry (FastLoop Momentum) ── */}
       {(() => {
         const snap = status?.entrySnapshot;
+        // Prefer live advice (always-on, self-discovers market). Fall back to snapshot.
+        const yesPrice = manualAdvice?.up?.entryPrice   ?? snap?.yesPrice ?? null;
+        const noPrice  = manualAdvice?.down?.entryPrice ?? snap?.noPrice  ?? null;
         const fm = snap?.fastLoopMomentum ?? null;
-        const yesPrice = snap?.yesPrice ?? null;
-        const noPrice  = snap?.noPrice ?? null;
         const fmDir = fm?.direction;
         const fmStr = fm?.strength;
         const fmColor =
@@ -2062,7 +2063,10 @@ export default function BotDashboard() {
           fmDir === "DOWN" ? "text-red-400 border-red-500/30 bg-red-500/10" :
                              "text-zinc-400 border-zinc-700 bg-zinc-800/40";
         const defaultBet = status?.config.fixedTradeUsdc ?? 1;
-        const ready = !!snap;
+        const marketName = manualAdvice?.market ?? snap?.market ?? null;
+        const assetTag = manualAdvice?.asset ?? snap?.asset ?? null;
+        // Buttons are ready when EITHER advice has a market OR the bot snapshot exists.
+        const ready = !!(manualAdvice?.ok && manualAdvice.market) || !!snap;
         return (
           <div className="glass-card p-4 w-full border border-amber-500/20">
             <div className="flex items-center justify-between mb-3">
@@ -2077,14 +2081,11 @@ export default function BotDashboard() {
               )}
             </div>
 
-            {!snap ? (
-              <div className="text-[11px] text-zinc-600">Waiting for bot to load the current 5m market…</div>
-            ) : (
               <div className="flex flex-col gap-3">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] text-zinc-500 truncate">{snap.market}</span>
-                  {snap.asset && (
-                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-orange-500/15 text-orange-400 border-orange-500/30">{snap.asset}</span>
+                  <span className="text-[11px] text-zinc-500 truncate">{marketName ?? "Discovering current 5m market…"}</span>
+                  {assetTag && (
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-orange-500/15 text-orange-400 border-orange-500/30">{assetTag}</span>
                   )}
                   {!status?.enabled && (
                     <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-zinc-800 text-zinc-500 border-zinc-700">BOT OFF — manual still works</span>
@@ -2276,7 +2277,6 @@ export default function BotDashboard() {
                   </div>
                 )}
               </div>
-            )}
           </div>
         );
       })()}

@@ -4403,6 +4403,47 @@ async function startServer() {
     res.json({ ok: true, cleared: wasHalted, previousReason: prevReason });
   });
 
+  // Self-contained market discovery for manual endpoints. Returns the cached
+  // active market if the bot already scanned this window; otherwise fetches
+  // the current Polymarket event by slug and primes the cache so manual
+  // execution works even when the bot has never run.
+  const ensureActiveMarket = async (asset: TradingAsset): Promise<any | null> => {
+    const cached = activeBotMarketByAsset.get(asset);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const windowStart = Math.floor(nowSec / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+    const expectedSlug = `${ASSET_CONFIG[asset].polySlugPrefix}-${windowStart}`;
+    if (cached && cached.eventSlug === expectedSlug) return cached;
+    try {
+      const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${expectedSlug}`, { timeout: 8000 });
+      const event = eventRes.data;
+      const parseArr = (val: any): any[] => {
+        if (Array.isArray(val)) return val;
+        if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
+        return [];
+      };
+      const markets = (event?.markets || []).map((m: any) => ({
+        ...m,
+        outcomes: parseArr(m.outcomes),
+        outcomePrices: parseArr(m.outcomePrices),
+        clobTokenIds: parseArr(m.clobTokenIds),
+        eventSlug: event.slug,
+        eventTitle: event.title,
+        eventId: event.id,
+        startDate: event.startDate,
+        endDate: event.endDate,
+      }));
+      const market = markets[0] ?? null;
+      if (market) {
+        activeBotMarketByAsset.set(asset, market);
+        botPrint("INFO", `[manual] Discovered active market for ${asset}: ${market.question?.slice(0, 60) ?? market.id}`);
+      }
+      return market;
+    } catch (err: any) {
+      botPrint("WARN", `[manual] Market discovery failed for ${asset}: ${err?.message ?? err}`);
+      return null;
+    }
+  };
+
   // ── Manual trade entry (FastLoop Momentum advisory) ──────────────────────
   // Lets the user fire an order on the currently-active 5m market without
   // waiting for the bot's full gauntlet. Direction is user-chosen; FastLoop
@@ -4421,9 +4462,9 @@ async function startServer() {
       }
       const asset: TradingAsset = (body.asset && ENABLED_ASSETS.includes(body.asset as TradingAsset))
         ? (body.asset as TradingAsset) : "BTC";
-      const market = activeBotMarketByAsset.get(asset);
+      const market = await ensureActiveMarket(asset);
       if (!market) {
-        return res.status(503).json({ ok: false, error: `No active ${asset} market loaded yet — wait for bot to discover the current 5m market` });
+        return res.status(503).json({ ok: false, error: `No active ${asset} market for current 5m window — Polymarket gamma API unreachable or window not yet listed` });
       }
       const outcomeIndex = direction === "UP" ? 0 : 1;
       const tokenIds: string[] = market.clobTokenIds || [];
@@ -4587,9 +4628,9 @@ async function startServer() {
     try {
       const assetParam = String(req.query.asset || "BTC").toUpperCase() as TradingAsset;
       const asset: TradingAsset = ENABLED_ASSETS.includes(assetParam) ? assetParam : "BTC";
-      const market = activeBotMarketByAsset.get(asset);
+      const market = await ensureActiveMarket(asset);
       if (!market) {
-        return res.json({ ok: false, error: "No active market yet", asset });
+        return res.json({ ok: false, error: "Polymarket market for current 5m window not yet listed — try again in a moment", asset });
       }
       const tokenIds: string[] = market.clobTokenIds || [];
       const yesTokenId = tokenIds[0];
