@@ -89,6 +89,35 @@ interface BotStatus {
   };
 }
 
+interface ManualAdviceSide {
+  direction: "UP" | "DOWN";
+  confidence: number;
+  entryPrice: number | null;
+  pWin: number | null;
+  ev: number | null;
+  evPctOfStake: number | null;
+  passesPWinGate: boolean;
+  passesEvGate: boolean;
+  passesBothGates: boolean;
+  imbalanceSignal: string | null;
+}
+
+interface ManualAdvice {
+  ok: boolean;
+  asset?: string;
+  market?: string;
+  windowElapsedSeconds?: number;
+  windowRemainingSeconds?: number;
+  calibratorReady?: boolean;
+  gates?: { minPWin: number; minEdge: number };
+  up?: ManualAdviceSide;
+  down?: ManualAdviceSide;
+  recommendation?: "UP" | "DOWN" | "NEITHER";
+  recommendationReason?: string;
+  updatedAt?: string;
+  error?: string;
+}
+
 interface BotLogEntry {
   timestamp: string;
   market: string;
@@ -318,6 +347,10 @@ export default function BotDashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [resetConfLoading, setResetConfLoading] = useState(false);
   const [resetRiskLoading, setResetRiskLoading] = useState(false);
+  const [manualAmountInput, setManualAmountInput] = useState<string>("");
+  const [manualTradeLoading, setManualTradeLoading] = useState<"UP" | "DOWN" | null>(null);
+  const [manualTradeMsg, setManualTradeMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [manualAdvice, setManualAdvice] = useState<ManualAdvice | null>(null);
   const [modeLoading, setModeLoading] = useState(false);
   const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
   const [sessionTradeLog, setSessionTradeLog] = useState<TradeLogStats | null>(null);
@@ -411,6 +444,23 @@ export default function BotDashboard() {
     };
   }, []);
 
+  // Poll manual-trade advice every 5s while the dashboard is mounted.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchAdvice = async () => {
+      try {
+        const res = await fetch("/api/bot/manual-advice");
+        const data = await res.json();
+        if (!cancelled) setManualAdvice(data);
+      } catch {
+        if (!cancelled) setManualAdvice({ ok: false, error: "Advice fetch failed" });
+      }
+    };
+    fetchAdvice();
+    const id = window.setInterval(fetchAdvice, 5_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
   useEffect(() => {
     const executedEntries = log.filter((entry) => entry.tradeExecuted && (entry.orderId || entry.timestamp));
     if (executedEntries.length === 0) return;
@@ -462,6 +512,39 @@ export default function BotDashboard() {
       await fetchAll();
     } finally {
       setResetRiskLoading(false);
+    }
+  };
+
+  const handleManualTrade = async (direction: "UP" | "DOWN") => {
+    setManualTradeLoading(direction);
+    setManualTradeMsg(null);
+    try {
+      const amountRaw = manualAmountInput.trim();
+      const body: { direction: "UP" | "DOWN"; amount?: number } = { direction };
+      if (amountRaw !== "") {
+        const n = Number(amountRaw);
+        if (Number.isFinite(n) && n > 0) body.amount = n;
+      }
+      const res = await fetch("/api/bot/manual-trade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setManualTradeMsg({ type: "err", text: data.error || `HTTP ${res.status}` });
+      } else {
+        setManualTradeMsg({
+          type: "ok",
+          text: `Order ${data.orderId} | ${direction === "UP" ? "▲ UP" : "▼ DOWN"} @ ${(data.entryPrice * 100).toFixed(1)}¢ | $${data.spent.toFixed(2)}${data.paperMode ? " (paper)" : ""}`,
+        });
+      }
+      await fetchAll();
+    } catch (err: any) {
+      setManualTradeMsg({ type: "err", text: err?.message || "Manual trade failed" });
+    } finally {
+      setManualTradeLoading(null);
+      setTimeout(() => setManualTradeMsg(null), 6000);
     }
   };
 
@@ -1960,6 +2043,238 @@ export default function BotDashboard() {
                     </span>
                   )}
                 </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* ── Manual Entry (FastLoop Momentum) ── */}
+      {(() => {
+        const snap = status?.entrySnapshot;
+        const fm = snap?.fastLoopMomentum ?? null;
+        const yesPrice = snap?.yesPrice ?? null;
+        const noPrice  = snap?.noPrice ?? null;
+        const fmDir = fm?.direction;
+        const fmStr = fm?.strength;
+        const fmColor =
+          fmDir === "UP"   ? "text-green-400 border-green-500/30 bg-green-500/10" :
+          fmDir === "DOWN" ? "text-red-400 border-red-500/30 bg-red-500/10" :
+                             "text-zinc-400 border-zinc-700 bg-zinc-800/40";
+        const defaultBet = status?.config.fixedTradeUsdc ?? 1;
+        const ready = !!snap;
+        return (
+          <div className="glass-card p-4 w-full border border-amber-500/20">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-amber-300 flex items-center gap-2">
+                <Zap className="w-4 h-4" />
+                Manual Entry — FastLoop Momentum
+              </h3>
+              {fm && (
+                <span className={cn("text-[10px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-wider", fmColor)}>
+                  {fmDir} · {fmStr} · vw={fm.vw.toFixed(3)}%
+                </span>
+              )}
+            </div>
+
+            {!snap ? (
+              <div className="text-[11px] text-zinc-600">Waiting for bot to load the current 5m market…</div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] text-zinc-500 truncate">{snap.market}</span>
+                  {snap.asset && (
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-orange-500/15 text-orange-400 border-orange-500/30">{snap.asset}</span>
+                  )}
+                  {!status?.enabled && (
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-zinc-800 text-zinc-500 border-zinc-700">BOT OFF — manual still works</span>
+                  )}
+                  {manualAdvice?.ok && manualAdvice.windowRemainingSeconds !== undefined && (
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-zinc-800 text-zinc-400 border-zinc-700 font-mono">
+                      Window {Math.max(0, manualAdvice.windowRemainingSeconds)}s left
+                    </span>
+                  )}
+                </div>
+
+                {/* ── Probability advice (calibrated pWin) ── */}
+                {(() => {
+                  if (!manualAdvice) {
+                    return <div className="text-[10px] text-zinc-600">Loading advice…</div>;
+                  }
+                  if (!manualAdvice.ok) {
+                    return (
+                      <div className="text-[10px] text-zinc-500 bg-zinc-900/50 border border-zinc-800 rounded px-2 py-1.5">
+                        Advice unavailable: {manualAdvice.error || "unknown"}
+                      </div>
+                    );
+                  }
+                  if (manualAdvice.calibratorReady === false) {
+                    return (
+                      <div className="text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-1.5">
+                        ⚠ Calibrator not trained yet — pWin advice unavailable. Train via <span className="font-mono">POST /api/calibrator/train</span>.
+                      </div>
+                    );
+                  }
+                  const up = manualAdvice.up;
+                  const down = manualAdvice.down;
+                  const rec = manualAdvice.recommendation;
+                  const pWinColor = (p: number | null | undefined) =>
+                    p == null ? "text-zinc-500 border-zinc-700 bg-zinc-800/40"
+                    : p >= 0.60 ? "text-green-300 border-green-500/40 bg-green-500/10"
+                    : p >= (manualAdvice.gates?.minPWin ?? 0.55) ? "text-lime-300 border-lime-500/40 bg-lime-500/10"
+                    : p >= 0.45 ? "text-yellow-300 border-yellow-500/40 bg-yellow-500/10"
+                    : "text-red-300 border-red-500/40 bg-red-500/10";
+                  const evColor = (ev: number | null | undefined) =>
+                    ev == null ? "text-zinc-500"
+                    : ev >= (manualAdvice.gates?.minEdge ?? 0.05) ? "text-green-300"
+                    : ev >= 0 ? "text-yellow-300"
+                    : "text-red-300";
+                  const renderSide = (side: ManualAdviceSide | undefined, label: string, accent: string) => {
+                    if (!side) return null;
+                    const isRec = rec === side.direction;
+                    return (
+                      <div className={cn(
+                        "rounded-xl p-3 border flex flex-col gap-1.5",
+                        isRec ? "border-amber-500/50 bg-amber-500/5" : "border-zinc-800 bg-zinc-900/40"
+                      )}>
+                        <div className="flex items-center justify-between">
+                          <span className={cn("text-[10px] uppercase tracking-widest font-bold", accent)}>{label}</span>
+                          {isRec && (
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-amber-500 text-black uppercase tracking-wider">Rec</span>
+                          )}
+                          {!isRec && side.passesBothGates && (
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-300 border border-green-500/40">+EV</span>
+                          )}
+                        </div>
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-[9px] uppercase text-zinc-500">pWin</span>
+                          <span className={cn(
+                            "text-2xl font-mono font-bold px-1.5 py-0 rounded border",
+                            pWinColor(side.pWin)
+                          )}>
+                            {side.pWin !== null ? `${(side.pWin * 100).toFixed(1)}%` : "—"}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] font-mono">
+                          <span className="text-zinc-500">Entry <span className="text-zinc-300">{side.entryPrice !== null ? `${(side.entryPrice * 100).toFixed(1)}¢` : "—"}</span></span>
+                          <span className="text-zinc-500">EV <span className={evColor(side.ev)}>{side.ev !== null ? `${side.ev >= 0 ? "+" : ""}${(side.ev * 100).toFixed(1)}¢` : "—"}</span></span>
+                          {side.evPctOfStake !== null && (
+                            <span className="text-zinc-500">ROI <span className={evColor(side.ev)}>{side.evPctOfStake >= 0 ? "+" : ""}{side.evPctOfStake.toFixed(0)}%</span></span>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap gap-1 text-[9px]">
+                          <span className={cn(
+                            "px-1.5 py-0.5 rounded border font-bold uppercase tracking-wide",
+                            side.passesPWinGate ? "bg-green-500/10 text-green-300 border-green-500/40" : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                          )}>
+                            pWin gate {side.passesPWinGate ? "✓" : "✗"}
+                          </span>
+                          <span className={cn(
+                            "px-1.5 py-0.5 rounded border font-bold uppercase tracking-wide",
+                            side.passesEvGate ? "bg-green-500/10 text-green-300 border-green-500/40" : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                          )}>
+                            EV gate {side.passesEvGate ? "✓" : "✗"}
+                          </span>
+                          {side.imbalanceSignal && (
+                            <span className={cn(
+                              "px-1.5 py-0.5 rounded border font-bold uppercase tracking-wide",
+                              side.imbalanceSignal === "BUY_PRESSURE" ? "bg-green-500/10 text-green-300 border-green-500/40"
+                              : side.imbalanceSignal === "SELL_PRESSURE" ? "bg-red-500/10 text-red-300 border-red-500/40"
+                              : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                            )}>
+                              {side.imbalanceSignal.replace("_", " ")}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  };
+                  return (
+                    <div className="flex flex-col gap-2">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        {renderSide(up,   "BUY UP (YES)",  "text-green-400")}
+                        {renderSide(down, "BUY DOWN (NO)", "text-red-400")}
+                      </div>
+                      {manualAdvice.recommendationReason && (
+                        <div className={cn(
+                          "text-[10px] px-2 py-1 rounded border",
+                          rec === "NEITHER" ? "bg-zinc-900/50 text-zinc-400 border-zinc-800"
+                          : "bg-amber-500/10 text-amber-200 border-amber-500/30"
+                        )}>
+                          <span className="font-bold uppercase tracking-wider mr-1">Rec:</span>
+                          {rec === "NEITHER" ? "Skip" : rec} — {manualAdvice.recommendationReason}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                <div className="flex items-end gap-3 flex-wrap">
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">Amount (USDC)</span>
+                    <input
+                      type="number"
+                      min={0.5}
+                      step={0.5}
+                      inputMode="decimal"
+                      value={manualAmountInput}
+                      onChange={(e) => setManualAmountInput(e.target.value)}
+                      placeholder={`default $${defaultBet.toFixed(2)}`}
+                      className="w-32 bg-zinc-900 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-sm font-mono text-white focus:outline-none focus:border-amber-500/60"
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => handleManualTrade("UP")}
+                    disabled={!ready || manualTradeLoading !== null}
+                    title="BUY YES (UP) on current market"
+                    className={cn(
+                      "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all",
+                      "bg-green-500 text-black hover:bg-green-400",
+                      (!ready || manualTradeLoading !== null) && "opacity-40 cursor-not-allowed hover:bg-green-500"
+                    )}
+                  >
+                    <TrendingUp className="w-4 h-4" />
+                    {manualTradeLoading === "UP" ? "Sending…" : "BUY UP"}
+                    {yesPrice !== null && (
+                      <span className="font-mono text-xs opacity-80">@{(yesPrice * 100).toFixed(1)}¢</span>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleManualTrade("DOWN")}
+                    disabled={!ready || manualTradeLoading !== null}
+                    title="BUY NO (DOWN) on current market"
+                    className={cn(
+                      "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all",
+                      "bg-red-500 text-white hover:bg-red-400",
+                      (!ready || manualTradeLoading !== null) && "opacity-40 cursor-not-allowed hover:bg-red-500"
+                    )}
+                  >
+                    <TrendingDown className="w-4 h-4" />
+                    {manualTradeLoading === "DOWN" ? "Sending…" : "BUY DOWN"}
+                    {noPrice !== null && (
+                      <span className="font-mono text-xs opacity-80">@{(noPrice * 100).toFixed(1)}¢</span>
+                    )}
+                  </button>
+                </div>
+
+                <div className="text-[10px] text-zinc-600">
+                  Direction kamu yang pilih — FastLoop hanya advisory. Order dieksekusi AGGRESSIVE @ best ask, TP/SL/TS otomatis ter-arm.
+                </div>
+
+                {manualTradeMsg && (
+                  <div className={cn(
+                    "text-[11px] font-mono px-2 py-1.5 rounded border",
+                    manualTradeMsg.type === "ok"
+                      ? "bg-green-500/10 text-green-300 border-green-500/30"
+                      : "bg-red-500/10 text-red-300 border-red-500/30"
+                  )}>
+                    {manualTradeMsg.type === "ok" ? "✓ " : "✗ "}{manualTradeMsg.text}
+                  </div>
+                )}
               </div>
             )}
           </div>

@@ -4403,6 +4403,387 @@ async function startServer() {
     res.json({ ok: true, cleared: wasHalted, previousReason: prevReason });
   });
 
+  // ── Manual trade entry (FastLoop Momentum advisory) ──────────────────────
+  // Lets the user fire an order on the currently-active 5m market without
+  // waiting for the bot's full gauntlet. Direction is user-chosen; FastLoop
+  // momentum is included in the response/log as advisory context only.
+  app.post("/api/bot/manual-trade", async (req, res) => {
+    try {
+      const body = (req.body || {}) as {
+        direction?: "UP" | "DOWN";
+        amount?: number;
+        asset?: TradingAsset;
+        armAutomation?: boolean;
+      };
+      const direction = String(body.direction || "").toUpperCase() as "UP" | "DOWN";
+      if (direction !== "UP" && direction !== "DOWN") {
+        return res.status(400).json({ ok: false, error: "direction must be 'UP' or 'DOWN'" });
+      }
+      const asset: TradingAsset = (body.asset && ENABLED_ASSETS.includes(body.asset as TradingAsset))
+        ? (body.asset as TradingAsset) : "BTC";
+      const market = activeBotMarketByAsset.get(asset);
+      if (!market) {
+        return res.status(503).json({ ok: false, error: `No active ${asset} market loaded yet — wait for bot to discover the current 5m market` });
+      }
+      const outcomeIndex = direction === "UP" ? 0 : 1;
+      const tokenIds: string[] = market.clobTokenIds || [];
+      const tokenId = tokenIds[outcomeIndex];
+      if (!tokenId) {
+        return res.status(500).json({ ok: false, error: `Market has no clobTokenId for ${direction}` });
+      }
+
+      const client = await getClobClient();
+      if (!client && !paperMode) {
+        return res.status(503).json({ ok: false, error: "CLOB client not initialised. Check POLYGON_PRIVATE_KEY." });
+      }
+
+      const orderbook = client
+        ? await withRetry(() => client.getOrderBook(tokenId), { label: "manual:getOrderBook" }).catch(() => null)
+        : null;
+      const clobAsk = Number(orderbook?.asks?.[0]?.price || "0");
+      const bestBid = Number(orderbook?.bids?.[0]?.price || "0");
+      const impliedPrice = parseFloat(market.outcomePrices?.[outcomeIndex] ?? "0");
+      const CLOB_SPREAD_THRESHOLD = 0.97;
+      const bestAsk = (clobAsk > 0 && clobAsk < CLOB_SPREAD_THRESHOLD)
+        ? clobAsk
+        : impliedPrice > 0 ? impliedPrice : clobAsk;
+      if (!Number.isFinite(bestAsk) || bestAsk <= 0 || bestAsk >= 1) {
+        return res.status(503).json({ ok: false, error: `Invalid ask price (${bestAsk}) — order book not ready` });
+      }
+
+      // Balance check
+      let currentBalance = lastKnownBalance ?? botSessionStartBalance ?? 0;
+      if (!paperMode && client) {
+        try {
+          const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+          currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
+          lastKnownBalance = currentBalance;
+        } catch { /* fall back to cached */ }
+      }
+      if (!paperMode && currentBalance < 1) {
+        return res.status(400).json({ ok: false, error: `Insufficient balance ($${currentBalance.toFixed(2)} USDC < $1 min)` });
+      }
+
+      const cfg = getActiveConfig();
+      const requestedAmount = Number(body.amount);
+      const betAmount = Number.isFinite(requestedAmount) && requestedAmount > 0
+        ? requestedAmount
+        : cfg.fixedTradeUsdc;
+      if (!paperMode && betAmount > currentBalance) {
+        return res.status(400).json({ ok: false, error: `Amount $${betAmount.toFixed(2)} exceeds balance $${currentBalance.toFixed(2)}` });
+      }
+      if (betAmount < 0.5) {
+        return res.status(400).json({ ok: false, error: `Amount $${betAmount.toFixed(2)} too small (min $0.50)` });
+      }
+
+      // FastLoop momentum advisory (telemetry only — user already picked direction)
+      const histResult = await getBtcHistory().catch(() => null);
+      const fastMom = histResult?.history?.length
+        ? computeFastLoopMomentum(histResult.history)
+        : null;
+      const advisoryAgrees = fastMom && fastMom.direction === direction;
+      const advisoryNote = fastMom
+        ? `FastLoop=${fastMom.direction} ${fastMom.strength} vw=${fastMom.volumeWeighted.toFixed(3)}%${advisoryAgrees ? " ✓ aligned" : " ⚠ user override"}`
+        : "FastLoop=n/a";
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const windowStart = Math.floor(nowSec / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+
+      botPrint("TRADE", `━━━ 🖐 MANUAL ENTRY ━━━`);
+      botPrint("TRADE", `Direction : ${direction === "UP" ? "▲ UP (YES)" : "▼ DOWN (NO)"}`);
+      botPrint("TRADE", `Amount    : $${betAmount.toFixed(2)} USDC`);
+      botPrint("TRADE", `Price     : ${(bestAsk * 100).toFixed(1)}¢ ask | ${(bestBid * 100).toFixed(1)}¢ bid`);
+      botPrint("TRADE", `Advisory  : ${advisoryNote}`);
+
+      markTradeExecutionStarted(asset, market.id);
+      let tradeResult: Awaited<ReturnType<typeof executePolymarketTrade>>;
+      try {
+        tradeResult = await executePolymarketTrade({
+          tokenID: tokenId,
+          amount: betAmount,
+          side: Side.BUY,
+          price: bestAsk,
+          executionMode: "AGGRESSIVE",
+          amountMode: "SPEND",
+        });
+        markTradeExecutionFinished(asset, market.id, true);
+      } catch (err: any) {
+        markTradeExecutionFinished(asset, market.id, false);
+        const msg = err?.message || String(err);
+        botPrint("ERR", `Manual trade failed: ${msg}`);
+        return res.status(500).json({ ok: false, error: msg });
+      }
+
+      if (body.armAutomation !== false) {
+        const levels = recommendAutomationLevels(bestAsk);
+        await savePositionAutomation({
+          assetId: tokenId,
+          market: market.question || market.id,
+          outcome: market.outcomes?.[outcomeIndex] || direction,
+          averagePrice: bestAsk.toFixed(4),
+          size: tradeResult.orderSize.toFixed(6),
+          takeProfit: levels.takeProfit,
+          stopLoss: levels.stopLoss,
+          trailingStop: levels.trailingStop,
+          windowEnd: windowStart + MARKET_SESSION_SECONDS,
+          armed: true,
+        });
+        botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}¢ — automation ARMED`);
+      }
+
+      pendingResults.set(tokenId, {
+        eventSlug: market.eventSlug,
+        marketId: market.id,
+        market: market.question || market.id,
+        tokenId,
+        direction,
+        outcome: market.outcomes?.[outcomeIndex] || direction,
+        entryPrice: bestAsk,
+        betAmount,
+        orderId: tradeResult.orderID,
+        windowEnd: windowStart + MARKET_SESSION_SECONDS,
+        confidence: fastMom?.strength === "STRONG" ? 80 : fastMom?.strength === "MODERATE" ? 65 : 50,
+        edge: 0,
+        reasoning: `[MANUAL] ${advisoryNote}`,
+        windowElapsedSeconds: nowSec - windowStart,
+        asset,
+        isPaperTrade: paperMode,
+      });
+
+      botSessionTradesCount++;
+      botPrint("OK", `Manual order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
+      void sendNotification(
+        `🖐 <b>MANUAL TRADE</b>\nMarket: ${market.question?.slice(0, 60) ?? `${asset} 5m`}\nDirection: ${direction === "UP" ? "▲ UP" : "▼ DOWN"}\nAmount: $${betAmount.toFixed(2)} USDC @ ${(bestAsk * 100).toFixed(1)}¢\n${advisoryNote}`
+      );
+      pushSSE("cycle", { ts: new Date().toISOString() });
+
+      res.json({
+        ok: true,
+        orderId: tradeResult.orderID,
+        status: tradeResult.status,
+        direction,
+        asset,
+        market: market.question || market.id,
+        entryPrice: bestAsk,
+        size: tradeResult.orderSize,
+        spent: betAmount,
+        paperMode,
+        fastLoop: fastMom
+          ? { direction: fastMom.direction, strength: fastMom.strength, vw: fastMom.volumeWeighted, accel: fastMom.acceleration, advisoryAgrees }
+          : null,
+      });
+    } catch (err: any) {
+      botPrint("ERR", `Manual trade error: ${err?.message || String(err)}`);
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  // ── Manual trade advice — calibrated pWin per direction for current window ──
+  // Live probabilistic advisory for the manual-trade widget. Computes the same
+  // features the bot uses, runs predictPWin() for both UP and DOWN, and returns
+  // EV / passes-gate flags so the user can see whether the model thinks either
+  // side is +EV before clicking BUY UP / BUY DOWN.
+  app.get("/api/bot/manual-advice", async (req, res) => {
+    try {
+      const assetParam = String(req.query.asset || "BTC").toUpperCase() as TradingAsset;
+      const asset: TradingAsset = ENABLED_ASSETS.includes(assetParam) ? assetParam : "BTC";
+      const market = activeBotMarketByAsset.get(asset);
+      if (!market) {
+        return res.json({ ok: false, error: "No active market yet", asset });
+      }
+      const tokenIds: string[] = market.clobTokenIds || [];
+      const yesTokenId = tokenIds[0];
+      const noTokenId  = tokenIds[1];
+
+      // Fresh order books (best ask + imbalance signal)
+      const client = await getClobClient();
+      const fetchBook = async (tid: string | undefined) => {
+        if (!tid) return null;
+        try {
+          const raw: any = client
+            ? await client.getOrderBook(tid)
+            : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
+          const sum = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
+          const bidSize = sum(raw.bids), askSize = sum(raw.asks);
+          const total = bidSize + askSize;
+          const imbalance = total > 0 ? bidSize / total : 0.5;
+          const imbalanceSignal: "BUY_PRESSURE" | "SELL_PRESSURE" | "NEUTRAL" =
+            imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
+          return {
+            bestAsk: Number(raw.asks?.[0]?.price || "0"),
+            bestBid: Number(raw.bids?.[0]?.price || "0"),
+            imbalanceSignal,
+          };
+        } catch { return null; }
+      };
+      const [yesBook, noBook] = await Promise.all([fetchBook(yesTokenId), fetchBook(noTokenId)]);
+
+      // Resolve best ask per side: prefer CLOB if reasonable (<97¢), else AMM outcomePrices
+      const CLOB_SPREAD_THRESHOLD = 0.97;
+      const yesImplied = parseFloat(market.outcomePrices?.[0] ?? "0");
+      const noImplied  = parseFloat(market.outcomePrices?.[1] ?? "0");
+      const yesAsk = (yesBook && yesBook.bestAsk > 0 && yesBook.bestAsk < CLOB_SPREAD_THRESHOLD) ? yesBook.bestAsk : yesImplied;
+      const noAsk  = (noBook  && noBook.bestAsk  > 0 && noBook.bestAsk  < CLOB_SPREAD_THRESHOLD) ? noBook.bestAsk  : noImplied;
+
+      // Indicators + history + divergence + FastLoop (fresh, same sources as bot loop)
+      const [indicators, histResult] = await Promise.all([
+        getBtcIndicators().catch(() => null),
+        getBtcHistory().catch(() => null),
+      ]);
+      const fastMom = histResult?.history?.length
+        ? computeFastLoopMomentum(histResult.history)
+        : null;
+      const div = divergenceStateByAsset.get(asset) ?? null;
+      const divFresh = (div && Math.floor(Date.now() / 1000) - div.updatedAt < 30) ? div : null;
+
+      // Simple alignment-based heuristic confidence (same flavour as SYNTH path,
+      // condensed). Used only as a feature input to the calibrator.
+      const hist = histResult?.history ?? [];
+      const indAlignBull = ((): number => {
+        let s = 0;
+        if (indicators?.emaCross === "BULLISH") s += 1;
+        if (indicators?.signalScore != null && indicators.signalScore >= 2) s += 1;
+        if (fastMom?.direction === "UP" && fastMom.strength !== "WEAK") s += 1;
+        if (hist.length >= 2) {
+          const last = hist[hist.length - 1];
+          if (last.close > last.open) s += 1;
+        }
+        if (divFresh?.direction === "UP" && divFresh.strength !== "NONE") s += 1;
+        if (yesBook?.imbalanceSignal === "BUY_PRESSURE") s += 1;
+        return s;
+      })();
+      const indAlignBear = ((): number => {
+        let s = 0;
+        if (indicators?.emaCross === "BEARISH") s += 1;
+        if (indicators?.signalScore != null && indicators.signalScore <= -2) s += 1;
+        if (fastMom?.direction === "DOWN" && fastMom.strength !== "WEAK") s += 1;
+        if (hist.length >= 2) {
+          const last = hist[hist.length - 1];
+          if (last.close < last.open) s += 1;
+        }
+        if (divFresh?.direction === "DOWN" && divFresh.strength !== "NONE") s += 1;
+        if (yesBook?.imbalanceSignal === "SELL_PRESSURE") s += 1;
+        return s;
+      })();
+      const confFor = (dir: "UP" | "DOWN") => {
+        const align = dir === "UP" ? indAlignBull : indAlignBear;
+        const momBoost = fastMom?.direction === dir
+          ? (fastMom.strength === "STRONG" ? 8 : fastMom.strength === "MODERATE" ? 4 : 0)
+          : 0;
+        const divBoost = divFresh?.direction === dir
+          ? (divFresh.strength === "STRONG" ? 8 : divFresh.strength === "MODERATE" ? 4 : 0)
+          : 0;
+        return Math.max(55, Math.min(90, 60 + align * 4 + momBoost + divBoost));
+      };
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const windowStart = Math.floor(nowSec / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
+      const windowElapsedSeconds = nowSec - windowStart;
+      const calibratorReady = isCalibratorReady();
+
+      const adviceFor = (dir: "UP" | "DOWN", entryPrice: number, imbalanceSignal: string | undefined) => {
+        const confidence = confFor(dir);
+        const features: TradeFeatures = {
+          direction: dir,
+          confidence,
+          rsi: indicators?.rsi,
+          emaCross: indicators?.emaCross,
+          signalScore: indicators?.signalScore,
+          imbalanceSignal: imbalanceSignal ?? "NEUTRAL",
+          divergenceDirection: divFresh?.direction,
+          divergenceStrength: divFresh?.strength,
+          btcDelta30s: divFresh?.btcDelta30s,
+          yesDelta30s: divFresh?.yesDelta30s,
+          windowElapsedSeconds,
+          entryPrice,
+        };
+        const pWin = calibratorReady ? predictPWin(features) : null;
+        const ev = pWin !== null && entryPrice > 0 ? pWin - entryPrice : null;
+        const evPctOfStake = pWin !== null && entryPrice > 0 ? ((pWin / entryPrice) - 1) * 100 : null;
+        const passesPWinGate  = pWin !== null && pWin >= BOT_CALIBRATED_MIN_PWIN;
+        const passesEvGate    = ev   !== null && ev   >= BOT_CALIBRATED_MIN_EDGE;
+        return {
+          direction: dir,
+          confidence,
+          entryPrice: Number.isFinite(entryPrice) ? Number(entryPrice.toFixed(4)) : null,
+          pWin: pWin !== null ? Number(pWin.toFixed(4)) : null,
+          ev: ev !== null ? Number(ev.toFixed(4)) : null,
+          evPctOfStake: evPctOfStake !== null ? Number(evPctOfStake.toFixed(1)) : null,
+          passesPWinGate,
+          passesEvGate,
+          passesBothGates: passesPWinGate && passesEvGate,
+          imbalanceSignal: imbalanceSignal ?? null,
+        };
+      };
+
+      const up   = adviceFor("UP",   yesAsk, yesBook?.imbalanceSignal);
+      const down = adviceFor("DOWN", noAsk,  noBook?.imbalanceSignal);
+
+      // Recommendation: prefer side that passes both gates; if both pass, pick higher EV;
+      // if neither, "NEITHER" with the reason.
+      let recommendation: "UP" | "DOWN" | "NEITHER" = "NEITHER";
+      let recommendationReason = "";
+      if (!calibratorReady) {
+        recommendationReason = "Calibrator not trained — pWin unavailable (POST /api/calibrator/train)";
+      } else if (up.passesBothGates && down.passesBothGates) {
+        recommendation = (up.ev ?? -Infinity) >= (down.ev ?? -Infinity) ? "UP" : "DOWN";
+        recommendationReason = `Both sides +EV; ${recommendation} has higher EV (${(((recommendation === "UP" ? up.ev : down.ev) ?? 0) * 100).toFixed(1)}¢)`;
+      } else if (up.passesBothGates) {
+        recommendation = "UP";
+        recommendationReason = `UP passes pWin≥${(BOT_CALIBRATED_MIN_PWIN * 100).toFixed(0)}% + EV≥${(BOT_CALIBRATED_MIN_EDGE * 100).toFixed(1)}¢`;
+      } else if (down.passesBothGates) {
+        recommendation = "DOWN";
+        recommendationReason = `DOWN passes pWin≥${(BOT_CALIBRATED_MIN_PWIN * 100).toFixed(0)}% + EV≥${(BOT_CALIBRATED_MIN_EDGE * 100).toFixed(1)}¢`;
+      } else {
+        const failBits: string[] = [];
+        if (up.pWin   !== null && up.pWin   < BOT_CALIBRATED_MIN_PWIN) failBits.push(`UP pWin ${(up.pWin   * 100).toFixed(0)}% < ${(BOT_CALIBRATED_MIN_PWIN * 100).toFixed(0)}%`);
+        if (down.pWin !== null && down.pWin < BOT_CALIBRATED_MIN_PWIN) failBits.push(`DOWN pWin ${(down.pWin * 100).toFixed(0)}% < ${(BOT_CALIBRATED_MIN_PWIN * 100).toFixed(0)}%`);
+        recommendationReason = failBits.length > 0 ? failBits.join(" | ") : "Neither side passes both EV/pWin gates";
+      }
+
+      res.json({
+        ok: true,
+        asset,
+        market: market.question || market.id,
+        windowStart,
+        windowElapsedSeconds,
+        windowRemainingSeconds: MARKET_SESSION_SECONDS - windowElapsedSeconds,
+        yesPrice: yesAsk,
+        noPrice: noAsk,
+        fastLoop: fastMom ? {
+          direction: fastMom.direction,
+          strength: fastMom.strength,
+          vw: Number(fastMom.volumeWeighted.toFixed(4)),
+          raw: Number(fastMom.raw.toFixed(4)),
+          accel: Number(fastMom.acceleration.toFixed(4)),
+        } : null,
+        divergence: divFresh ? {
+          direction: divFresh.direction,
+          strength: divFresh.strength,
+          btcDelta30s: divFresh.btcDelta30s,
+          yesDelta30s: divFresh.yesDelta30s,
+        } : null,
+        indicators: indicators ? {
+          rsi: indicators.rsi,
+          emaCross: indicators.emaCross,
+          signalScore: indicators.signalScore,
+        } : null,
+        calibratorReady,
+        gates: {
+          minPWin: BOT_CALIBRATED_MIN_PWIN,
+          minEdge: BOT_CALIBRATED_MIN_EDGE,
+        },
+        up,
+        down,
+        recommendation,
+        recommendationReason,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
   // ── Calibrator endpoints (Phase 0 Fix 1) ────────────────────────────────
   // Trains a logistic regression on outcome ~ heuristic features. Produces a
   // *real* P(WIN) used as the authoritative EV gate at trade time. This
