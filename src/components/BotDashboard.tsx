@@ -365,8 +365,25 @@ export default function BotDashboard() {
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
   const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "analytics">("dashboard");
-  const [calibration, setCalibration] = useState<{ enabled: boolean; state: any | null }>({ enabled: false, state: null });
-  const [calibTogglingLoading, setCalibTogglingLoading] = useState(false);
+  const [calibration, setCalibration] = useState<{
+    ready: boolean;
+    reason: string;
+    nSamples: number;
+    minTrades: number;
+    buckets: Array<{ range: string; predicted: number; realized: number; n: number }>;
+    model: {
+      trainedAt: number;
+      trainBrier: number;
+      trainLogLoss: number;
+      cvBrier: number | null;
+      cvLogLoss: number | null;
+      features?: string[];
+      hyper?: any;
+    } | null;
+    thresholds: { minPWin: number; minEdge: number; requireCalibrator: boolean };
+  } | null>(null);
+  const [calibRetrainLoading, setCalibRetrainLoading] = useState(false);
+  const [calibRetrainMsg, setCalibRetrainMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [learning, setLearning] = useState<LearningState | null>(null);
   const [assetsLoading] = useState(false);
   const [lossPenaltySaving, setLossPenaltySaving] = useState(false);
@@ -390,7 +407,7 @@ export default function BotDashboard() {
         fetch("/api/bot/momentum-history").then((r) => r.json()),
         fetch("/api/notifications/status").then((r) => r.json()),
         fetch("/api/analytics").then((r) => r.json()),
-        fetch("/api/bot/calibration").then((r) => r.json()),
+        fetch("/api/calibrator/status").then((r) => r.json()),
         fetch("/api/bot/learning").then((r) => r.json()),
         fetch("/api/market-heat/BTC").then((r) => r.ok ? r.json() : null).catch(() => null),
       ]);
@@ -656,15 +673,34 @@ export default function BotDashboard() {
     setBacktestLoading(false);
   };
 
-  const handleToggleCalibrator = async () => {
-    setCalibTogglingLoading(true);
+  const handleRetrainCalibrator = async (source: "live" | "synthetic" | "both") => {
+    setCalibRetrainLoading(true);
+    setCalibRetrainMsg(null);
     try {
-      const res = await fetch("/api/bot/calibration/toggle", { method: "POST" });
+      const res = await fetch("/api/calibrator/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source }),
+      });
       const data = await res.json();
-      setCalibration(prev => ({ ...prev, enabled: data.enabled }));
-      await fetchAll(); // refresh calibration state
-    } catch {}
-    setCalibTogglingLoading(false);
+      if (!res.ok || data.error) {
+        setCalibRetrainMsg({ type: "err", text: data.error || `HTTP ${res.status}` });
+      } else if (!data.ok) {
+        setCalibRetrainMsg({ type: "err", text: data.state?.reason || "Model not ready" });
+      } else {
+        const cv = data.state?.model?.cvBrier;
+        setCalibRetrainMsg({
+          type: "ok",
+          text: `Trained on ${data.labeledSamples} samples (${source}) · CV Brier ${cv != null ? cv.toFixed(4) : "n/a"}`,
+        });
+      }
+      await fetchAll();
+    } catch (err: any) {
+      setCalibRetrainMsg({ type: "err", text: err?.message || "Retrain failed" });
+    } finally {
+      setCalibRetrainLoading(false);
+      setTimeout(() => setCalibRetrainMsg(null), 8000);
+    }
   };
 
   const handlePingTest = async () => {
@@ -1509,75 +1545,151 @@ export default function BotDashboard() {
 
       {/* ── Auto-Calibrator Widget ── */}
       <div className="glass-card p-4">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
             <FlaskConical className="w-4 h-4 text-purple-400" />
             Auto-Calibrator
-          </h3>
-          <button
-            type="button"
-            aria-label={calibration.enabled ? "Disable auto-calibrator" : "Enable auto-calibrator"}
-            onClick={handleToggleCalibrator}
-            disabled={calibTogglingLoading}
-            className={cn(
-              "relative w-12 h-6 rounded-full transition-colors duration-200 disabled:opacity-50 focus:outline-none",
-              calibration.enabled ? "bg-purple-600" : "bg-zinc-700"
+            {calibration ? (
+              <span className={cn(
+                "ml-1 text-[9px] font-bold px-1.5 py-0.5 rounded-full border uppercase tracking-wider",
+                calibration.ready
+                  ? "bg-green-500/10 text-green-300 border-green-500/40"
+                  : "bg-amber-500/10 text-amber-300 border-amber-500/40"
+              )}>
+                {calibration.ready ? "Ready" : "Not Ready"}
+              </span>
+            ) : (
+              <span className="ml-1 text-[9px] font-bold px-1.5 py-0.5 rounded-full border bg-zinc-800 text-zinc-500 border-zinc-700 uppercase tracking-wider animate-pulse">Loading…</span>
             )}
-          >
-            <span className={cn(
-              "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200",
-              calibration.enabled ? "translate-x-6" : "translate-x-0"
-            )} />
-          </button>
+          </h3>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => handleRetrainCalibrator("both")}
+              disabled={calibRetrainLoading}
+              title="Retrain on live trades + synthetic candle samples"
+              className={cn(
+                "px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider transition-colors",
+                "bg-purple-600 text-white hover:bg-purple-500",
+                calibRetrainLoading && "opacity-50 cursor-wait"
+              )}
+            >
+              {calibRetrainLoading ? "Training…" : "Retrain"}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRetrainCalibrator("live")}
+              disabled={calibRetrainLoading}
+              title="Retrain on live trades only (skip synthetic)"
+              className={cn(
+                "px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider transition-colors",
+                "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 border border-zinc-700",
+                calibRetrainLoading && "opacity-50 cursor-wait"
+              )}
+            >
+              Live
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRetrainCalibrator("synthetic")}
+              disabled={calibRetrainLoading}
+              title="Retrain on synthetic candle samples only"
+              className={cn(
+                "px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider transition-colors",
+                "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 border border-zinc-700",
+                calibRetrainLoading && "opacity-50 cursor-wait"
+              )}
+            >
+              Synth
+            </button>
+          </div>
         </div>
 
-        {!calibration.enabled ? (
-          <p className="text-[11px] text-zinc-600">
-            When enabled, runs FastLoop backtest at the start of each 5-min window and automatically adjusts signal thresholds + confidence based on recent accuracy.
-          </p>
-        ) : calibration.state ? (
+        {!calibration ? (
+          <p className="text-[11px] text-zinc-600 animate-pulse">Fetching calibrator status…</p>
+        ) : (
           <div className="flex flex-col gap-2">
-            <div className="grid grid-cols-3 gap-2 text-[11px]">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
               <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
-                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Win Rate</span>
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Samples</span>
                 <span className={cn(
                   "font-bold text-base",
-                  (calibration.state.winRate ?? 0) >= 65 ? "text-green-400"
-                    : (calibration.state.winRate ?? 0) >= 50 ? "text-yellow-400"
+                  calibration.nSamples >= calibration.minTrades ? "text-green-400" : "text-amber-400"
+                )}>
+                  {calibration.nSamples}
+                  <span className="text-zinc-600 text-[10px] font-normal"> / {calibration.minTrades} min</span>
+                </span>
+              </div>
+              <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">CV Brier</span>
+                <span className={cn(
+                  "font-bold text-base font-mono",
+                  calibration.model?.cvBrier == null ? "text-zinc-500"
+                    : calibration.model.cvBrier <= 0.20 ? "text-green-400"
+                    : calibration.model.cvBrier <= 0.25 ? "text-yellow-400"
                     : "text-red-400"
                 )}>
-                  {calibration.state.winRate != null ? `${calibration.state.winRate}%` : "—"}
+                  {calibration.model?.cvBrier != null ? calibration.model.cvBrier.toFixed(4) : "—"}
                 </span>
               </div>
               <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
-                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Min Strength</span>
-                <span className={cn(
-                  "font-bold text-sm",
-                  calibration.state.fastLoopMinStrength === "STRONG" ? "text-red-400" : "text-blue-400"
-                )}>
-                  {calibration.state.fastLoopMinStrength}
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Min pWin Gate</span>
+                <span className="font-bold text-base font-mono text-blue-400">
+                  {(calibration.thresholds.minPWin * 100).toFixed(0)}%
                 </span>
               </div>
               <div className="bg-zinc-800/60 rounded-lg p-2 flex flex-col gap-0.5">
-                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Conf Δ</span>
-                <span className={cn(
-                  "font-bold text-sm",
-                  calibration.state.confidenceDelta > 0 ? "text-red-400"
-                    : calibration.state.confidenceDelta < 0 ? "text-green-400"
-                    : "text-zinc-400"
-                )}>
-                  {calibration.state.confidenceDelta > 0 ? `+${calibration.state.confidenceDelta}%` : calibration.state.confidenceDelta < 0 ? `${calibration.state.confidenceDelta}%` : "±0%"}
+                <span className="text-zinc-500 text-[9px] uppercase tracking-wider">Min EV Gate</span>
+                <span className="font-bold text-base font-mono text-blue-400">
+                  {(calibration.thresholds.minEdge * 100).toFixed(1)}¢
                 </span>
               </div>
             </div>
-            <p className="text-[10px] text-zinc-500 italic">{calibration.state.note}</p>
-            <p className="text-[9px] text-zinc-700">
-              {calibration.state.correctCount}/{calibration.state.signaledCount} signals correct · {calibration.state.totalWindows} windows sampled
-              {calibration.state.runAt ? ` · updated ${new Date(calibration.state.runAt * 1000).toLocaleTimeString()}` : ""}
+
+            {calibration.buckets && calibration.buckets.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <span className="text-[9px] uppercase tracking-widest text-zinc-500 font-semibold">Buckets — declared vs realized win rate</span>
+                <div className="grid grid-cols-4 gap-1">
+                  {calibration.buckets.map((b) => {
+                    const drift = Math.abs(b.predicted - b.realized);
+                    const driftColor = b.n < 5 ? "text-zinc-500 border-zinc-700"
+                      : drift <= 8 ? "text-green-300 border-green-500/30"
+                      : drift <= 15 ? "text-yellow-300 border-yellow-500/30"
+                      : "text-red-300 border-red-500/30";
+                    return (
+                      <div key={b.range} className={cn("rounded p-1.5 border bg-zinc-900/50 flex flex-col gap-0.5", driftColor)}>
+                        <span className="text-[9px] uppercase tracking-wider opacity-60">{b.range}</span>
+                        <span className="text-[10px] font-mono">
+                          {b.predicted.toFixed(0)}% → <span className="font-bold">{b.realized.toFixed(0)}%</span>
+                        </span>
+                        <span className="text-[9px] opacity-60">n={b.n}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <p className="text-[10px] text-zinc-500 italic">
+              {calibration.reason || (calibration.ready ? "Calibrator gating trades." : "Calibrator not ready — bot using fallback gate.")}
             </p>
+            {calibration.model?.trainedAt && (
+              <p className="text-[9px] text-zinc-700">
+                Trained {new Date(calibration.model.trainedAt).toLocaleString()}
+                {calibration.thresholds.requireCalibrator && " · BOT_REQUIRE_CALIBRATOR=true (hard gate)"}
+              </p>
+            )}
+            {calibRetrainMsg && (
+              <div className={cn(
+                "text-[11px] font-mono px-2 py-1.5 rounded border",
+                calibRetrainMsg.type === "ok"
+                  ? "bg-green-500/10 text-green-300 border-green-500/30"
+                  : "bg-red-500/10 text-red-300 border-red-500/30"
+              )}>
+                {calibRetrainMsg.type === "ok" ? "✓ " : "✗ "}{calibRetrainMsg.text}
+              </div>
+            )}
           </div>
-        ) : (
-          <p className="text-[11px] text-zinc-500 animate-pulse">Running calibration…</p>
         )}
       </div>
 

@@ -612,6 +612,9 @@ async function maybeRetrainCalibratorFromTradeLog(): Promise<void> {
   if (calibratorRetrainInFlight) return;
   if (now - lastCalibratorRetrainAt < CALIBRATOR_AUTO_RETRAIN_MS) return;
   calibratorRetrainInFlight = true;
+  // Bump the debounce timer upfront so an empty/early-bail run still gets
+  // throttled until the next CALIBRATOR_AUTO_RETRAIN_MS window.
+  lastCalibratorRetrainAt = now;
   try {
     const trades = await loadPersistedTradeLog();
     const labeled: LabeledTrade[] = [];
@@ -633,13 +636,17 @@ async function maybeRetrainCalibratorFromTradeLog(): Promise<void> {
         result: t.result,
       });
     }
-    if (labeled.length < 20) return;
+    if (labeled.length < 20) {
+      console.log(`[Calibrate] Auto-retrain skipped — only ${labeled.length} labeled trades (need ≥ 20)`);
+      return;
+    }
     const state = retrainCalibrator(labeled, {
       minTrades: Math.min(100, Math.floor(labeled.length * 0.5)),
     });
-    lastCalibratorRetrainAt = now;
     if (state.ready) {
       console.log(`[Calibrate] Auto-retrained on ${state.nSamples} live trades. ${state.reason}`);
+    } else {
+      console.warn(`[Calibrate] Auto-retrain completed but model not ready: ${state.reason}`);
     }
   } catch (e: any) {
     console.warn(`[Calibrate] Auto-retrain failed: ${e?.message ?? e}`);
@@ -2315,6 +2322,15 @@ async function startServer() {
       };
     }
 
+    if (/order[_ ]version[_ ]mismatch|version mismatch/i.test(message)) {
+      const ctx = context as any;
+      return {
+        error: `Order ditolak: negRisk flag salah (signed ${ctx?.negRisk ? "NegRiskCtfExchange" : "CTFExchange"} tapi market butuh contract sebaliknya). Sistem auto-retry dengan flag dibalik.`,
+        detail: message,
+        context,
+      };
+    }
+
     return { error: message, detail: message, context };
   };
 
@@ -2403,10 +2419,12 @@ async function startServer() {
       throw new Error("Computed order size is invalid.");
     }
 
-    const [tickSize, negRisk] = await Promise.all([
+    const [tickSize, negRiskInitial] = await Promise.all([
       withRetry(() => client.getTickSize(tokenID), { label: "getTickSize" }),
       withRetry(() => client.getNegRisk(tokenID), { label: "getNegRisk" }),
     ]);
+    let negRisk = negRiskInitial;
+    botPrint("INFO", `Order params: tickSize=${tickSize} | negRisk=${negRisk} | tokenID=${tokenID.slice(0, 12)}…`);
 
     if (parsedSide === Side.BUY && normalizedAmountMode === "SPEND") {
       const allowance = await withRetry(() => client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }), { label: "getBalanceAllowance" });
@@ -2434,19 +2452,43 @@ async function startServer() {
       }
     }
 
-    const order = await withRetry(
-      () => client.createAndPostOrder(
-        {
-          tokenID,
-          size: Number(orderSize.toFixed(6)),
-          side: parsedSide,
-          price: parsedPrice,
-        },
-        { tickSize, negRisk },
-        OrderType.GTC
-      ),
-      { label: "createAndPostOrder", maxRetries: 3 }
-    );
+    const submitOrder = (useNegRisk: boolean) =>
+      withRetry(
+        () => client.createAndPostOrder(
+          {
+            tokenID,
+            size: Number(orderSize.toFixed(6)),
+            side: parsedSide,
+            price: parsedPrice,
+          },
+          { tickSize, negRisk: useNegRisk },
+          OrderType.GTC
+        ),
+        { label: "createAndPostOrder", maxRetries: 3 }
+      );
+
+    const isVersionMismatch = (resp: any) => {
+      const msg = String(resp?.errorMsg ?? resp?.error ?? resp?.message ?? "");
+      return /order[_ ]version[_ ]mismatch|version mismatch/i.test(msg);
+    };
+
+    let order = await submitOrder(negRisk);
+
+    // Auto-retry with flipped negRisk flag if CLOB says version mismatch — the
+    // SDK's getNegRisk() can return the wrong value for newly listed markets,
+    // causing the order to be signed against the wrong exchange contract.
+    if (order?.success === false && isVersionMismatch(order)) {
+      const flipped = !negRisk;
+      botPrint("WARN", `order_version_mismatch with negRisk=${negRisk} — retrying with negRisk=${flipped}`);
+      const retry = await submitOrder(flipped);
+      if (retry?.success !== false) {
+        negRisk = flipped;
+        order = retry;
+        botPrint("OK", `Retry succeeded with negRisk=${flipped} — cache value was stale`);
+      } else {
+        order = retry; // surface the retry's error in the formatter below
+      }
+    }
 
     if (order?.success === false) {
       const formatted = formatTradeError(order, { tokenID, amount, side, price: parsedPrice, tickSize, negRisk });
